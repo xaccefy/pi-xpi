@@ -1,68 +1,51 @@
-# Casefile — Offensive Security Case Tracker
+# pi-casefile
 
-Track durable security cases during bug bounties, CTFs, and security audits.
+`pi-casefile` is a local-first case ledger and validation harness designed to track offensive security investigations, bug bounty findings, and CTF progress. It features a SQLite storage engine and an isolated PoC execution runner.
 
-## Surface Support
+## Features
 
-- **pi extension** — registers tools and `/casefile` dashboard.
+- **State Management**: Enforces strict lifecycle transitions across states (`hypothesis`, `investigating`, `confirmed`, `blocked`, `killed`, `reported`).
+- **PoC Runner**: Validates vulnerability reachability in an isolated Docker sandbox with `--network none` or locally on the host.
+- **SQL Backend**: Syncs case information to SQLite via Node's `node:sqlite` or Bun's `bun:sqlite` compat layers.
+- **Reporting**: Automatically compiles markdown vulnerability reports for confirmed or reported findings.
 
-## Tools (pi)
+## Installation
 
-| pi | Description |
-|---|---|
-| **CaseAdd** | Open a new hypothesis or investigation |
-| **CaseUpdate** | Update fields (status, evidence, impact, etc.) |
-| **PromoteFinding** | **PoC Runner**: Verify PoC in Docker to confirm |
-| **CaseGet** | Get full details of a single case |
-| **CaseList** / **Search** | Browse or search across fields |
-| **CaseLink** / **Unlink** | Connect primitives into exploit chains |
-| **CaseReport** | Generate markdown report (confirmed/reported only) |
-
-## PoC Runner (Docker / Local)
-
-To promote a case from `investigating` to `confirmed`, you must use `PromoteFinding` with an on-disk PoC path.
-
-- **Sandbox (Docker)**: Default. Runs in a `--network none` container with read-only mounts. Uses `python:3.12-slim` (.py) or `alpine` (.sh).
-- **Local**: Use `local: true`. Runs directly on the host (e.g. for network-dependent bugs).
-- **Verification**: Only promotes to `confirmed` if the PoC returns **exit code 0**.
-- **Timeout**: 30 second limit.
-
-## Offensive Security Workflow
-
-1. **Hypothesize**: `CaseAdd(status: hypothesis)`
-2. **Investigate**: `CaseUpdate(status: investigating, evidence, confidence)`
-3. **Confirm**: `PromoteFinding(id, poc_path, local?)` -> Exit 0 verifies and confirms.
-4. **Chain**: `CaseLink` primitives to escalations.
-5. **Report**: `CaseReport` -> `CaseUpdate(status: reported)`.
-6. **Kill**: `CaseUpdate(status: killed)` for dead ends.
-
-### State Gates
-- `hypothesis` → `investigating` requires `evidence` + `confidence`.
-- `investigating` → `confirmed` requires a verified PoC run (exit 0) and `poc`, `evidence`, `impact`, `severity`.
-- `confirmed` → `reported` requires `CaseReport` to have been generated.
-- `killed` and `reported` are **terminal**.
-
-## Storage & Environment
-
-Stored as **SQLite** at `.casefile/casefile.db` (project) or `~/.casefile/casefile.db` (global).
-
-- `CASEFILE_PATH`: Force exact ledger path.
-- `CASEFILE_SCOPE=project|global`: Set storage scope.
-
-## Project Structure
-
-```
-src/
-  index.ts        — pi extension (tools, commands, events)
-  ledger.ts       — SQLite storage engine
-  poc-runner.ts   — Docker/local PoC verification
-  sqlite-compat.ts — node:sqlite / bun:sqlite compat layer
-skills/
-  casefile/SKILL.md — agent skill prompt
-test/
-  ledger.test.ts   — unit tests
+```bash
+pi install npm:pi-casefile
 ```
 
----
-Install: `pi install npm:pi-casefile`
+## Environment Variables
 
+- `CASEFILE_PATH`: Set explicit absolute path to the SQLite database file.
+- `CASEFILE_SCOPE`: Scope database storage. Options: `project` (default, stores in `.pi/casefile.db` or `.casefile/casefile.db` relative to workspace root) or `global` (stores in `~/.pi/casefile/casefile.db` or `~/.casefile/casefile.db`).
+
+## Core Workflow & State Transitions
+
+The ledger acts as a state gate to ensure finding validity:
+1. **Hypothesis**: Initial lead tracking (`CaseAdd`).
+2. **Investigation**: Move to `investigating` when code paths or reachability trace are identified (`CaseUpdate`).
+3. **Confirmation**: Validate with a working PoC script (`PromoteFinding`). Requires the PoC script to exit with code `0`.
+4. **Chaining**: Link low-impact primitives to build high-impact chains (`CaseLink`).
+5. **Reporting**: Compile markdown report (`CaseReport`) and transition finding to `reported` (`CaseUpdate`).
+
+## Tools Reference
+
+| Tool | Action | Requirements |
+|---|---|---|
+| `CaseAdd` | Create a new hypothesis or investigation case | Title, target (scope) |
+| `CaseUpdate` | Modify case details (remediation, impact, status) | ID, field updates |
+| `PromoteFinding` | Run on-disk PoC script to transition status to `confirmed` | ID, `poc_path`, `local` flag |
+| `CaseGet` | Retrieve full JSON details of a case | ID |
+| `CaseList` | Query and filter cases by status/confidence/tags | Filter flags, limit, offset |
+| `CaseSearch` | Perform full-text search across specific case fields | Query string, optional field |
+| `CaseLink` | Create a bidirectional link between two cases | Source ID, Target ID |
+| `CaseUnlink` | Remove link between two cases | Source ID, Target ID |
+| `CaseReport` | Write markdown report to disk | ID (must be `confirmed` or `reported`) |
+
+## Development and Testing
+
+Run tests via Bun:
+```bash
+bun test
+```
