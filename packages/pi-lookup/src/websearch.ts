@@ -12,6 +12,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { join, resolve, dirname } from "node:path";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { Text } from "@earendil-works/pi-tui";
 
 // ── Constants & Environment ──────────────────────────────────────────
@@ -40,23 +41,33 @@ const DOMAIN_ENDPOINT_MAP = [
 // ── Helpers ──────────────────────────────────────────────────────────
 
 function getDaemonScriptPath(): string {
+  // 0. Resolve via Node module resolution (handles scoped npm packages correctly)
+  try {
+    const _require = createRequire(import.meta.url);
+    return _require.resolve("open-websearch/build/index.js");
+  } catch {}
+
   // 1. Check relative to process.cwd()
   let searchPath = join(process.cwd(), "node_modules", "open-websearch", "build", "index.js");
   if (existsSync(searchPath)) return searchPath;
 
-  // 2. Check parent node_modules (if installed as npm package in ~/.pi/agent/npm/node_modules)
+  // 2. Check parent node_modules (unscoped npm package layout)
   searchPath = resolve(__dirname, "..", "open-websearch", "build", "index.js");
   if (existsSync(searchPath)) return searchPath;
 
-  // 3. Check monorepo packages/node_modules (packages/pi-lookup → packages/node_modules)
+  // 3. Check scoped npm package layout (@scope/pkg/src → @scope/pkg/ → @scope/ → node_modules/)
+  searchPath = resolve(__dirname, "..", "..", "..", "..", "open-websearch", "build", "index.js");
+  if (existsSync(searchPath)) return searchPath;
+
+  // 4. Check monorepo packages/node_modules (packages/pi-lookup → packages/node_modules)
   searchPath = resolve(__dirname, "..", "..", "node_modules", "open-websearch", "build", "index.js");
   if (existsSync(searchPath)) return searchPath;
 
-  // 4. Check monorepo root node_modules (packages/pi-lookup/src → ../../../node_modules)
+  // 5. Check monorepo root node_modules (packages/pi-lookup/src → ../../../node_modules)
   searchPath = resolve(__dirname, "..", "..", "..", "node_modules", "open-websearch", "build", "index.js");
   if (existsSync(searchPath)) return searchPath;
 
-  // 5. Check nested node_modules
+  // 6. Check nested node_modules
   searchPath = join(__dirname, "node_modules", "open-websearch", "build", "index.js");
   if (existsSync(searchPath)) return searchPath;
 
