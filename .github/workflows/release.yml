@@ -28,6 +28,17 @@ jobs:
       - name: Run Tests
         run: bun test
 
+      - name: Verify NPM Token
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "::error::NPM_TOKEN is empty! Please configure it in your repository settings under Settings > Secrets and variables > Actions > Repository secrets."
+            exit 1
+          else
+            echo "NPM_TOKEN is set (length: ${#NPM_TOKEN})"
+          fi
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Publish to NPM
         run: npm publish -ws --access public
         env:
