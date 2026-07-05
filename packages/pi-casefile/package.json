@@ -1,0 +1,63 @@
+{
+  "name": "pi-casefile",
+  "version": "0.1.0",
+  "description": "Offensive security case tracker for Pi Agent — bug bounties, CTFs, security audits",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "xpi",
+    "security",
+    "bug-bounty",
+    "ctf",
+    "casefile"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/x4cc3/pi-xpi.git",
+    "directory": "packages/pi-casefile"
+  },
+  "homepage": "https://github.com/x4cc3/pi-xpi/tree/main/packages/pi-casefile#readme",
+  "bugs": {
+    "url": "https://github.com/x4cc3/pi-xpi/issues"
+  },
+  "scripts": {
+    "test": "bun test test",
+    "typecheck": "tsc --noEmit --project tsconfig.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "files": [
+    "src/index.ts",
+    "src/ledger.ts",
+    "src/poc-runner.ts",
+    "src/sqlite-compat.ts",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "src/index.ts",
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.32.34"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "typescript": "^6.0.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}

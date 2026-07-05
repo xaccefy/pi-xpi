@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "noEmit": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2022",
+    "types": ["bun"]
+  },
+  "include": [
+    "src/index.ts",
+    "src/ledger.ts",
+    "src/poc-runner.ts",
+    "src/sqlite-compat.ts",
+    "test/ledger.test.ts"
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "name": "pi-xtodo",
+  "version": "0.1.0",
+  "description": "Simplified todo extension for tracking multi-step progress in Pi Agent",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "xpi",
+    "todo"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/x4cc3/pi-xpi.git",
+    "directory": "packages/pi-xtodo"
+  },
+  "homepage": "https://github.com/x4cc3/pi-xpi/tree/main/packages/pi-xtodo#readme",
+  "bugs": {
+    "url": "https://github.com/x4cc3/pi-xpi/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "index.ts",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.32.34"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "typescript": "^6.0.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
