@@ -1,6 +1,6 @@
 {
-  "name": "@x4cc3/pi-lookup",
-  "version": "0.1.0",
+  "name": "@xaccefy/pi-lookup",
+  "version": "0.1.1",
   "description": "Web search, page fetch, library docs (Context7), and GitHub repo Q&A (DeepWiki) for Pi Agent",
   "keywords": [
     "pi-package",

@@ -1,6 +1,6 @@
 {
-  "name": "@x4cc3/pi-casefile",
-  "version": "0.1.0",
+  "name": "@xaccefy/pi-casefile",
+  "version": "0.1.1",
   "description": "Offensive security case tracker for Pi Agent — bug bounties, CTFs, security audits",
   "keywords": [
     "pi-package",

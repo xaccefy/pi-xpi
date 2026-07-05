@@ -1,6 +1,6 @@
 {
-  "name": "@x4cc3/pi-xtodo",
-  "version": "0.1.0",
+  "name": "@xaccefy/pi-xtodo",
+  "version": "0.1.1",
   "description": "Simplified todo extension for tracking multi-step progress in Pi Agent",
   "keywords": [
     "pi-package",

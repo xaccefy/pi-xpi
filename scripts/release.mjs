@@ -168,7 +168,7 @@ run(`git tag v${version}`);
 console.log();
 
 console.log("Publishing to npm...");
-run("npm run publish");
+run("npm run publish:all");
 console.log();
 
 console.log("Reinstating [Unreleased] sections for next cycle...");

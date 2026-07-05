@@ -14,7 +14,7 @@ Or install them manually:
 
 ```bash
 # Install XPI
-pi install npm:@x4cc3/pi-xpi
+pi install npm:@xaccefy/pi-xpi
 ```
 
 ### ExploitSearch API key
@@ -74,10 +74,10 @@ pi-xpi/
 ├── prompts/                 # /pentest, /bugbounty, /ctf, /hunt, /patch, /harness
 ├── agents/                  # auditor, exploit-dev, patch-writer, harness definitions
 ├── packages/
-│   ├── @x4cc3/pi-casefile         # SQLite case tracker
-│   ├── @x4cc3/pi-exploitsearch    # ExploitSearch tool
-│   ├── @x4cc3/pi-lookup           # web_search, web_fetch, context7, deepwiki
-│   ├── @x4cc3/pi-codeintel        # Codebase indexer & graph queries
-│   └── @x4cc3/pi-xtodo            # Todo tracking
+│   ├── @xaccefy/pi-casefile         # SQLite case tracker
+│   ├── @xaccefy/pi-exploitsearch    # ExploitSearch tool
+│   ├── @xaccefy/pi-lookup           # web_search, web_fetch, context7, deepwiki
+│   ├── @xaccefy/pi-codeintel        # Codebase indexer & graph queries
+│   └── @xaccefy/pi-xtodo            # Todo tracking
 └── package.json
 ```

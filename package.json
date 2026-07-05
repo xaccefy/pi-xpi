@@ -1,6 +1,6 @@
 {
-  "name": "@x4cc3/pi-xpi",
-  "version": "0.1.0",
+  "name": "@xaccefy/pi-xpi",
+  "version": "0.1.1",
   "description": "XPI — offensive security tools for Pi Agent. Casefile tracking, web search, library docs, exploit technique search, code intelligence, todo tracking.",
   "keywords": [
     "pi-package",
@@ -51,11 +51,11 @@
     "typescript": "^6.0.3"
   },
   "peerDependencies": {
-    "@x4cc3/pi-casefile": "*",
-    "@x4cc3/pi-exploitsearch": "*",
-    "@x4cc3/pi-lookup": "*",
-    "@x4cc3/pi-codeintel": "*",
-    "@x4cc3/pi-xtodo": "*",
+    "@xaccefy/pi-casefile": "*",
+    "@xaccefy/pi-exploitsearch": "*",
+    "@xaccefy/pi-lookup": "*",
+    "@xaccefy/pi-codeintel": "*",
+    "@xaccefy/pi-xtodo": "*",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
@@ -71,7 +71,7 @@
     "version:patch": "npm version patch -ws --no-git-tag-version && npm version patch --no-git-tag-version && node scripts/sync-versions.js",
     "version:minor": "npm version minor -ws --no-git-tag-version && npm version minor --no-git-tag-version && node scripts/sync-versions.js",
     "version:major": "npm version major -ws --no-git-tag-version && npm version major --no-git-tag-version && node scripts/sync-versions.js",
-    "publish": "npm publish -ws --access public",
+    "publish:all": "npm publish -ws --access public && npm publish --access public",
     "publish:dry": "npm publish -ws --access public --dry-run",
     "release:patch": "node scripts/release.mjs patch",
     "release:minor": "node scripts/release.mjs minor",
