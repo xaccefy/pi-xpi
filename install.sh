@@ -41,10 +41,10 @@ register_package_in_settings() {
   ' "$pkg"
 }
 
-# GitHub-hosted extension — pi treats bare org/repo as remote spec
-if ! $PI_BIN install fitchmultz/pi-codex-goal 2>/dev/null; then
-  echo "  pi install failed for fitchmultz/pi-codex-goal, falling back to npm"
-  npm install --no-save github:fitchmultz/pi-codex-goal 2>/dev/null || echo "  (fallback skipped)"
+# Install pi-codex-goal via npm
+if ! $PI_BIN install npm:pi-codex-goal 2>/dev/null; then
+  echo "  pi install failed for pi-codex-goal, falling back to npm"
+  npm install --no-save pi-codex-goal 2>/dev/null || echo "  (fallback skipped)"
   register_package_in_settings "npm:pi-codex-goal"
 fi
 
