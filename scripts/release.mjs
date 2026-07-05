@@ -59,6 +59,15 @@ function stageChangedFiles() {
 	run(`git add -- ${paths.map(shellQuote).join(" ")}`);
 }
 
+function commitIfStaged(message) {
+	try {
+		execSync("git diff --cached --quiet");
+		console.log("  No changes staged to commit.");
+	} catch {
+		run(`git commit -m "${message}"`);
+	}
+}
+
 function bumpOrSetVersion(target) {
 	const currentVersion = getVersion();
 	let newVersion;
@@ -196,12 +205,8 @@ console.log();
 
 console.log("Committing and tagging...");
 stageChangedFiles();
-run(`git commit -m "Release v${version}"`);
+commitIfStaged(`Release v${version}`);
 run(`git tag v${version}`);
-console.log();
-
-console.log("Publishing to npm...");
-run("npm run publish:all");
 console.log();
 
 console.log("Reinstating [Unreleased] sections for next cycle...");
@@ -210,7 +215,7 @@ console.log();
 
 console.log("Committing changelog updates...");
 stageChangedFiles();
-run(`git commit -m "Add [Unreleased] section for next cycle"`);
+commitIfStaged("Add [Unreleased] section for next cycle");
 console.log();
 
 console.log("Pushing to remote...");
