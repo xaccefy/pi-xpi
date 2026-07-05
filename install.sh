@@ -61,8 +61,6 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p ~/.pi/agent/agents
 cp -f "$SCRIPT_DIR"/agents/*.md ~/.pi/agent/agents/ 2>/dev/null || true
-mkdir -p ~/.pi/agent/prompts
-cp -f "$SCRIPT_DIR"/prompts/*.md ~/.pi/agent/prompts/ 2>/dev/null || true
 
 # ExploitSearch API key notice
 echo ""
