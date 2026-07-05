@@ -5,6 +5,10 @@ if [ -n "$PI_XPI_INSTALLING" ]; then exit 0; fi
 export PI_XPI_INSTALLING=1
 
 PI_BIN="$(command -v pi 2>/dev/null)"
+if [ -n "$PI_BIN" ] && ! "$PI_BIN" --help 2>&1 | grep -q "Extensions"; then
+  PI_BIN=""
+fi
+
 if [ -z "$PI_BIN" ]; then
   echo "pi not found in PATH — skipping 3rd party dep install"
   exit 0
