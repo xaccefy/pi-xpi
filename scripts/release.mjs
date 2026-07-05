@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 const RELEASE_TARGET = process.argv[2];
@@ -61,23 +61,56 @@ function stageChangedFiles() {
 
 function bumpOrSetVersion(target) {
 	const currentVersion = getVersion();
+	let newVersion;
 
 	if (BUMP_TYPES.has(target)) {
-		console.log(`Bumping version (${target})...`);
-		run(`npm version ${target} -ws --no-git-tag-version && npm version ${target} --no-git-tag-version`);
-		run("node scripts/sync-versions.js");
-		return getVersion();
+		const parts = currentVersion.split(".").map(Number);
+		if (target === "major") {
+			parts[0] += 1;
+			parts[1] = 0;
+			parts[2] = 0;
+		} else if (target === "minor") {
+			parts[1] += 1;
+			parts[2] = 0;
+		} else if (target === "patch") {
+			parts[2] += 1;
+		}
+		newVersion = parts.join(".");
+		console.log(`Bumping version (${target}) to v${newVersion}...`);
+	} else {
+		if (compareVersions(target, currentVersion) <= 0) {
+			console.error(`Error: explicit version ${target} must be greater than current version ${currentVersion}.`);
+			process.exit(1);
+		}
+		newVersion = target;
+		console.log(`Setting explicit version to v${newVersion}...`);
 	}
 
-	if (compareVersions(target, currentVersion) <= 0) {
-		console.error(`Error: explicit version ${target} must be greater than current version ${currentVersion}.`);
-		process.exit(1);
+	const packagesDir = "packages";
+	const packages = readdirSync(packagesDir).filter((name) => {
+		try {
+			return statSync(join(packagesDir, name)).isDirectory();
+		} catch {
+			return false;
+		}
+	});
+
+	const targetPaths = [
+		"package.json",
+		...packages.map((pkg) => join(packagesDir, pkg, "package.json")),
+	];
+
+	for (const pkgPath of targetPaths) {
+		if (existsSync(pkgPath)) {
+			const data = JSON.parse(readFileSync(pkgPath, "utf-8"));
+			data.version = newVersion;
+			writeFileSync(pkgPath, JSON.stringify(data, null, 2) + "\n");
+			console.log(`  Updated ${pkgPath} to v${newVersion}`);
+		}
 	}
 
-	console.log(`Setting explicit version (${target})...`);
-	run(`npm version ${target} -ws --no-git-tag-version && npm version ${target} --no-git-tag-version`);
 	run("node scripts/sync-versions.js");
-	return getVersion();
+	return newVersion;
 }
 
 function getChangelogs() {
