@@ -35,6 +35,7 @@
     "src/ledger.ts",
     "src/poc-runner.ts",
     "src/sqlite-compat.ts",
+    "mcp",
     "skills",
     "README.md",
     "LICENSE"
@@ -50,7 +51,8 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "@sinclair/typebox": "^0.32.34"
+    "@sinclair/typebox": "^0.32.34",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/bun": "^1.3.14",
