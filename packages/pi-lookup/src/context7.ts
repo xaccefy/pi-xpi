@@ -48,9 +48,14 @@ export const context7Tool = {
 
     if (!libraryName) throw new Error("libraryName is required.");
 
+    const requestSignal = AbortSignal.any([
+      ...(signal ? [signal] : []),
+      AbortSignal.timeout(30000),
+    ]);
+
     // Step 1: resolve library name to ID
     const searchUrl = `${CONTEXT7_API}/search?query=${encodeURIComponent(libraryName)}`;
-    const searchRes = await fetch(searchUrl, { signal });
+    const searchRes = await fetch(searchUrl, { signal: requestSignal });
     if (!searchRes.ok) throw new Error(`Context7 search failed: ${searchRes.status}`);
 
     const searchData = (await searchRes.json()) as Context7SearchResponse;
@@ -66,7 +71,7 @@ export const context7Tool = {
     if (topic) docParams.set("topic", topic);
 
     const docsUrl = `${CONTEXT7_API}/${libraryId}?${docParams.toString()}`;
-    const docsRes = await fetch(docsUrl, { signal });
+    const docsRes = await fetch(docsUrl, { signal: requestSignal });
     if (!docsRes.ok) throw new Error(`Context7 docs failed: ${docsRes.status}`);
 
     const body = await docsRes.text();

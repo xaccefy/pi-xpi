@@ -68,12 +68,22 @@ function startDaemon(): void {
   daemonProcess = spawn("node", [scriptPath, "serve", "--port", DAEMON_PORT], {
     stdio: "ignore",
     env: { ...process.env, PORT: DAEMON_PORT },
+    windowsHide: true,
+    detached: false,
   });
 
   daemonProcess.on("exit", () => {
     daemonProcess = null;
   });
 }
+
+process.on("exit", () => {
+  if (daemonProcess) {
+    try {
+      daemonProcess.kill();
+    } catch {}
+  }
+});
 
 async function ensureDaemonRunning(): Promise<boolean> {
   if (await checkDaemonRunning()) {
