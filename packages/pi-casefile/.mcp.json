@@ -2,10 +2,7 @@
   "mcpServers": {
     "casefile": {
       "command": "bun",
-      "args": [
-        "run",
-        "./mcp/server.ts"
-      ],
+      "args": ["run", "./mcp/server.ts"],
       "cwd": ".",
       "env": {
         "CASEFILE_SCOPE": "project"

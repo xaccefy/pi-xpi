@@ -1,21 +1,18 @@
-import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert";
-import { rm } from "fs/promises";
-import { join } from "path";
-import { tmpdir } from "os";
 import { mkdtempSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, it } from "node:test";
 
 import {
   addCaseResult,
-  getCasefilePath,
   linkCasesResult,
   promoteFindingResult,
   readCasefile,
-  searchCases,
   setCasefilePath,
   unlinkCasesResult,
   updateCaseResult,
-  writeCaseReport,
 } from "../src/ledger.ts";
 
 const addCase = (input: Parameters<typeof addCaseResult>[0]) => {

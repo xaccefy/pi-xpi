@@ -1,29 +1,7 @@
-import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert";
-
+import { afterEach, beforeEach, describe, it } from "node:test";
+import { MockExtensionAPI } from "../../../test-utils.ts";
 import piLookup from "../src/index.ts";
-
-// Dummy Mock of Pi Extension API
-class MockExtensionAPI {
-  tools: any[] = [];
-  events: Record<string, Function[]> = {};
-
-  registerTool(spec: any) {
-    this.tools.push(spec);
-  }
-
-  on(event: string, handler: Function) {
-    if (!this.events[event]) this.events[event] = [];
-    this.events[event].push(handler);
-  }
-
-  async emit(event: string, ...args: any[]) {
-    const handlers = this.events[event] || [];
-    for (const h of handlers) {
-      await h(...args);
-    }
-  }
-}
 
 // Save original global fetch
 const originalFetch = globalThis.fetch;
@@ -100,7 +78,7 @@ describe("pi-lookup tool tests", () => {
       { query: "CVE-2024-1234" },
       null,
       null,
-      null
+      null,
     );
     assert.ok(searchResult.details.results.length > 0);
     assert.strictEqual(searchResult.details.results[0].title, "CVE-2024-1234 Detail");
@@ -112,7 +90,7 @@ describe("pi-lookup tool tests", () => {
       { url: "https://github.com/Aas-ee/open-webSearch" },
       null,
       null,
-      null
+      null,
     );
     assert.strictEqual(fetchResult.details.metadata.markdown, "# Mocked Markdown Content");
     assert.strictEqual(fetchResult.content[0].text, "# Mocked Markdown Content");

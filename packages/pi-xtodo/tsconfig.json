@@ -9,8 +9,5 @@
     "target": "ES2022",
     "types": ["bun"]
   },
-  "include": [
-    "index.ts",
-    "test/**/*.ts"
-  ]
+  "include": ["index.ts", "test/**/*.ts"]
 }

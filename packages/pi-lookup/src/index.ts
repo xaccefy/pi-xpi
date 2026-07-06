@@ -6,9 +6,9 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import websearchExtension from "./websearch.ts";
 import { context7Tool } from "./context7.ts";
 import { deepwikiTool } from "./deepwiki.ts";
+import websearchExtension from "./websearch.ts";
 
 export default function piLookup(pi: ExtensionAPI) {
   // Register web_search + web_fetch
@@ -37,7 +37,8 @@ export default function piLookup(pi: ExtensionAPI) {
 
     renderCall(args, theme) {
       return new Text(
-        theme.fg("toolTitle", theme.bold("Context7 ")) + theme.fg("dim", (args.libraryName as string) ?? ""),
+        theme.fg("toolTitle", theme.bold("Context7 ")) +
+          theme.fg("dim", (args.libraryName as string) ?? ""),
         0,
         0,
       );
@@ -48,7 +49,11 @@ export default function piLookup(pi: ExtensionAPI) {
         return new Text(theme.fg("error", "✗ Context7 failed"), 0, 0);
       }
       const details = result.details as { libraryId?: string } | undefined;
-      return new Text(theme.fg("success", "✓ Docs ") + theme.fg("muted", details?.libraryId ?? ""), 0, 0);
+      return new Text(
+        theme.fg("success", "✓ Docs ") + theme.fg("muted", details?.libraryId ?? ""),
+        0,
+        0,
+      );
     },
   });
 
@@ -75,7 +80,8 @@ export default function piLookup(pi: ExtensionAPI) {
 
     renderCall(args, theme) {
       return new Text(
-        theme.fg("toolTitle", theme.bold("DeepWiki ")) + theme.fg("dim", (args.repo as string) ?? ""),
+        theme.fg("toolTitle", theme.bold("DeepWiki ")) +
+          theme.fg("dim", (args.repo as string) ?? ""),
         0,
         0,
       );
@@ -86,7 +92,11 @@ export default function piLookup(pi: ExtensionAPI) {
         return new Text(theme.fg("error", "✗ DeepWiki failed"), 0, 0);
       }
       const details = result.details as { repo?: string } | undefined;
-      return new Text(theme.fg("success", "✓ Answer ") + theme.fg("muted", details?.repo ?? ""), 0, 0);
+      return new Text(
+        theme.fg("success", "✓ Answer ") + theme.fg("muted", details?.repo ?? ""),
+        0,
+        0,
+      );
     },
   });
 }

@@ -20,13 +20,16 @@ export const deepwikiTool = {
     "Ask questions about any public GitHub repository. " +
     "Use repo='owner/name' (e.g. 'facebook/react') and a natural-language question. " +
     "Returns synthesized answer with citations to source files.",
-  parameters: Type.Object({
-    repo: Type.String({
-      description: "GitHub repo in 'owner/name' format, e.g. 'facebook/react'",
-      pattern: "^[\\w.-]+/[\\w.-]+$",
-    }),
-    question: Type.String({ description: "Natural-language question about the repository" }),
-  }, { additionalProperties: false }),
+  parameters: Type.Object(
+    {
+      repo: Type.String({
+        description: "GitHub repo in 'owner/name' format, e.g. 'facebook/react'",
+        pattern: "^[\\w.-]+/[\\w.-]+$",
+      }),
+      question: Type.String({ description: "Natural-language question about the repository" }),
+    },
+    { additionalProperties: false },
+  ),
 
   async execute(_id: string, params: Record<string, unknown>, signal?: AbortSignal) {
     const repo = (params.repo as string | undefined)?.trim();

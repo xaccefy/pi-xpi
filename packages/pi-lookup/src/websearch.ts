@@ -6,14 +6,13 @@
  * - Tool: web_fetch — retrieve clean page markdown or article content.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
-import { spawn, type ChildProcess } from "node:child_process";
-import { join, resolve, dirname } from "node:path";
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { type ChildProcess, spawn } from "node:child_process";
 import { createRequire } from "node:module";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
+import { Type } from "@sinclair/typebox";
 
 // ── Constants & Environment ──────────────────────────────────────────
 
@@ -41,44 +40,19 @@ const DOMAIN_ENDPOINT_MAP = [
 // ── Helpers ──────────────────────────────────────────────────────────
 
 function getDaemonScriptPath(): string {
-  // 0. Resolve via Node module resolution (handles scoped npm packages correctly)
   try {
     const _require = createRequire(import.meta.url);
     return _require.resolve("open-websearch/build/index.js");
-  } catch {}
-
-  // 1. Check relative to process.cwd()
-  let searchPath = join(process.cwd(), "node_modules", "open-websearch", "build", "index.js");
-  if (existsSync(searchPath)) return searchPath;
-
-  // 2. Check parent node_modules (unscoped npm package layout)
-  searchPath = resolve(__dirname, "..", "open-websearch", "build", "index.js");
-  if (existsSync(searchPath)) return searchPath;
-
-  // 3. Check scoped npm package layout (@scope/pkg/src → @scope/pkg/ → @scope/ → node_modules/)
-  searchPath = resolve(__dirname, "..", "..", "..", "..", "open-websearch", "build", "index.js");
-  if (existsSync(searchPath)) return searchPath;
-
-  // 4. Check monorepo packages/node_modules (packages/pi-lookup → packages/node_modules)
-  searchPath = resolve(__dirname, "..", "..", "node_modules", "open-websearch", "build", "index.js");
-  if (existsSync(searchPath)) return searchPath;
-
-  // 5. Check monorepo root node_modules (packages/pi-lookup/src → ../../../node_modules)
-  searchPath = resolve(__dirname, "..", "..", "..", "node_modules", "open-websearch", "build", "index.js");
-  if (existsSync(searchPath)) return searchPath;
-
-  // 6. Check nested node_modules
-  searchPath = join(__dirname, "node_modules", "open-websearch", "build", "index.js");
-  if (existsSync(searchPath)) return searchPath;
-
-  return "";
+  } catch {
+    return "";
+  }
 }
 
 async function checkDaemonRunning(): Promise<boolean> {
   try {
     const res = await fetch(`${DAEMON_URL}/health`, { signal: AbortSignal.timeout(500) });
     if (res.ok) {
-      const body = await res.json() as any;
+      const body = (await res.json()) as any;
       return body?.status === "ok" || body?.data?.daemon === "running";
     }
   } catch {}
@@ -88,13 +62,12 @@ async function checkDaemonRunning(): Promise<boolean> {
 function startDaemon(): void {
   const scriptPath = getDaemonScriptPath();
   if (!scriptPath) {
-    console.error("pi-websearch: open-websearch daemon script not found. Run npm install.");
     return;
   }
 
   daemonProcess = spawn("node", [scriptPath, "serve", "--port", DAEMON_PORT], {
     stdio: "ignore",
-    env: { ...process.env, PORT: DAEMON_PORT }
+    env: { ...process.env, PORT: DAEMON_PORT },
   });
 
   daemonProcess.on("exit", () => {
@@ -141,7 +114,7 @@ async function stopDaemon(): Promise<void> {
 async function fetchWithRetry(
   url: string,
   options: RequestInit,
-  parentSignal?: AbortSignal
+  parentSignal?: AbortSignal,
 ): Promise<Response> {
   const requestSignal = AbortSignal.any([
     ...(parentSignal ? [parentSignal] : []),
@@ -195,23 +168,34 @@ function handleWebsearchError(err: unknown, toolName: string) {
   }
   return {
     content: [{ type: "text" as const, text: `${toolName} failed: ${message}${hint}` }],
-    details: { error: message }
+    isError: true,
+    details: { error: message },
   };
 }
 
 // ── Pi Extension ──────────────────────────────────────────────────────
 
 export default function websearchExtension(pi: ExtensionAPI) {
-
   // ── Tool: web_search ──
   pi.registerTool({
     name: "web_search",
     label: "Web Search",
-    description: "Search the web for real-world exploits, write-ups, or documentation using search engines (no API keys required).",
+    description:
+      "Search the web for real-world exploits, write-ups, or documentation using search engines (no API keys required).",
     parameters: Type.Object({
       query: Type.String({ description: "Search query string" }),
-      limit: Type.Optional(Type.Integer({ description: "Max search results (1-50, default: 10)", minimum: 1, maximum: 50 })),
-      engines: Type.Optional(Type.Array(Type.String(), { description: "Engines to query (e.g. bing, duckduckgo, brave, exa)" })),
+      limit: Type.Optional(
+        Type.Integer({
+          description: "Max search results (1-50, default: 10)",
+          minimum: 1,
+          maximum: 50,
+        }),
+      ),
+      engines: Type.Optional(
+        Type.Array(Type.String(), {
+          description: "Engines to query (e.g. bing, duckduckgo, brave, exa)",
+        }),
+      ),
     }),
 
     async execute(_id, params, signal, _onUpdate, _ctx) {
@@ -221,17 +205,21 @@ export default function websearchExtension(pi: ExtensionAPI) {
           throw new Error("Unable to establish connection with local open-websearch daemon.");
         }
 
-        const res = await fetchWithRetry(`${DAEMON_URL}/search`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            query: params.query,
-            limit: params.limit ?? 10,
-            engines: params.engines || ["duckduckgo", "startpage"],
-          }),
-        }, signal);
+        const res = await fetchWithRetry(
+          `${DAEMON_URL}/search`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              query: params.query,
+              limit: params.limit ?? 10,
+              engines: params.engines || ["duckduckgo", "startpage"],
+            }),
+          },
+          signal,
+        );
 
-        const body = await res.json() as any;
+        const body = (await res.json()) as any;
         if (body?.status !== "ok" || !body?.data) {
           throw new Error(body?.error?.message || "Invalid response format from daemon");
         }
@@ -239,8 +227,10 @@ export default function websearchExtension(pi: ExtensionAPI) {
         const results = body.data.results || [];
         if (results.length === 0) {
           return {
-            content: [{ type: "text" as const, text: `No results found for query: "${params.query}"` }],
-            details: { results: [] }
+            content: [
+              { type: "text" as const, text: `No results found for query: "${params.query}"` },
+            ],
+            details: { results: [] },
           };
         }
 
@@ -256,7 +246,7 @@ export default function websearchExtension(pi: ExtensionAPI) {
 
         return {
           content: [{ type: "text" as const, text: markdown.trim() }],
-          details: { results, query: params.query }
+          details: { results, query: params.query },
         };
       } catch (err) {
         return handleWebsearchError(err, "Web search");
@@ -270,20 +260,24 @@ export default function websearchExtension(pi: ExtensionAPI) {
       }
       const results = details?.results || [];
       const query = details?.query || "";
-      const baseText = theme.fg("success", "✓") + theme.fg("toolTitle", " Web Search: ") + theme.fg("dim", `${results.length} results found for "${query}"`);
+      const baseText =
+        theme.fg("success", "✓") +
+        theme.fg("toolTitle", " Web Search: ") +
+        theme.fg("dim", `${results.length} results found for "${query}"`);
       if (expanded) {
         const text = (result.content[0] as any)?.text || "";
-        return new Text(baseText + "\n" + text, 0, 0);
+        return new Text(`${baseText}\n${text}`, 0, 0);
       }
       return new Text(baseText, 0, 0);
-    }
+    },
   });
 
   // ── Tool: web_fetch ──
   pi.registerTool({
     name: "web_fetch",
     label: "Web Fetch",
-    description: "Read full text, markdown article content, or GitHub README files from an HTTP/HTTPS URL.",
+    description:
+      "Read full text, markdown article content, or GitHub README files from an HTTP/HTTPS URL.",
     parameters: Type.Object({
       url: Type.String({ description: "Valid HTTP or HTTPS URL to fetch" }),
     }),
@@ -308,25 +302,30 @@ export default function websearchExtension(pi: ExtensionAPI) {
           }
         }
 
-        const res = await fetchWithRetry(`${DAEMON_URL}${endpoint}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: targetUrl }),
-        }, signal);
+        const res = await fetchWithRetry(
+          `${DAEMON_URL}${endpoint}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url: targetUrl }),
+          },
+          signal,
+        );
 
-        const body = await res.json() as any;
+        const body = (await res.json()) as any;
         if (body?.status !== "ok" || !body?.data) {
           throw new Error(body?.error?.message || "Invalid response from daemon");
         }
 
         const data = body.data;
-        const textContent = typeof data === "string" 
-          ? data 
-          : (data.markdown || data.content || data.text || JSON.stringify(data));
+        const textContent =
+          typeof data === "string"
+            ? data
+            : data.markdown || data.content || data.text || JSON.stringify(data);
 
         return {
           content: [{ type: "text" as const, text: textContent }],
-          details: { metadata: data, url: targetUrl }
+          details: { metadata: data, url: targetUrl },
         };
       } catch (err) {
         return handleWebsearchError(err, "Web fetch");
@@ -341,12 +340,15 @@ export default function websearchExtension(pi: ExtensionAPI) {
       const url = details?.url || "";
       const text = (result.content[0] as any)?.text || "";
       const textLength = text.length;
-      const baseText = theme.fg("success", "✓") + theme.fg("toolTitle", " Web Fetch: ") + theme.fg("dim", `Fetched ${textLength} characters from "${url}"`);
+      const baseText =
+        theme.fg("success", "✓") +
+        theme.fg("toolTitle", " Web Fetch: ") +
+        theme.fg("dim", `Fetched ${textLength} characters from "${url}"`);
       if (expanded) {
-        return new Text(baseText + "\n" + text, 0, 0);
+        return new Text(`${baseText}\n${text}`, 0, 0);
       }
       return new Text(baseText, 0, 0);
-    }
+    },
   });
 
   // ── Session Event Bindings ──────────────────────────────────────────

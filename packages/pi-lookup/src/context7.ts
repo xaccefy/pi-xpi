@@ -26,11 +26,20 @@ export const context7Tool = {
     "Fetch up-to-date documentation for a library. " +
     "Use libraryName (e.g. 'react') and optional topic (e.g. 'hooks'). " +
     "Returns current docs with code examples.",
-  parameters: Type.Object({
-    libraryName: Type.String({ description: "Library name, e.g. 'react', 'next.js', 'zod'" }),
-    topic: Type.Optional(Type.String({ description: "Specific topic within the library, e.g. 'hooks', 'routing', 'validation'" })),
-    maxTokens: Type.Optional(Type.Number({ description: "Max tokens of documentation to return (default 10000)" })),
-  }, { additionalProperties: false }),
+  parameters: Type.Object(
+    {
+      libraryName: Type.String({ description: "Library name, e.g. 'react', 'next.js', 'zod'" }),
+      topic: Type.Optional(
+        Type.String({
+          description: "Specific topic within the library, e.g. 'hooks', 'routing', 'validation'",
+        }),
+      ),
+      maxTokens: Type.Optional(
+        Type.Number({ description: "Max tokens of documentation to return (default 10000)" }),
+      ),
+    },
+    { additionalProperties: false },
+  ),
 
   async execute(_id: string, params: Record<string, unknown>, signal?: AbortSignal) {
     const libraryName = (params.libraryName as string | undefined)?.trim();

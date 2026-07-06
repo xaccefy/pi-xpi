@@ -16,6 +16,7 @@
     "packages/pi-lookup/src/**/*.ts",
     "packages/pi-lookup/test/**/*.ts",
     "packages/pi-codeintel/src/**/*.ts",
-    "packages/pi-xtodo/index.ts"
+    "packages/pi-xtodo/index.ts",
+    "packages/pi-sqlite-compat/src/**/*.ts"
   ]
 }

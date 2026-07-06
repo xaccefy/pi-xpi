@@ -10,15 +10,21 @@
  * - Auto-indexing on target, status, priority, severity.
  */
 
-import { DatabaseSync } from "./sqlite-compat.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "path";
-import { homedir } from "os";
+import { dirname, join, resolve } from "node:path";
+import { DatabaseSync } from "@xaccefy/pi-sqlite-compat";
 
 // ── Types ────────────────────────────────────────────────────────────
 
-export const STATUS_VALUES = ["hypothesis", "investigating", "confirmed", "blocked", "killed", "reported"] as const;
+export const STATUS_VALUES = [
+  "hypothesis",
+  "investigating",
+  "confirmed",
+  "blocked",
+  "killed",
+  "reported",
+] as const;
 export type CaseStatus = (typeof STATUS_VALUES)[number];
 
 export const CONFIDENCE_VALUES = ["low", "medium", "high"] as const;
@@ -30,7 +36,16 @@ export type CaseSeverity = (typeof SEVERITY_VALUES)[number];
 export const PRIORITY_VALUES = ["P0", "P1", "P2", "P3", "P4"] as const;
 export type CasePriority = (typeof PRIORITY_VALUES)[number];
 
-export const SEARCH_FIELD_VALUES = ["title", "summary", "evidence", "impact", "target", "endpoint", "bugClass", "poc"] as const;
+export const SEARCH_FIELD_VALUES = [
+  "title",
+  "summary",
+  "evidence",
+  "impact",
+  "target",
+  "endpoint",
+  "bugClass",
+  "poc",
+] as const;
 export type CaseSearchField = (typeof SEARCH_FIELD_VALUES)[number];
 
 export type CaseRecord = {
@@ -55,7 +70,13 @@ export type CaseRecord = {
   /** Explicit assumptions or unknowns to avoid overstating exploitability. */
   assumptions?: string[];
   /** Verification of an on-disk PoC run (set only by promoteFindingResult). */
-  pocVerified?: { path: string; exitCode: number; ranAt: string; output?: string; sandbox: boolean };
+  pocVerified?: {
+    path: string;
+    exitCode: number;
+    ranAt: string;
+    output?: string;
+    sandbox: boolean;
+  };
   /** ISO timestamp when CaseReport first wrote the markdown report. */
   reportedAt?: string;
   /** Path to the generated markdown report (set only by writeCaseReport). */
@@ -131,14 +152,8 @@ export type CaseSearchOptions = {
 let ledgerPathOverride: string | undefined;
 let dbInstance: DatabaseSync | undefined;
 
-function nowIso(): string {
-  return new Date().toISOString();
-}
-
 function normalizeList(values: string[] | undefined): string[] {
-  return Array.from(
-    new Set((values ?? []).map((v) => v.trim()).filter(Boolean)),
-  );
+  return Array.from(new Set((values ?? []).map((v) => v.trim()).filter(Boolean)));
 }
 
 function normalizeText(value: string | undefined): string | undefined {
@@ -152,14 +167,6 @@ function normalizeMatchText(value: string | undefined): string {
 
 function stableShortId(input: string): string {
   return createHash("sha1").update(input).digest("hex").slice(0, 10);
-}
-
-function firstEnv(...names: string[]): { name: string; value: string } | undefined {
-  for (const name of names) {
-    const value = process.env[name]?.trim();
-    if (value) return { name, value };
-  }
-  return undefined;
 }
 
 function detectWorkspaceRoot(): string {
@@ -178,25 +185,8 @@ function detectWorkspaceRoot(): string {
 
 export function getCasefilePath(): string {
   if (ledgerPathOverride) return ledgerPathOverride;
-
-  const explicitPath = firstEnv("CASEFILE_PATH", "PI_CASEFILE_PATH");
-  if (explicitPath) return resolve(explicitPath.value);
-
-  const scopeConfig = firstEnv("CASEFILE_SCOPE", "PI_CASEFILE_SCOPE");
-  const scope = (scopeConfig?.value.toLowerCase() || "project");
-  
-  if (scope === "global" && scopeConfig?.name === "PI_CASEFILE_SCOPE") {
-    return join(homedir(), ".pi", "casefile", "casefile.db");
-  }
-  if (scope === "global") {
-    return join(homedir(), ".casefile", "casefile.db");
-  }
-
-  const projectDir = scopeConfig?.name === "CASEFILE_SCOPE"
-    ? ".casefile"
-    : ".pi";
-
-  return join(detectWorkspaceRoot(), projectDir, "casefile.db");
+  if (process.env.PI_CASEFILE_PATH) return resolve(process.env.PI_CASEFILE_PATH.trim());
+  return join(detectWorkspaceRoot(), ".pi", "casefile.db");
 }
 
 export function setCasefilePath(path: string | undefined): void {
@@ -220,7 +210,7 @@ function getDb(): DatabaseSync {
   }
 
   const db = new DatabaseSync(dbPath);
-  
+
   // Create tables
   db.exec(`
     CREATE TABLE IF NOT EXISTS cases (
@@ -326,7 +316,7 @@ function mapRow(row: any, linkedCaseIds: string[] = []): CaseRecord {
 
 export function readCasefile(): CaseRecord[] {
   const db = getDb();
-  
+
   // Read all cases
   const stmt = db.prepare("SELECT * FROM cases");
   const rows = stmt.all();
@@ -334,11 +324,11 @@ export function readCasefile(): CaseRecord[] {
   // Read all links to construct linkedCaseIds map
   const linkStmt = db.prepare("SELECT source_id, target_id FROM case_links");
   const links = linkStmt.all() as { source_id: string; target_id: string }[];
-  
+
   const linkMap = new Map<string, string[]>();
   for (const link of links) {
     if (!linkMap.has(link.source_id)) linkMap.set(link.source_id, []);
-    linkMap.get(link.source_id)!.push(link.target_id);
+    linkMap.get(link.source_id)?.push(link.target_id);
   }
 
   return rows.map((row: any) => mapRow(row, linkMap.get(row.id) ?? []));
@@ -352,8 +342,11 @@ export function getCaseById(id: string): CaseRecord | undefined {
 
   const linkStmt = db.prepare("SELECT target_id FROM case_links WHERE source_id = ?");
   const links = linkStmt.all(id) as { target_id: string }[];
-  
-  return mapRow(row, links.map(l => l.target_id));
+
+  return mapRow(
+    row,
+    links.map((l) => l.target_id),
+  );
 }
 
 // ── Validation ────────────────────────────────────────────────────────
@@ -373,9 +366,16 @@ function validateCase(record: CaseRecord): void {
     (record.blockers ?? []).length === 0 &&
     (record.assumptions ?? []).length === 0
   ) {
-    throw new Error("Killed cases require evidence, next step, blockers, or assumptions explaining why");
+    throw new Error(
+      "Killed cases require evidence, next step, blockers, or assumptions explaining why",
+    );
   }
-  if (record.status === "reported" && !record.poc && !record.remediation && (record.references ?? []).length === 0) {
+  if (
+    record.status === "reported" &&
+    !record.poc &&
+    !record.remediation &&
+    (record.references ?? []).length === 0
+  ) {
     throw new Error("Reported cases require poc, remediation, or references");
   }
 }
@@ -389,10 +389,14 @@ function validateTransition(
   if (from === to) return;
 
   if (from === "killed") {
-    throw new Error(`Cannot revive a killed case; open a new case if the lead is revived (was ${from} → ${to})`);
+    throw new Error(
+      `Cannot revive a killed case; open a new case if the lead is revived (was ${from} → ${to})`,
+    );
   }
   if (from === "reported") {
-    throw new Error(`Cannot mutate a reported case; file a follow-up case instead (was ${from} → ${to})`);
+    throw new Error(
+      `Cannot mutate a reported case; file a follow-up case instead (was ${from} → ${to})`,
+    );
   }
 
   if (to === "killed") return;
@@ -402,14 +406,17 @@ function validateTransition(
   const transitions: Partial<Record<CaseStatus, Partial<Record<CaseStatus, Rule>>>> = {
     hypothesis: {
       investigating: (u) =>
-        !u.evidence ? "INVESTIGATING requires evidence (source→sink trace)" :
-        !u.confidence ? "INVESTIGATING requires confidence level" :
-        null,
+        !u.evidence
+          ? "INVESTIGATING requires evidence (source→sink trace)"
+          : !u.confidence
+            ? "INVESTIGATING requires confidence level"
+            : null,
       confirmed: () => "Cannot jump hypothesis → confirmed; promote to investigating first",
       reported: () => "Cannot jump hypothesis → reported; confirm first",
     },
     investigating: {
-      confirmed: () => "investigating → confirmed requires a verified PoC run; use the promote_finding tool",
+      confirmed: () =>
+        "investigating → confirmed requires a verified PoC run; use the promote_finding tool",
       hypothesis: () => null,
     },
     confirmed: {
@@ -421,9 +428,11 @@ function validateTransition(
     },
     blocked: {
       investigating: (u) =>
-        !u.evidence ? "INVESTIGATING requires evidence (source→sink trace)" :
-        !u.confidence ? "INVESTIGATING requires confidence level" :
-        null,
+        !u.evidence
+          ? "INVESTIGATING requires evidence (source→sink trace)"
+          : !u.confidence
+            ? "INVESTIGATING requires confidence level"
+            : null,
       hypothesis: () => null,
     },
   };
@@ -440,7 +449,9 @@ function validateTransition(
 
 function validateNewCaseInput(input: CaseInput): void {
   if (input.status && input.status !== "hypothesis" && input.status !== "investigating") {
-    throw new Error("New cases must start as hypothesis or investigating; promote with CaseUpdate after validation");
+    throw new Error(
+      "New cases must start as hypothesis or investigating; promote with CaseUpdate after validation",
+    );
   }
   if (input.status === "investigating") {
     if (!input.evidence) {
@@ -452,15 +463,10 @@ function validateNewCaseInput(input: CaseInput): void {
   }
 }
 
-function buildRecord(
-  input: NormalizedCaseInput,
-  existing?: CaseRecord,
-): CaseRecord {
-  const timestamp = nowIso();
+function buildRecord(input: NormalizedCaseInput, existing?: CaseRecord): CaseRecord {
+  const timestamp = new Date().toISOString();
   const title = ("title" in input ? input.title : existing?.title)?.trim() ?? "";
-  const id =
-    existing?.id ??
-    `case_${stableShortId(`${title}\n${timestamp}\n${randomUUID()}`)}`;
+  const id = existing?.id ?? `case_${stableShortId(`${title}\n${timestamp}\n${randomUUID()}`)}`;
 
   return {
     id,
@@ -477,7 +483,8 @@ function buildRecord(
     impact: input.impact !== undefined ? normalizeText(input.impact) : existing?.impact,
     nextStep: input.nextStep !== undefined ? normalizeText(input.nextStep) : existing?.nextStep,
     poc: input.poc !== undefined ? normalizeText(input.poc) : existing?.poc,
-    remediation: input.remediation !== undefined ? normalizeText(input.remediation) : existing?.remediation,
+    remediation:
+      input.remediation !== undefined ? normalizeText(input.remediation) : existing?.remediation,
     references: normalizeList(input.references ?? existing?.references),
     blockers: normalizeList(input.blockers ?? existing?.blockers),
     tags: normalizeList(input.tags ?? existing?.tags),
@@ -513,7 +520,10 @@ function findDuplicateCaseInDb(db: DatabaseSync, candidate: CaseRecord): CaseRec
       // Find links
       const linkStmt = db.prepare("SELECT target_id FROM case_links WHERE source_id = ?");
       const links = linkStmt.all(row.id) as { target_id: string }[];
-      return mapRow(row, links.map(l => l.target_id));
+      return mapRow(
+        row,
+        links.map((l) => l.target_id),
+      );
     }
   }
   return undefined;
@@ -560,7 +570,7 @@ function insertOrReplaceCase(db: DatabaseSync, record: CaseRecord) {
     record.reportedAt || null,
     record.reportPath || null,
     record.createdAt,
-    record.updatedAt
+    record.updatedAt,
   );
 }
 
@@ -584,17 +594,25 @@ export function addCaseResult(input: CaseInput): CaseAddResult {
   return { record, created: true };
 }
 
-export function updateCaseResult(
-  id: string,
-  update: CaseUpdate,
-): CaseUpdateResult {
+export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResult {
   const db = getDb();
   const current = getCaseById(id);
   if (!current) {
     throw new Error(`Case not found: ${id}`);
   }
 
-  const optionalFields = ["title", "target", "endpoint", "bugClass", "summary", "evidence", "impact", "nextStep", "poc", "remediation"] as const;
+  const optionalFields = [
+    "title",
+    "target",
+    "endpoint",
+    "bugClass",
+    "summary",
+    "evidence",
+    "impact",
+    "nextStep",
+    "poc",
+    "remediation",
+  ] as const;
   const optionalPatch: Record<string, unknown> = {};
   for (const field of optionalFields) {
     if (field in update && update[field] !== undefined) {
@@ -614,7 +632,7 @@ export function updateCaseResult(
       tags: update.tags ?? current.tags,
       assumptions: update.assumptions ?? current.assumptions,
     },
-    current
+    current,
   );
 
   if (update.status && update.status !== current.status) {
@@ -623,11 +641,13 @@ export function updateCaseResult(
   validateCase(next);
 
   // Check material equality (we ignore links since links are mutated via CaseLink)
-  const norm = (r: CaseRecord) => JSON.stringify({ ...r, updatedAt: "", createdAt: "", linkedCaseIds: [] });
+  const norm = (r: CaseRecord) =>
+    JSON.stringify({ ...r, updatedAt: "", createdAt: "", linkedCaseIds: [] });
   if (norm(current) === norm(next)) {
-    const reason = update.status && update.status === current.status
-      ? `Case is already ${current.status}; no material fields changed.`
-      : "No material fields changed.";
+    const reason =
+      update.status && update.status === current.status
+        ? `Case is already ${current.status}; no material fields changed.`
+        : "No material fields changed.";
     return { record: current, changed: false, reason };
   }
 
@@ -649,7 +669,10 @@ export function updateCaseResult(
     ) {
       const linkStmt = db.prepare("SELECT target_id FROM case_links WHERE source_id = ?");
       const links = linkStmt.all(row.id) as { target_id: string }[];
-      duplicate = mapRow(row, links.map(l => l.target_id));
+      duplicate = mapRow(
+        row,
+        links.map((l) => l.target_id),
+      );
       break;
     }
   }
@@ -674,10 +697,7 @@ type PocVerification = {
   sandbox: boolean;
 };
 
-export function promoteFindingResult(
-  id: string,
-  verification: PocVerification,
-): CaseUpdateResult {
+export function promoteFindingResult(id: string, verification: PocVerification): CaseUpdateResult {
   const db = getDb();
   const current = getCaseById(id);
   if (!current) {
@@ -699,7 +719,9 @@ export function promoteFindingResult(
     throw new Error("CONFIRMED requires severity; set severity on the case first");
   }
   if (verification.exitCode !== 0) {
-    throw new Error(`PoC verification failed (exit ${verification.exitCode}); cannot promote to confirmed`);
+    throw new Error(
+      `PoC verification failed (exit ${verification.exitCode}); cannot promote to confirmed`,
+    );
   }
 
   const next = buildRecord(
@@ -707,7 +729,7 @@ export function promoteFindingResult(
       status: "confirmed",
       pocVerified: verification,
     },
-    current
+    current,
   );
   validateCase(next);
 
@@ -717,10 +739,7 @@ export function promoteFindingResult(
 
 // ── Link operations ──────────────────────────────────────────────────
 
-export function linkCasesResult(
-  sourceId: string,
-  targetId: string,
-): CaseLinkResult {
+export function linkCasesResult(sourceId: string, targetId: string): CaseLinkResult {
   const db = getDb();
   if (sourceId === targetId) {
     throw new Error("Cannot link a case to itself");
@@ -742,7 +761,7 @@ export function linkCasesResult(
   linkStmt.run(sourceId, targetId);
   linkStmt.run(targetId, sourceId);
 
-  const now = nowIso();
+  const now = new Date().toISOString();
   const updateTimeStmt = db.prepare("UPDATE cases SET updated_at = ? WHERE id = ?");
   updateTimeStmt.run(now, sourceId);
   updateTimeStmt.run(now, targetId);
@@ -752,10 +771,7 @@ export function linkCasesResult(
   return { source: finalSource, target: finalTarget, changed: true };
 }
 
-export function unlinkCasesResult(
-  sourceId: string,
-  targetId: string,
-): CaseLinkResult {
+export function unlinkCasesResult(sourceId: string, targetId: string): CaseLinkResult {
   const db = getDb();
   const source = getCaseById(sourceId);
   const target = getCaseById(targetId);
@@ -769,10 +785,12 @@ export function unlinkCasesResult(
     return { source, target, changed: false, reason: "Cases are not linked" };
   }
 
-  const unlinkStmt = db.prepare("DELETE FROM case_links WHERE (source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?)");
+  const unlinkStmt = db.prepare(
+    "DELETE FROM case_links WHERE (source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?)",
+  );
   unlinkStmt.run(sourceId, targetId, targetId, sourceId);
 
-  const now = nowIso();
+  const now = new Date().toISOString();
   const updateTimeStmt = db.prepare("UPDATE cases SET updated_at = ? WHERE id = ?");
   updateTimeStmt.run(now, sourceId);
   updateTimeStmt.run(now, targetId);
@@ -784,10 +802,7 @@ export function unlinkCasesResult(
 
 // ── Search & Queries ─────────────────────────────────────────────────
 
-function caseHaystack(
-  record: CaseRecord,
-  field?: CaseSearchField,
-): string {
+function caseHaystack(record: CaseRecord, field?: CaseSearchField): string {
   if (field) {
     const val = record[field];
     if (Array.isArray(val)) return val.join(" ").toLowerCase();
@@ -801,9 +816,10 @@ function caseHaystack(
     .toLowerCase();
 }
 
-export function searchCases(
-  options: CaseSearchOptions = {},
-): { cases: CaseRecord[]; total: number } {
+export function searchCases(options: CaseSearchOptions = {}): {
+  cases: CaseRecord[];
+  total: number;
+} {
   const query = options.query?.trim().toLowerCase();
   const field = options.field;
   const tag = options.tag?.trim().toLowerCase();
@@ -824,9 +840,7 @@ export function searchCases(
     .filter((r) => !options.confidence || r.confidence === options.confidence)
     .filter((r) => !options.severity || r.severity === options.severity)
     .filter((r) => !options.priority || r.priority === options.priority)
-    .filter(
-      (r) => !tag || r.tags?.some((t) => t.toLowerCase() === tag),
-    )
+    .filter((r) => !tag || r.tags?.some((t) => t.toLowerCase() === tag))
     .filter((r) => !query || caseHaystack(r, field).includes(query))
     .sort((a, b) => {
       const aStatus = STATUS_ORDER.indexOf(a.status);
@@ -868,9 +882,7 @@ export function formatCase(record: CaseRecord): string {
     record.endpoint ? `endpoint=${record.endpoint}` : undefined,
     record.target ? `target=${record.target}` : undefined,
     record.tags?.length ? `tags=${record.tags.join(",")}` : undefined,
-    record.linkedCaseIds.length
-      ? `links=${record.linkedCaseIds.join(",")}`
-      : undefined,
+    record.linkedCaseIds.length ? `links=${record.linkedCaseIds.join(",")}` : undefined,
     record.nextStep ? `next=${record.nextStep}` : undefined,
   ].filter(Boolean);
   return bits.join(" | ");
@@ -884,7 +896,12 @@ export function formatCases(records: CaseRecord[]): string {
 export function formatCaseDetail(record: CaseRecord): string {
   const lines = [`═══ ${record.id} ═══`];
   for (const [key, val] of Object.entries(record)) {
-    if (!val || (Array.isArray(val) && !val.length) || ["id", "createdAt", "updatedAt"].includes(key)) continue;
+    if (
+      !val ||
+      (Array.isArray(val) && !val.length) ||
+      ["id", "createdAt", "updatedAt"].includes(key)
+    )
+      continue;
     const label = key.charAt(0).toUpperCase() + key.slice(1).replace(/([A-Z])/g, " $1");
     const display = Array.isArray(val)
       ? val.join(", ")
@@ -893,15 +910,9 @@ export function formatCaseDetail(record: CaseRecord): string {
         : val;
     lines.push(`${label.padEnd(12)} ${display}`);
   }
-  return lines.concat([`Created:     ${record.createdAt}`, `Updated:     ${record.updatedAt}`]).join("\n");
-}
-
-function slugify(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 70) || "case";
+  return lines
+    .concat([`Created:     ${record.createdAt}`, `Updated:     ${record.updatedAt}`])
+    .join("\n");
 }
 
 function mdSection(title: string, body?: string): string {
@@ -917,13 +928,23 @@ export function writeCaseReport(id: string): { path: string; record: CaseRecord 
 
   const db = getDb();
   const dbPath = getCasefilePath();
-  
+
   const reportDir = join(dirname(dbPath), "report");
   mkdirSync(reportDir, { recursive: true });
 
-  const reportPath = join(reportDir, `${slugify(current.title)}-${current.id}.md`);
-  const references = current.references?.length ? current.references.map((r) => `- ${r}`).join("\n") : undefined;
-  const assumptions = current.assumptions?.length ? current.assumptions.map((a) => `- ${a}`).join("\n") : undefined;
+  const slug =
+    current.title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 70) || "case";
+  const reportPath = join(reportDir, `${slug}-${current.id}.md`);
+  const references = current.references?.length
+    ? current.references.map((r) => `- ${r}`).join("\n")
+    : undefined;
+  const assumptions = current.assumptions?.length
+    ? current.assumptions.map((a) => `- ${a}`).join("\n")
+    : undefined;
   const body = [
     `# ${current.title}`,
     `**Severity:** ${current.severity ?? "Not assessed"}`,
@@ -941,15 +962,17 @@ export function writeCaseReport(id: string): { path: string; record: CaseRecord 
     mdSection("Remediation", current.remediation),
     mdSection("Assumptions and Uncertainty", assumptions),
     mdSection("References", references),
-  ].filter(Boolean).join("\n");
-  
+  ]
+    .filter(Boolean)
+    .join("\n");
+
   writeFileSync(reportPath, body, "utf8");
 
   const next: CaseRecord = {
     ...current,
     reportPath,
-    reportedAt: current.reportedAt ?? nowIso(),
-    updatedAt: nowIso(),
+    reportedAt: current.reportedAt ?? new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
   };
 
   insertOrReplaceCase(db, next);

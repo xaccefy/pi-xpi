@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { mkdtemp, rm } from "fs/promises";
-import { join } from "path";
-import { tmpdir } from "os";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { setCasefilePath } from "../src/ledger.ts";
 
@@ -36,7 +36,13 @@ mock.module("@earendil-works/pi-tui", () => ({
 }));
 
 mock.module("../src/poc-runner.ts", () => ({
-  runPoc: () => ({ path: "/mock/poc.sh", exitCode: 0, output: "ok", ranAt: "2024-01-01T00:00:00Z", sandbox: true }),
+  runPoc: () => ({
+    path: "/mock/poc.sh",
+    exitCode: 0,
+    output: "ok",
+    ranAt: "2024-01-01T00:00:00Z",
+    sandbox: true,
+  }),
 }));
 
 type FakePi = {

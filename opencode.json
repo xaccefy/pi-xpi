@@ -1,0 +1,6 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "/home/xaccefy/.local/share/opencode/repos/github.com/DietrichGebert/ponytail/.opencode/plugins/ponytail.mjs"
+  ]
+}

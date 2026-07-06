@@ -5,13 +5,13 @@
  * with a fully lazy-loaded implementation to keep agent startup overhead near zero.
  */
 
-import * as path from "node:path";
-import * as fs from "node:fs";
 import { createHash } from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
 import { Text } from "@earendil-works/pi-tui";
-import type { DatabaseSync } from "./sqlite-compat.ts";
+import { Type } from "@sinclair/typebox";
+import type { DatabaseSync } from "@xaccefy/pi-sqlite-compat";
 
 // ── Lazy Load Helpers ───────────────────────────────────────────────
 
@@ -41,7 +41,7 @@ async function getDb(workspace: string): Promise<DatabaseSync> {
   const cached = dbInstances.get(absWorkspace);
   if (cached) return cached;
 
-  const { DatabaseSync } = await import("./sqlite-compat.ts");
+  const { DatabaseSync } = await import("@xaccefy/pi-sqlite-compat");
   const dbPath = getDbPath(absWorkspace);
   const db = new DatabaseSync(dbPath);
 
@@ -282,7 +282,9 @@ function parseSourceFile(ts: any, filePath: string, content: string) {
 // ── Tools Schema ────────────────────────────────────────────────────
 
 const WorkspaceSchema = Type.Object({
-  workspace: Type.Optional(Type.String({ description: "Target workspace path (default: current directory)" })),
+  workspace: Type.Optional(
+    Type.String({ description: "Target workspace path (default: current directory)" }),
+  ),
 });
 
 const IndexSchema = Type.Object({
@@ -292,7 +294,9 @@ const IndexSchema = Type.Object({
 
 const FindSymbolSchema = Type.Object({
   query: Type.String({ description: "Search query for symbol names (case-insensitive)" }),
-  kind: Type.Optional(Type.String({ description: "Filter by symbol kind (Class, Function, Method, etc.)" })),
+  kind: Type.Optional(
+    Type.String({ description: "Filter by symbol kind (Class, Function, Method, etc.)" }),
+  ),
   workspace: Type.Optional(Type.String()),
 });
 
@@ -303,14 +307,20 @@ const GetSymbolSchema = Type.Object({
 
 const CallGraphSchema = Type.Object({
   symbolName: Type.String({ description: "The starting symbol name" }),
-  direction: Type.Union([Type.Literal("inbound"), Type.Literal("outbound")], { description: "Call trace direction" }),
+  direction: Type.Union([Type.Literal("inbound"), Type.Literal("outbound")], {
+    description: "Call trace direction",
+  }),
   depth: Type.Optional(Type.Number({ description: "Max call graph traversal depth (default: 3)" })),
   workspace: Type.Optional(Type.String()),
 });
 
 const TraceCallPathSchema = Type.Object({
-  targetSymbol: Type.String({ description: "Name of the target function/symbol to trace paths leading to" }),
-  sourceSymbol: Type.Optional(Type.String({ description: "Optional starting function/symbol name to filter paths from" })),
+  targetSymbol: Type.String({
+    description: "Name of the target function/symbol to trace paths leading to",
+  }),
+  sourceSymbol: Type.Optional(
+    Type.String({ description: "Optional starting function/symbol name to filter paths from" }),
+  ),
   workspace: Type.Optional(Type.String()),
 });
 
@@ -409,7 +419,8 @@ async function indexWorkspace(
       }
 
       for (const call of calls) {
-        const callerId = symbolIdMap.get(call.callerName) || `${relPath}:${call.callerName}:(global)`;
+        const callerId =
+          symbolIdMap.get(call.callerName) || `${relPath}:${call.callerName}:(global)`;
         insertCall.run(callerId, call.calleeName, relPath, call.line);
       }
 
@@ -462,7 +473,8 @@ export default function codebaseExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "CodebaseIndex",
     label: "Index Codebase",
-    description: "Scan and build/update a persistent AST-based SQLite codebase index of the workspace.",
+    description:
+      "Scan and build/update a persistent AST-based SQLite codebase index of the workspace.",
     parameters: IndexSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
@@ -517,13 +529,15 @@ export default function codebaseExtension(pi: ExtensionAPI) {
       const workspace = (params.workspace as string) || process.cwd();
       const db = await ensureIndexed(workspace);
       // Escape LIKE wildcards so user searches for literal "%" or "_" work correctly
-      const escapedQuery = (params.query as string).replace(/[%_]/g, (char) => "\\" + char);
+      const escapedQuery = (params.query as string).replace(/[%_]/g, (char) => `\\${char}`);
       const query = `%${escapedQuery}%`;
       const kind = params.kind as string | undefined;
 
       let rows: any[] = [];
       if (kind) {
-        const stmt = db.prepare("SELECT * FROM symbols WHERE name LIKE ? ESCAPE '\\' AND kind = ? LIMIT 100");
+        const stmt = db.prepare(
+          "SELECT * FROM symbols WHERE name LIKE ? ESCAPE '\\' AND kind = ? LIMIT 100",
+        );
         rows = stmt.all(query, kind);
       } else {
         const stmt = db.prepare("SELECT * FROM symbols WHERE name LIKE ? ESCAPE '\\' LIMIT 100");
@@ -544,7 +558,8 @@ export default function codebaseExtension(pi: ExtensionAPI) {
         lines.push(`  Path: ${row.file_path}#L${row.start_line}-${row.end_line}`);
         if (row.signature) lines.push(`  Signature: ${row.signature}`);
         if (row.docstring) {
-          const doc = row.docstring.length > 150 ? row.docstring.slice(0, 150) + "..." : row.docstring;
+          const doc =
+            row.docstring.length > 150 ? `${row.docstring.slice(0, 150)}...` : row.docstring;
           lines.push(`  Docs: ${doc}`);
         }
       }
@@ -638,7 +653,9 @@ export default function codebaseExtension(pi: ExtensionAPI) {
 
       const lines = [`References to "${name}":`];
       for (const row of rows) {
-        const callerText = row.caller_name ? `${row.caller_name} (${row.caller_kind})` : "(global/anonymous)";
+        const callerText = row.caller_name
+          ? `${row.caller_name} (${row.caller_kind})`
+          : "(global/anonymous)";
         lines.push(`  - ${row.file_path}:${row.line} in ${callerText}`);
       }
 
@@ -680,7 +697,7 @@ export default function codebaseExtension(pi: ExtensionAPI) {
 
         for (const c of callers) {
           lines.push(`${indent}↖ ${c.caller} [${c.kind}] (${c.file_path}:${c.line})`);
-          traceInbound(c.caller, currentDepth + 1, indent + "  ");
+          traceInbound(c.caller, currentDepth + 1, `${indent}  `);
         }
       }
 
@@ -701,7 +718,7 @@ export default function codebaseExtension(pi: ExtensionAPI) {
           const callees = callStmt.all(s.id) as any[];
           for (const c of callees) {
             lines.push(`${indent}↘ ${c.callee_name} (${c.file_path}:${c.line})`);
-            traceOutbound(c.callee_name, currentDepth + 1, indent + "  ");
+            traceOutbound(c.callee_name, currentDepth + 1, `${indent}  `);
           }
         }
       }
@@ -727,7 +744,8 @@ export default function codebaseExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "CodebaseTraceCallPath",
     label: "Trace Call Path",
-    description: "Scan call graph database paths to trace call routes leading to a target function or symbol.",
+    description:
+      "Scan call graph database paths to trace call routes leading to a target function or symbol.",
     parameters: TraceCallPathSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
@@ -850,12 +868,14 @@ export default function codebaseExtension(pi: ExtensionAPI) {
       const topImports = importStmt.all() as any[];
 
       // General counts
-      const counts = db.prepare(`
+      const counts = db
+        .prepare(`
         SELECT 
           (SELECT count(*) FROM files) as files_count,
           (SELECT count(*) FROM symbols) as symbols_count,
           (SELECT count(*) FROM calls) as calls_count
-      `).get();
+      `)
+        .get();
 
       const lines = [
         `Codebase Architecture Summary for: ${workspace}`,
@@ -872,10 +892,7 @@ export default function codebaseExtension(pi: ExtensionAPI) {
         lines.push(`  - ${h.callee_name} (called ${h.call_count}x)${loc}`);
       }
 
-      lines.push(
-        ``,
-        `Top Internal/External Dependencies (frequent imports):`,
-      );
+      lines.push(``, `Top Internal/External Dependencies (frequent imports):`);
 
       for (const i of topImports) {
         lines.push(`  - "${i.module_name}" (imported ${i.import_count}x)`);
