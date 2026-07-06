@@ -1,6 +1,6 @@
 {
   "name": "@xaccefy/pi-codeintel",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "AST-based TypeScript/JavaScript code intelligence indexer and query tool for Pi Agent",
   "keywords": [
     "pi-package",
@@ -27,6 +27,7 @@
   },
   "files": [
     "src/index.ts",
+    "src/sqlite-compat/index.ts",
     "README.md",
     "LICENSE"
   ],
