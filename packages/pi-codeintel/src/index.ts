@@ -11,7 +11,7 @@ import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import type { DatabaseSync } from "@xaccefy/pi-sqlite-compat";
+import { DatabaseSync } from "./sqlite-compat/index.ts";
 
 // ── Lazy Load Helpers ───────────────────────────────────────────────
 
@@ -41,7 +41,6 @@ async function getDb(workspace: string): Promise<DatabaseSync> {
   const cached = dbInstances.get(absWorkspace);
   if (cached) return cached;
 
-  const { DatabaseSync } = await import("@xaccefy/pi-sqlite-compat");
   const dbPath = getDbPath(absWorkspace);
   const db = new DatabaseSync(dbPath);
 

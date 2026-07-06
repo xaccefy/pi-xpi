@@ -38,7 +38,6 @@
   },
   "dependencies": {
     "@sinclair/typebox": "^0.32.34",
-    "@xaccefy/pi-sqlite-compat": "^0.1.6",
     "typescript": "^6.0.3"
   },
   "devDependencies": {

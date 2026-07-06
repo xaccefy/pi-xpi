@@ -13,7 +13,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { DatabaseSync } from "@xaccefy/pi-sqlite-compat";
+import { DatabaseSync } from "./sqlite-compat/index.ts";
 
 // ── Types ────────────────────────────────────────────────────────────
 
