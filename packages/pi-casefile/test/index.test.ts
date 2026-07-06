@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -163,6 +164,8 @@ describe("casefile extension", () => {
     });
     expect(promoted.details.record.status).toBe("confirmed");
     expect(promoted.details.record.pocVerified?.exitCode).toBe(0);
+    expect(promoted.details.record.evidence).toContain("PoC Execution Capture");
+    expect(promoted.details.record.evidence).toContain("Execution Output\n```\nok\n```");
 
     const listed = await executeTool(pi, "CaseList", { status: "confirmed" });
     expect(listed.details.total).toBe(1);
@@ -178,6 +181,10 @@ describe("casefile extension", () => {
 
     const report = await executeTool(pi, "CaseReport", { id: record.id });
     expect(report.details.path).toMatch(/sensitive-file-disclosure-case_[a-f0-9]{10}\.md$/);
+
+    const reportText = readFileSync(report.details.path, "utf8");
+    expect(reportText).toContain("PoC Verification Log");
+    expect(reportText).toContain("Output\n```\nok\n```");
   });
 
   test("returns the existing case when CaseAdd repeats the same title and scope", async () => {

@@ -241,15 +241,15 @@ function renderCaseResult(
   theme: Theme,
   successPrefix = "✓ ",
   failPrefix = "✗ ",
-): Text {
+): string {
   const details = result.details as { record?: CaseRecord; changed?: boolean } | undefined;
   if (!details?.record) {
-    return new Text(theme.fg("error", "✗ Failed"), 0, 0);
+    return theme.fg("error", "✗ Failed");
   }
   const success = details.changed !== false;
   const prefix = success ? successPrefix : failPrefix;
   const color = success ? "success" : "warning";
-  return new Text(theme.fg(color, prefix) + renderOneLine(details.record, theme), 0, 0);
+  return theme.fg(color, prefix) + renderOneLine(details.record, theme);
 }
 
 // ── Dashboard component ──────────────────────────────────────────────
@@ -409,7 +409,7 @@ function buildCaseContext(records: CaseRecord[]): string {
   if (records.length === 0) return "";
 
   const safe = (v?: string, max = 160) => {
-    const controlChars = new RegExp("[\r\n\t\\u0000-\\u001F\\u007F\\u2028\\u2029]+", "g");
+    const controlChars = /[\r\n\t\u0000-\u001F\u007F\u2028\u2029]+/g;
     const s = v
       ?.replace(controlChars, " ")
       .replace(/[<>]/g, (c) => (c === "<" ? "‹" : "›"))
@@ -547,8 +547,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     renderResult(result, { expanded }, theme) {
       const details = result.details as { created?: boolean; record?: CaseRecord };
       const created = details?.created;
-      const baseText = renderCaseResult(result, theme, created === false ? "↻ " : "✓ ");
-      let line = baseText.toString();
+      let line = renderCaseResult(result, theme, created === false ? "↻ " : "✓ ");
       if (expanded && details?.record) {
         line += `\n${theme.fg("dim", `  ${details.record.id} → ${details.record.nextStep ?? "no next step"}`)}`;
       }
@@ -603,8 +602,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     renderResult(result, { expanded }, theme) {
       const details = result.details as { changed?: boolean; record?: CaseRecord; reason?: string };
       const unchanged = details?.changed === false;
-      const baseText = renderCaseResult(result, theme, unchanged ? "↷ " : "✓ ");
-      let line = baseText.toString();
+      let line = renderCaseResult(result, theme, unchanged ? "↷ " : "✓ ");
       if (expanded && details?.record) {
         line +=
           "\n" +
@@ -672,7 +670,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     renderResult(result, _options, theme) {
       const details = result.details as { run?: { exitCode: number } } | undefined;
       const success = details?.run?.exitCode === 0;
-      return renderCaseResult(result, theme, success ? "✓ " : "✗ ", "✗ ");
+      return new Text(renderCaseResult(result, theme, success ? "✓ " : "✗ ", "✗ "), 0, 0);
     },
   });
 
@@ -705,7 +703,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderResult(result, _options, theme) {
-      return renderCaseResult(result, theme, "", "");
+      return new Text(renderCaseResult(result, theme, "", ""), 0, 0);
     },
   });
 

@@ -724,10 +724,18 @@ export function promoteFindingResult(id: string, verification: PocVerification):
     );
   }
 
+  const newEvidence =
+    (current.evidence ? current.evidence + "\n\n" : "") +
+    `### PoC Execution Capture (${verification.ranAt})\n` +
+    `- **Exit Code:** ${verification.exitCode}\n` +
+    `- **Sandbox:** ${verification.sandbox ? "yes" : "no"}\n` +
+    `#### Execution Output\n\`\`\`\n${verification.output ?? ""}\n\`\`\``;
+
   const next = buildRecord(
     {
       status: "confirmed",
       pocVerified: verification,
+      evidence: newEvidence,
     },
     current,
   );
@@ -958,6 +966,12 @@ export function writeCaseReport(id: string): { path: string; record: CaseRecord 
     mdSection("Summary", current.summary),
     mdSection("Steps to Reproduce / Evidence", current.evidence),
     mdSection("Proof of Concept", current.poc),
+    current.pocVerified
+      ? mdSection(
+          "PoC Verification Log",
+          `### PoC Run Verification\n- **Timestamp:** ${current.pocVerified.ranAt}\n- **Path:** \`${current.pocVerified.path}\`\n- **Sandbox:** ${current.pocVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.pocVerified.exitCode}\n\n#### Output\n\`\`\`\n${current.pocVerified.output ?? ""}\n\`\`\``,
+        )
+      : undefined,
     mdSection("Impact", current.impact),
     mdSection("Remediation", current.remediation),
     mdSection("Assumptions and Uncertainty", assumptions),
