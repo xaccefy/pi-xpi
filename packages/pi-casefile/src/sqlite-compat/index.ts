@@ -1,5 +1,11 @@
-// ponytail: thin re-export with any cast to match node:sqlite API
-import { Database } from "bun:sqlite";
-const instance = Database as any;
-export { instance as DatabaseSync };
-export type DatabaseSync = any;
+import { createRequire } from "node:module";
+const _require = createRequire(import.meta.url);
+
+let DatabaseSync: any;
+try {
+  DatabaseSync = _require("bun:sqlite").Database as any;
+} catch {
+  DatabaseSync = (_require("node:sqlite") as any).DatabaseSync;
+}
+
+export { DatabaseSync };
