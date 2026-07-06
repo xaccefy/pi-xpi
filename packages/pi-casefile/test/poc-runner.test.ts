@@ -48,7 +48,7 @@ describe("poc-runner", () => {
   it("sanitizes control characters from output", () => {
     const shPoc = join(tempDir, "poc.sh");
     // Print ANSI color escape and a null byte
-    writeFileSync(shPoc, '#!/bin/sh\nprintf "\\033[31mhello\\033[0m \\x00world\\n"', "utf8");
+    writeFileSync(shPoc, '#!/bin/sh\nprintf "\\033[31mhello\\033[0m \\000world\\n"', "utf8");
 
     const result = runPoc(shPoc, false);
 
