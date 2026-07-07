@@ -45,10 +45,18 @@ jobs:
       - name: Version bump (${{ inputs.bump }})
         run: bun run version:${{ inputs.bump }}
 
-      - name: Publish to npm
-        run: bun run publish:all
+      - name: Configure npm auth
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > "${{ github.workspace }}/.npmrc"
+          echo "NPM_CONFIG_USERCONFIG=${{ github.workspace }}/.npmrc" >> "$GITHUB_ENV"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify npm auth (diagnostic)
+        run: echo "Authenticated to npm as: $(npm whoami)"
+
+      - name: Publish to npm
+        run: npm publish -ws --access public && npm publish --access public
 
       - name: Commit version bumps
         run: |
