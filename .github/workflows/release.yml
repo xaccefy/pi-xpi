@@ -53,7 +53,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Verify npm auth (diagnostic)
-        run: echo "Authenticated to npm as: $(npm whoami)"
+        run: 'echo "Authenticated to npm as: $(npm whoami)"'
 
       - name: Publish to npm
         run: npm publish -ws --access public && npm publish --access public
