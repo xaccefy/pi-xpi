@@ -1,7 +1,10 @@
 import assert from "node:assert";
+import { unlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import { MockExtensionAPI } from "../../../test-utils.ts";
-import { __resetState, default as registerTodo } from "../index.ts";
+import { __replayComputeCount, __resetState, default as registerTodo } from "../index.ts";
 
 class MockSessionManager {
   sessionId = "test-session";
@@ -157,5 +160,73 @@ describe("pi-xtodo simplified tests", () => {
     const listResult = await todoTool.execute("3", { action: "list" }, null, null, mockCtx);
     assert.ok(listResult.content[0].text.includes("#1 Task 1"));
     assert.ok(listResult.content[0].text.includes("#2 Task 2"));
+  });
+
+  it("persists tasks to disk and restores them on session_start when branch history is empty", async () => {
+    sessionManager.sessionId = "persist-test-session";
+    sessionManager.branch = [];
+    const todoTool = pi.tools[0];
+
+    await todoTool.execute(
+      "1",
+      { action: "create", subject: "Persisted task" },
+      null,
+      null,
+      mockCtx,
+    );
+
+    // Simulate a restart: fresh branch (no todo history) but the saved file exists.
+    sessionManager.branch = [];
+    await pi.emit("session_start", {}, mockCtx);
+
+    const listResult = await todoTool.execute("2", { action: "list" }, null, null, mockCtx);
+    assert.ok(listResult.content[0].text.includes("#1 Persisted task"));
+
+    // Clean up the persisted file for this isolated session id.
+    try {
+      unlinkSync(join(homedir(), ".pi", "xtodo", "persist-test-session.json"));
+    } catch {
+      // File may not exist.
+    }
+  });
+
+  it("skips replay when branch length is unchanged (cache hit, no recompute)", async () => {
+    const todoTool = pi.tools[0];
+    sessionManager.sessionId = "cache-skip-session";
+    sessionManager.branch = [];
+
+    // Seed a branch history containing one create result.
+    const created = await todoTool.execute(
+      "1",
+      { action: "create", subject: "Cache task" },
+      null,
+      null,
+      mockCtx,
+    );
+    sessionManager.branch = [
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "todo",
+          details: created.details,
+        },
+      },
+    ];
+
+    await pi.emit("session_start", {}, mockCtx);
+    assert.strictEqual(__replayComputeCount(), 1);
+
+    // Same branch length -> cache hit, must NOT recompute.
+    await pi.emit("session_start", {}, mockCtx);
+    assert.strictEqual(__replayComputeCount(), 1);
+
+    // Different branch length -> cache miss -> recompute.
+    sessionManager.branch = [
+      ...sessionManager.branch,
+      { type: "message", message: { role: "assistant", content: "more" } },
+    ];
+    await pi.emit("session_start", {}, mockCtx);
+    assert.strictEqual(__replayComputeCount(), 2);
   });
 });

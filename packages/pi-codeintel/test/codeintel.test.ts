@@ -132,4 +132,48 @@ describe("pi-codeintel tool tests", () => {
     );
     assert.strictEqual(archResult.details.counts.files_count, 2);
   });
+
+  it("disambiguates same-named functions across files via callee_id (no false paths)", async () => {
+    const collisionDir = path.join(tempDir, "collision");
+    fs.mkdirSync(collisionDir, { recursive: true });
+    // Two functions named `helper`, in different files, only ONE of which reaches eval.
+    fs.writeFileSync(
+      path.join(collisionDir, "fileB.ts"),
+      `export function helper() { eval("1 + 1"); }`,
+    );
+    fs.writeFileSync(
+      path.join(collisionDir, "fileC.ts"),
+      `export function helper() { console.log("other"); }`,
+    );
+    fs.writeFileSync(
+      path.join(collisionDir, "fileA.ts"),
+      `import { helper } from "./fileB";\n\nexport function run() { helper(); }`,
+    );
+    fs.writeFileSync(
+      path.join(collisionDir, "fileD.ts"),
+      `import { helper } from "./fileC";\n\nexport function otherRun() { helper(); }`,
+    );
+
+    const pi = new MockExtensionAPI();
+    codebaseExtension(pi as any);
+    const indexTool = pi.tools.find((t) => t.name === "CodebaseIndex");
+    const traceTool = pi.tools.find((t) => t.name === "CodebaseTraceCallPath");
+
+    await indexTool.execute("i1", { workspace: collisionDir, force: true }, null, null, null);
+
+    const res = await traceTool.execute(
+      "t1",
+      { targetSymbol: "eval", workspace: collisionDir },
+      null,
+      null,
+      null,
+    );
+    const text = res.content[0].text;
+    assert.ok(text.includes("run"), "real caller 'run' should appear in the path to eval");
+    assert.ok(
+      !text.toLowerCase().includes("otherrun"),
+      "must NOT report otherRun as a path to eval (name-collision false positive)",
+    );
+    assert.ok(text.includes("helper"), "helper should appear as the intermediate node");
+  });
 });

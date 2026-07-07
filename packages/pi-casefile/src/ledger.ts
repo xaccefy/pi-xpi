@@ -141,8 +141,14 @@ export type CaseSearchOptions = {
   status?: CaseStatus;
   confidence?: CaseConfidence;
   severity?: CaseSeverity;
+  /** Return only cases at or above this severity (info < low < medium < high < critical). */
+  minSeverity?: CaseSeverity;
   priority?: CasePriority;
   tag?: string;
+  /** ISO timestamp; only cases created at/after this time. */
+  since?: string;
+  /** ISO timestamp; only cases created at/before this time. */
+  until?: string;
   limit?: number;
   offset?: number;
 };
@@ -190,10 +196,15 @@ export function getCasefilePath(): string {
 }
 
 export function setCasefilePath(path: string | undefined): void {
-  ledgerPathOverride = path;
   if (dbInstance) {
-    dbInstance = undefined; // Force reconnection on next getDb
+    try {
+      dbInstance.close();
+    } catch {
+      // Best-effort close.
+    }
   }
+  ledgerPathOverride = path;
+  dbInstance = undefined; // Force reconnection on next getDb
 }
 
 // ── SQLite Schema Init ────────────────────────────────────────────────
@@ -210,6 +221,9 @@ function getDb(): DatabaseSync {
   }
 
   const db = new DatabaseSync(dbPath);
+  // Enable foreign-key enforcement so ON DELETE CASCADE actually fires
+  // (SQLite keeps FK off by default; bun:sqlite in particular defaults it off).
+  db.exec("PRAGMA foreign_keys = ON");
 
   // Create tables
   db.exec(`
@@ -353,8 +367,13 @@ export function getCaseById(id: string): CaseRecord | undefined {
 
 function validateCase(record: CaseRecord): void {
   if (!record.title.trim()) throw new Error("Case title cannot be empty");
-  if (record.status === "confirmed" && (!record.evidence || !record.poc)) {
-    throw new Error("Confirmed cases require both evidence and poc");
+  // Keep this gate in lockstep with promoteFindingResult: a case may only be
+  // CONFIRMED when it has evidence, a PoC, demonstrated impact, and a severity.
+  if (
+    record.status === "confirmed" &&
+    (!record.evidence || !record.poc || !record.impact || !record.severity)
+  ) {
+    throw new Error("Confirmed cases require evidence, poc, impact, and severity");
   }
   if (record.status === "blocked" && (record.blockers ?? []).length === 0) {
     throw new Error("Blocked cases require at least one blocker");
@@ -370,13 +389,10 @@ function validateCase(record: CaseRecord): void {
       "Killed cases require evidence, next step, blockers, or assumptions explaining why",
     );
   }
-  if (
-    record.status === "reported" &&
-    !record.poc &&
-    !record.remediation &&
-    (record.references ?? []).length === 0
-  ) {
-    throw new Error("Reported cases require poc, remediation, or references");
+  // A case becomes REPORTED only via CaseReport, which records reportPath. Require it
+  // here so validation stays consistent with the confirmed→reported transition gate.
+  if (record.status === "reported" && !record.reportPath) {
+    throw new Error("Reported cases require a generated report (run CaseReport first)");
   }
 }
 
@@ -810,57 +826,138 @@ export function unlinkCasesResult(sourceId: string, targetId: string): CaseLinkR
 
 // ── Search & Queries ─────────────────────────────────────────────────
 
-function caseHaystack(record: CaseRecord, field?: CaseSearchField): string {
-  if (field) {
-    const val = record[field];
-    if (Array.isArray(val)) return val.join(" ").toLowerCase();
-    return (typeof val === "string" ? val : String(val ?? "")).toLowerCase();
+// Searchable text columns (excludes ids/timestamps/JSON arrays for performance + signal).
+const SEARCH_COLUMNS = [
+  "title",
+  "summary",
+  "evidence",
+  "impact",
+  "target",
+  "endpoint",
+  "bugClass",
+  "poc",
+] as const;
+
+const FIELD_COLUMN: Record<CaseSearchField, string> = {
+  title: "title",
+  summary: "summary",
+  evidence: "evidence",
+  impact: "impact",
+  target: "target",
+  endpoint: "endpoint",
+  bugClass: "bugClass",
+  poc: "poc",
+};
+
+function severityRank(s: CaseSeverity): number {
+  return SEVERITY_VALUES.indexOf(s);
+}
+
+/**
+ * Build a parameterized WHERE clause + params for case queries. Pushes all
+ * structured filters (and free-text) into SQL so we never load the whole ledger
+ * into memory just to filter it in JS. Also returns a stable ORDER BY that keeps
+ * the original status precedence (hypothesis first) with updated_at as tiebreak.
+ */
+function buildCaseWhere(options: CaseSearchOptions): {
+  whereSql: string;
+  orderSql: string;
+  params: unknown[];
+} {
+  const where: string[] = [];
+  const params: unknown[] = [];
+
+  if (options.status) {
+    where.push("status = ?");
+    params.push(options.status);
   }
-  return Object.entries(record)
-    .filter(([k]) => !["id", "createdAt", "updatedAt", "reportedAt", "reportPath"].includes(k))
-    .map(([, v]) => (Array.isArray(v) ? v.join(" ") : String(v ?? "")))
-    .filter(Boolean)
-    .join("\n")
-    .toLowerCase();
+  if (options.confidence) {
+    where.push("confidence = ?");
+    params.push(options.confidence);
+  }
+  if (options.severity) {
+    where.push("severity = ?");
+    params.push(options.severity);
+  }
+  if (options.minSeverity) {
+    where.push(
+      "severity IS NOT NULL AND (CASE severity WHEN 'info' THEN 0 WHEN 'low' THEN 1 WHEN 'medium' THEN 2 WHEN 'high' THEN 3 WHEN 'critical' THEN 4 ELSE -1 END) >= ?",
+    );
+    params.push(severityRank(options.minSeverity));
+  }
+  if (options.priority) {
+    where.push("priority = ?");
+    params.push(options.priority);
+  }
+  if (options.tag) {
+    where.push("EXISTS (SELECT 1 FROM json_each(tags_json) WHERE lower(value) = ?)");
+    params.push(options.tag.trim().toLowerCase());
+  }
+  if (options.since) {
+    where.push("created_at >= ?");
+    params.push(options.since);
+  }
+  if (options.until) {
+    where.push("created_at <= ?");
+    params.push(options.until);
+  }
+
+  const query = options.query?.trim().toLowerCase();
+  if (query) {
+    const likeParam = `%${query}%`;
+    if (options.field) {
+      where.push(`lower(${FIELD_COLUMN[options.field]}) LIKE ?`);
+      params.push(likeParam);
+    } else {
+      const ors = SEARCH_COLUMNS.map((c) => `lower(${c}) LIKE ?`).join(" OR ");
+      where.push(`(${ors})`);
+      for (let i = 0; i < SEARCH_COLUMNS.length; i++) params.push(likeParam);
+    }
+  }
+
+  const orderSql =
+    "CASE status WHEN 'hypothesis' THEN 0 WHEN 'investigating' THEN 1 WHEN 'confirmed' THEN 2 " +
+    "WHEN 'blocked' THEN 3 WHEN 'killed' THEN 4 WHEN 'reported' THEN 5 ELSE 6 END, updated_at DESC";
+
+  return {
+    whereSql: where.length ? `WHERE ${where.join(" AND ")}` : "",
+    orderSql,
+    params,
+  };
+}
+
+/** Map DB rows to CaseRecords, attaching linkedCaseIds fetched in a single batch. */
+function mapRowsWithLinks(db: DatabaseSync, rows: any[]): CaseRecord[] {
+  if (rows.length === 0) return [];
+  const ids = rows.map((r) => r.id);
+  const placeholders = ids.map(() => "?").join(",");
+  const links = db
+    .prepare(`SELECT source_id, target_id FROM case_links WHERE source_id IN (${placeholders})`)
+    .all(...ids) as { source_id: string; target_id: string }[];
+  const linkMap = new Map<string, string[]>();
+  for (const l of links) {
+    if (!linkMap.has(l.source_id)) linkMap.set(l.source_id, []);
+    linkMap.get(l.source_id)!.push(l.target_id);
+  }
+  return rows.map((row) => mapRow(row, linkMap.get(row.id) ?? []));
 }
 
 export function searchCases(options: CaseSearchOptions = {}): {
   cases: CaseRecord[];
   total: number;
 } {
-  const query = options.query?.trim().toLowerCase();
-  const field = options.field;
-  const tag = options.tag?.trim().toLowerCase();
+  const db = getDb();
   const limit = Math.max(1, Math.min(options.limit ?? 50, 200));
   const offset = Math.max(0, options.offset ?? 0);
 
-  const STATUS_ORDER: CaseStatus[] = [
-    "hypothesis",
-    "investigating",
-    "confirmed",
-    "blocked",
-    "killed",
-    "reported",
-  ];
+  const { whereSql, orderSql, params } = buildCaseWhere(options);
 
-  const filtered = readCasefile()
-    .filter((r) => !options.status || r.status === options.status)
-    .filter((r) => !options.confidence || r.confidence === options.confidence)
-    .filter((r) => !options.severity || r.severity === options.severity)
-    .filter((r) => !options.priority || r.priority === options.priority)
-    .filter((r) => !tag || r.tags?.some((t) => t.toLowerCase() === tag))
-    .filter((r) => !query || caseHaystack(r, field).includes(query))
-    .sort((a, b) => {
-      const aStatus = STATUS_ORDER.indexOf(a.status);
-      const bStatus = STATUS_ORDER.indexOf(b.status);
-      if (aStatus !== bStatus) return aStatus - bStatus;
-      return b.updatedAt.localeCompare(a.updatedAt);
-    });
+  const total = (db.prepare(`SELECT COUNT(*) as c FROM cases ${whereSql}`).get(...params) as any).c;
+  const rows = db
+    .prepare(`SELECT * FROM cases ${whereSql} ORDER BY ${orderSql} LIMIT ? OFFSET ?`)
+    .all(...params, limit, offset) as any[];
 
-  return {
-    total: filtered.length,
-    cases: filtered.slice(offset, offset + limit),
-  };
+  return { total, cases: mapRowsWithLinks(db, rows) };
 }
 
 export function countCases(): {
@@ -868,14 +965,22 @@ export function countCases(): {
   byStatus: Record<string, number>;
   bySeverity: Record<string, number>;
 } {
-  const records = readCasefile();
+  const db = getDb();
+  const total = (db.prepare("SELECT COUNT(*) as c FROM cases").get() as any).c;
+  const statusRows = db
+    .prepare("SELECT status, COUNT(*) as n FROM cases GROUP BY status")
+    .all() as { status: string; n: number }[];
+  const severityRows = db
+    .prepare(
+      "SELECT severity, COUNT(*) as n FROM cases WHERE severity IS NOT NULL GROUP BY severity",
+    )
+    .all() as { severity: string; n: number }[];
+
   const byStatus: Record<string, number> = {};
   const bySeverity: Record<string, number> = {};
-  for (const r of records) {
-    byStatus[r.status] = (byStatus[r.status] ?? 0) + 1;
-    if (r.severity) bySeverity[r.severity] = (bySeverity[r.severity] ?? 0) + 1;
-  }
-  return { total: records.length, byStatus, bySeverity };
+  for (const r of statusRows) byStatus[r.status] = r.n;
+  for (const r of severityRows) bySeverity[r.severity] = r.n;
+  return { total, byStatus, bySeverity };
 }
 
 // ── Format helpers ───────────────────────────────────────────────────

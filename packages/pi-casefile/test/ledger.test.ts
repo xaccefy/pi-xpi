@@ -10,6 +10,7 @@ import {
   linkCasesResult,
   promoteFindingResult,
   readCasefile,
+  searchCases,
   setCasefilePath,
   unlinkCasesResult,
   updateCaseResult,
@@ -123,5 +124,60 @@ describe("casefile sqlite ledger", () => {
     const unlinked = unlinkCasesResult(caseA.id, caseB.id);
     assert.strictEqual(unlinked.changed, true);
     assert.ok(!unlinked.source.linkedCaseIds.includes(caseB.id));
+  });
+
+  it("searchCases pushes filters into SQL (tag, severity, minSeverity, since, field, pagination)", () => {
+    addCase({
+      title: "SQL injection in login",
+      target: "app.test",
+      bugClass: "sqli",
+      severity: "high",
+      tags: ["inj", "auth"],
+      summary: "UNION-based extraction",
+    });
+    addCase({
+      title: "Reflected XSS in search",
+      target: "app.test",
+      bugClass: "xss",
+      severity: "low",
+      tags: ["inj"],
+      summary: "reflects query in HTML",
+    });
+    addCase({
+      title: "Open redirect",
+      target: "other.test",
+      bugClass: "redirect",
+      severity: "info",
+      tags: ["web"],
+    });
+
+    // tag filter via json_each
+    const byTag = searchCases({ tag: "inj" });
+    assert.strictEqual(byTag.total, 2);
+
+    // exact severity
+    const bySev = searchCases({ severity: "high" });
+    assert.strictEqual(bySev.total, 1);
+    assert.strictEqual(bySev.cases[0].bugClass, "sqli");
+
+    // minSeverity threshold (low+ => high & low, not info)
+    const byMin = searchCases({ minSeverity: "low" });
+    assert.strictEqual(byMin.total, 2);
+
+    // field-scoped free-text
+    const byField = searchCases({ field: "summary", query: "union" });
+    assert.strictEqual(byField.total, 1);
+    assert.strictEqual(byField.cases[0].bugClass, "sqli");
+
+    // since/until date range
+    const before = searchCases({ until: "2000-01-01T00:00:00Z" });
+    assert.strictEqual(before.total, 0);
+    const after = searchCases({ since: "2000-01-01T00:00:00Z" });
+    assert.strictEqual(after.total, 3);
+
+    // pagination
+    const page = searchCases({ limit: 1, offset: 0 });
+    assert.strictEqual(page.total, 3);
+    assert.strictEqual(page.cases.length, 1);
   });
 });

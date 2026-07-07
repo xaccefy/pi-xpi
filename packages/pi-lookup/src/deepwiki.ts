@@ -11,6 +11,10 @@ const DEEPWIKI_MCP_URL = "https://mcp.deepwiki.com/mcp";
 const DEEPWIKI_TOOL = "ask_question";
 const DEFAULT_TIMEOUT_MS = 30_000;
 
+// Short-lived cache so repeated questions about the same repo don't re-hit the MCP server.
+const DEEPWIKI_CACHE_TTL_MS = 10 * 60 * 1000;
+const deepwikiCache = new Map<string, { expires: number; text: string }>();
+
 type McpContentItem = { type: string; text?: string };
 
 export const deepwikiTool = {
@@ -37,6 +41,16 @@ export const deepwikiTool = {
 
     if (!repo) throw new Error("repo is required (e.g. 'facebook/react').");
     if (!question) throw new Error("question is required.");
+
+    const cacheKey = `${repo}|${question}`;
+    const now = Date.now();
+    const cached = deepwikiCache.get(cacheKey);
+    if (cached && cached.expires > now) {
+      return {
+        content: [{ type: "text" as const, text: cached.text }],
+        details: { provider: "deepwiki", repo, question },
+      };
+    }
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
@@ -89,8 +103,10 @@ export const deepwikiTool = {
         }
       }
 
+      const finalText = textParts.join("\n") || text.slice(0, 5000);
+      deepwikiCache.set(cacheKey, { expires: now + DEEPWIKI_CACHE_TTL_MS, text: finalText });
       return {
-        content: [{ type: "text" as const, text: textParts.join("\n") || text.slice(0, 5000) }],
+        content: [{ type: "text" as const, text: finalText }],
         details: { provider: "deepwiki", repo, question },
       };
     } catch (error) {

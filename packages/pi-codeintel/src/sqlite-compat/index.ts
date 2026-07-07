@@ -8,8 +8,15 @@ try {
   // biome-ignore lint/suspicious/noExplicitAny: Runtime module swappability
   DatabaseSyncConstructor = _require("bun:sqlite").Database as any;
 } catch {
-  // biome-ignore lint/suspicious/noExplicitAny: Runtime module swappability
-  DatabaseSyncConstructor = (_require("node:sqlite") as any).DatabaseSync;
+  try {
+    // biome-ignore lint/suspicious/noExplicitAny: Runtime module swappability
+    DatabaseSyncConstructor = (_require("node:sqlite") as any).DatabaseSync;
+  } catch (e) {
+    throw new Error(
+      "XPI requires bun:sqlite (Bun runtime) or node:sqlite (Node >= 22.5). " +
+        `Neither SQLite backend is available: ${(e as Error).message}`,
+    );
+  }
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: Standard SQLite API returns any

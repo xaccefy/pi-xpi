@@ -43,6 +43,9 @@ async function getDb(workspace: string): Promise<DatabaseSync> {
 
   const dbPath = getDbPath(absWorkspace);
   const db = new DatabaseSync(dbPath);
+  // Enable foreign-key enforcement so ON DELETE CASCADE actually fires
+  // (SQLite keeps FK off by default; bun:sqlite in particular defaults it off).
+  db.exec("PRAGMA foreign_keys = ON");
 
   // Initialize Schema
   db.exec(`
@@ -73,6 +76,7 @@ async function getDb(workspace: string): Promise<DatabaseSync> {
     CREATE TABLE IF NOT EXISTS calls (
       caller_id TEXT,
       callee_name TEXT NOT NULL,
+      callee_id TEXT,
       file_path TEXT NOT NULL,
       line INTEGER NOT NULL,
       FOREIGN KEY(caller_id) REFERENCES symbols(id) ON DELETE CASCADE
@@ -93,6 +97,14 @@ async function getDb(workspace: string): Promise<DatabaseSync> {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_path);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_calls_callee ON calls(callee_name);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller_id);`);
+  // Backfill callee_id on databases indexed before this column existed. New indexes
+  // populate it directly; older rows keep callee_id NULL and queries fall back to name.
+  try {
+    db.exec(`ALTER TABLE calls ADD COLUMN callee_id TEXT`);
+  } catch {
+    // Column already present.
+  }
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_calls_callee_id ON calls(callee_id);`);
 
   dbInstances.set(absWorkspace, db);
   return db;
@@ -429,34 +441,78 @@ async function indexWorkspace(
     "INSERT OR REPLACE INTO symbols (id, file_path, name, kind, start_line, end_line, docstring, signature) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
   );
   const insertCall = db.prepare(
-    "INSERT INTO calls (caller_id, callee_name, file_path, line) VALUES (?, ?, ?, ?)",
+    "INSERT INTO calls (caller_id, callee_name, callee_id, file_path, line) VALUES (?, ?, ?, ?, ?)",
   );
   const insertImport = db.prepare(
     "INSERT INTO imports (file_path, module_name, symbol_name) VALUES (?, ?, ?)",
   );
 
+  // Pass 1: parse every file up front so cross-file import resolution has the full
+  // symbol table. A callee imported from another module must resolve to THAT module's
+  // symbol id (otherwise callee_id is useless for disambiguating same-named functions).
+  interface ParsedFile {
+    relPath: string;
+    hash: string;
+    size: number;
+    symbols: { name: string; kind: string; startLine: number; endLine: number; docstring?: string; signature?: string }[];
+    calls: { callerName: string; calleeName: string; line: number }[];
+    imports: { moduleName: string; symbolName: string }[];
+  }
+  const parsedAll: ParsedFile[] = [];
+  const fileSymIds = new Map<string, Map<string, string>>(); // relPath -> (symbol name -> id)
+
+  for (const p of filePaths) {
+    const relPath = path.relative(absRoot, p);
+    let content = "";
+    try {
+      content = fs.readFileSync(p, "utf-8");
+    } catch {
+      skippedFiles++;
+      continue;
+    }
+    const size = statSafe(p)?.size ?? 0;
+    if (size === 0 || size > MAX_FILE_SIZE) {
+      skippedFiles++;
+      continue;
+    }
+    const hash = getFileHash(content);
+    let symbols: ParsedFile["symbols"] = [];
+    let calls: ParsedFile["calls"] = [];
+    let imports: ParsedFile["imports"] = [];
+    try {
+      const parsed = parseSourceFile(ts, relPath, content);
+      symbols = parsed.symbols;
+      calls = parsed.calls;
+      imports = parsed.imports;
+    } catch {
+      skippedFiles++;
+      continue;
+    }
+    const symMap = new Map<string, string>();
+    for (const sym of symbols) {
+      const symId = `${relPath}:${sym.name}:${sym.kind}:${sym.startLine}`;
+      symMap.set(sym.name, symId);
+    }
+    fileSymIds.set(relPath, symMap);
+    parsedAll.push({ relPath, hash, size, symbols, calls, imports });
+  }
+
+  // Resolve a relative module specifier ("./fileB", "../x/y") to a known relPath.
+  function resolveModule(importerRel: string, moduleName: string): string | null {
+    if (!moduleName.startsWith(".")) return null;
+    const dir = path.posix.dirname(importerRel);
+    const base = path.posix.normalize(path.posix.join(dir, moduleName));
+    const candidates = [base, `${base}.ts`, `${base}.tsx`, `${base}.js`, `${base}.jsx`, `${base}/index.ts`];
+    for (const c of candidates) if (fileSymIds.has(c)) return c;
+    return null;
+  }
+
   db.exec("BEGIN");
   try {
-    for (const p of filePaths) {
+    for (const pf of parsedAll) {
       totalFiles++;
-      const relPath = path.relative(absRoot, p);
-      let content = "";
-      try {
-        content = fs.readFileSync(p, "utf-8");
-      } catch {
-        skippedFiles++;
-        continue;
-      }
-
-      const size = statSafe(p)?.size ?? 0;
-      if (size === 0 || size > MAX_FILE_SIZE) {
-        skippedFiles++;
-        continue;
-      }
-      const hash = getFileHash(content);
-
-      const existing = selectFile.get(relPath);
-      if (!force && existing && existing.hash === hash) {
+      const existing = selectFile.get(pf.relPath);
+      if (!force && existing && existing.hash === pf.hash) {
         skippedFiles++;
         continue;
       }
@@ -465,25 +521,18 @@ async function indexWorkspace(
         updatedFiles++;
 
         // Transactional clear
-        deleteFile.run(relPath);
-        deleteSymbols.run(relPath);
-        deleteCalls.run(relPath);
-        deleteImports.run(relPath);
+        deleteFile.run(pf.relPath);
+        deleteSymbols.run(pf.relPath);
+        deleteCalls.run(pf.relPath);
+        deleteImports.run(pf.relPath);
 
-        // Parse
-        const { symbols, calls, imports } = parseSourceFile(ts, relPath, content);
+        insertFile.run(pf.relPath, pf.hash, pf.size, null, new Date().toISOString());
 
-        insertFile.run(relPath, hash, size, null, new Date().toISOString());
-
-        const symbolIdMap = new Map<string, string>();
-        for (const sym of symbols) {
-          // Include startLine to guarantee uniqueness (overloads, same-named methods in
-          // different classes, etc. would otherwise collide on the PRIMARY KEY).
-          const symId = `${relPath}:${sym.name}:${sym.kind}:${sym.startLine}`;
-          symbolIdMap.set(sym.name, symId);
+        for (const sym of pf.symbols) {
+          const symId = `${pf.relPath}:${sym.name}:${sym.kind}:${sym.startLine}`;
           insertSymbol.run(
             symId,
-            relPath,
+            pf.relPath,
             sym.name,
             sym.kind,
             sym.startLine,
@@ -493,14 +542,27 @@ async function indexWorkspace(
           );
         }
 
-        for (const call of calls) {
-          const callerId =
-            symbolIdMap.get(call.callerName) || `${relPath}:${call.callerName}:(global)`;
-          insertCall.run(callerId, call.calleeName, relPath, call.line);
+        // Map imported names -> the imported module's concrete symbol id.
+        const importSym = new Map<string, string>();
+        for (const imp of pf.imports) {
+          const targetRel = resolveModule(pf.relPath, imp.moduleName);
+          if (targetRel) {
+            const tid = fileSymIds.get(targetRel)?.get(imp.symbolName);
+            if (tid) importSym.set(imp.symbolName, tid);
+          }
         }
 
-        for (const imp of imports) {
-          insertImport.run(relPath, imp.moduleName, imp.symbolName);
+        const localSym = fileSymIds.get(pf.relPath);
+        for (const call of pf.calls) {
+          const callerId = localSym?.get(call.callerName) || `${pf.relPath}:${call.callerName}:(global)`;
+          // Prefer the imported symbol's id (cross-file), then a same-file symbol,
+          // else null (queries fall back to callee_name).
+          const calleeId = importSym.get(call.calleeName) ?? localSym?.get(call.calleeName) ?? null;
+          insertCall.run(callerId, call.calleeName, calleeId, pf.relPath, call.line);
+        }
+
+        for (const imp of pf.imports) {
+          insertImport.run(pf.relPath, imp.moduleName, imp.symbolName);
         }
       } catch {
         // A single unparseable file must not crash the entire index
@@ -722,14 +784,18 @@ export default function codebaseExtension(pi: ExtensionAPI) {
       const db = await ensureIndexed(workspace);
       const name = params.symbolName as string;
 
+      const ids = (db.prepare("SELECT id FROM symbols WHERE name = ?").all(name) as { id: string }[]).map(
+        (r) => r.id,
+      );
+      const inSql = ids.length ? `c.callee_id IN (${ids.map(() => "?").join(",")}) OR ` : "";
       const stmt = db.prepare(`
         SELECT c.callee_name, c.file_path, c.line, s.name as caller_name, s.kind as caller_kind
         FROM calls c
         LEFT JOIN symbols s ON c.caller_id = s.id
-        WHERE c.callee_name = ?
+        WHERE (${inSql}(c.callee_id IS NULL AND c.callee_name = ?))
         LIMIT 150
       `);
-      const rows = stmt.all(name) as any[];
+      const rows = stmt.all(...ids, name) as any[];
 
       if (rows.length === 0) {
         return {
@@ -770,50 +836,52 @@ export default function codebaseExtension(pi: ExtensionAPI) {
       const visited = new Set<string>();
       const lines: string[] = [`Call Graph for "${startSym}" (${direction}, max depth ${depth}):`];
 
-      function traceInbound(callee: string, currentDepth: number, indent: string) {
-        if (currentDepth > depth || visited.has(callee)) return;
-        visited.add(callee);
+      function traceInbound(calleeId: string, calleeName: string, currentDepth: number, indent: string) {
+        if (currentDepth > depth || visited.has(calleeId)) return;
+        visited.add(calleeId);
 
         const stmt = db.prepare(`
-          SELECT s.name as caller, s.kind, c.file_path, c.line
+          SELECT s.id as caller_id, s.name as caller, s.kind, c.file_path, c.line
           FROM calls c
           JOIN symbols s ON c.caller_id = s.id
-          WHERE c.callee_name = ?
+          WHERE (c.callee_id = ? OR (c.callee_id IS NULL AND c.callee_name = ?))
         `);
-        const callers = stmt.all(callee) as any[];
+        const callers = stmt.all(calleeId, calleeName) as any[];
 
         for (const c of callers) {
           lines.push(`${indent}↖ ${c.caller} [${c.kind}] (${c.file_path}:${c.line})`);
-          traceInbound(c.caller, currentDepth + 1, `${indent}  `);
+          traceInbound(c.caller_id, c.caller, currentDepth + 1, `${indent}  `);
         }
       }
 
-      function traceOutbound(callerName: string, currentDepth: number, indent: string) {
-        if (currentDepth > depth || visited.has(callerName)) return;
-        visited.add(callerName);
+      function traceOutbound(callerId: string, callerName: string, currentDepth: number, indent: string) {
+        if (currentDepth > depth || visited.has(callerId)) return;
+        visited.add(callerId);
 
-        // Find the caller symbol id(s)
-        const symStmt = db.prepare("SELECT id FROM symbols WHERE name = ?");
-        const syms = symStmt.all(callerName) as { id: string }[];
-
-        for (const s of syms) {
-          const callStmt = db.prepare(`
-            SELECT callee_name, line, file_path
-            FROM calls
-            WHERE caller_id = ?
-          `);
-          const callees = callStmt.all(s.id) as any[];
-          for (const c of callees) {
-            lines.push(`${indent}↘ ${c.callee_name} (${c.file_path}:${c.line})`);
-            traceOutbound(c.callee_name, currentDepth + 1, `${indent}  `);
-          }
+        const callStmt = db.prepare(`
+          SELECT callee_id, callee_name, line, file_path
+          FROM calls
+          WHERE caller_id = ?
+        `);
+        const callees = callStmt.all(callerId) as any[];
+        for (const c of callees) {
+          lines.push(`${indent}↘ ${c.callee_name} (${c.file_path}:${c.line})`);
+          traceOutbound(c.callee_id ?? c.callee_name, c.callee_name, currentDepth + 1, `${indent}  `);
         }
       }
 
-      if (direction === "inbound") {
-        traceInbound(startSym, 1, "  ");
+      const startSyms = db.prepare("SELECT id, name FROM symbols WHERE name = ?").all(startSym) as {
+        id: string;
+        name: string;
+      }[];
+      if (startSyms.length === 0) {
+        // Symbol not indexed: fall back to a name-only match so the trace still runs.
+        if (direction === "inbound") traceInbound(startSym, startSym, 1, "  ");
+        else traceOutbound(startSym, startSym, 1, "  ");
+      } else if (direction === "inbound") {
+        for (const s of startSyms) traceInbound(s.id, s.name, 1, "  ");
       } else {
-        traceOutbound(startSym, 1, "  ");
+        for (const s of startSyms) traceOutbound(s.id, s.name, 1, "  ");
       }
 
       if (lines.length === 1) {
@@ -842,13 +910,19 @@ export default function codebaseExtension(pi: ExtensionAPI) {
       const sourceFilter = params.sourceSymbol as string | undefined;
 
       // Find call edges where callee is the target
+      const targetIds = (
+        db.prepare("SELECT id FROM symbols WHERE name = ?").all(target) as { id: string }[]
+      ).map((r) => r.id);
+      const targetInSql = targetIds.length
+        ? `c.callee_id IN (${targetIds.map(() => "?").join(",")}) OR `
+        : "";
       const stmt = db.prepare(`
         SELECT c.caller_id, s.name as caller_name, c.file_path, c.line
         FROM calls c
         JOIN symbols s ON c.caller_id = s.id
-        WHERE c.callee_name = ?
+        WHERE (${targetInSql}(c.callee_id IS NULL AND c.callee_name = ?))
       `);
-      const directCallers = stmt.all(target) as any[];
+      const directCallers = stmt.all(...targetIds, target) as any[];
 
       if (directCallers.length === 0) {
         return {
@@ -882,9 +956,9 @@ export default function codebaseExtension(pi: ExtensionAPI) {
         const callersStmt = db.prepare(`
           SELECT caller_id
           FROM calls
-          WHERE callee_name = ?
+          WHERE (callee_id = ? OR (callee_id IS NULL AND callee_name = ?))
         `);
-        const callers = callersStmt.all(name) as { caller_id: string }[];
+        const callers = callersStmt.all(callerId, name) as { caller_id: string }[];
 
         if (callers.length === 0) {
           if (!sourceFilter) {

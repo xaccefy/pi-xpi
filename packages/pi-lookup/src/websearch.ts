@@ -126,13 +126,17 @@ async function fetchWithRetry(
   options: RequestInit,
   parentSignal?: AbortSignal,
 ): Promise<Response> {
-  const requestSignal = AbortSignal.any([
-    ...(parentSignal ? [parentSignal] : []),
-    AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-  ]);
+  const doFetch = (): Promise<Response> =>
+    fetch(url, {
+      ...options,
+      signal: AbortSignal.any([
+        ...(parentSignal ? [parentSignal] : []),
+        AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      ]),
+    });
 
   try {
-    const res = await fetch(url, { ...options, signal: requestSignal });
+    const res = await doFetch();
     if (res.ok) return res;
     throw new Error(`HTTP ${res.status}`);
   } catch (err) {
@@ -140,11 +144,13 @@ async function fetchWithRetry(
     if (parentSignal?.aborted) throw err;
 
     await new Promise((r) => setTimeout(r, 150));
-    const retrySignal = AbortSignal.any([
-      ...(parentSignal ? [parentSignal] : []),
-      AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    ]);
-    return await fetch(url, { ...options, signal: retrySignal });
+    const retry = await doFetch();
+    // On retry, fail loudly instead of returning a non-ok response that callers would
+    // try to parse as JSON and surface a confusing downstream error.
+    if (!retry.ok) {
+      throw new Error(`HTTP ${retry.status} after retry`);
+    }
+    return retry;
   }
 }
 
@@ -364,7 +370,8 @@ export default function websearchExtension(pi: ExtensionAPI) {
   // ── Session Event Bindings ──────────────────────────────────────────
 
   pi.on("session_start", async () => {
-    await ensureDaemonRunning();
+    // Don't block session start on daemon startup; the tools await it when they need it.
+    void ensureDaemonRunning();
   });
 
   pi.on("session_shutdown", async () => {

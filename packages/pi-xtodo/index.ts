@@ -3,6 +3,9 @@
  * Registers the `todo` tool, `/todos` slash command, and persistent TodoOverlay.
  */
 
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Text, type TUI, truncateToWidth } from "@earendil-works/pi-tui";
 import { type Static, Type } from "@sinclair/typebox";
@@ -102,14 +105,57 @@ export type TodoParams = Static<typeof TodoParamsSchema>;
 const sessions = new Map<string, TaskState>();
 let activeRenderSession = "";
 
+// Replay cache: avoid rescanning the entire branch message history on every
+// session event when nothing has changed (keyed by session id + branch length).
+const replayCache = new Map<string, { len: number; state: TaskState }>();
+
+// Test seam: how many times replayFromBranch actually recomputed state (vs. served
+// a cache hit). Exposed via __replayComputeCount so tests can assert the cache-skip fires.
+let replayComputeCount = 0;
+
+// Disk persistence: survive agent/session restarts. The branch message history
+// remains the source of truth; this is a fallback when history isn't replayed yet.
+const XTODO_DIR = join(homedir(), ".pi", "xtodo");
+function persistPath(id: string): string {
+  return join(XTODO_DIR, `${id}.json`);
+}
+function saveSessionState(id: string, state: TaskState): void {
+  try {
+    if (!existsSync(XTODO_DIR)) mkdirSync(XTODO_DIR, { recursive: true });
+    writeFileSync(persistPath(id), JSON.stringify(state), "utf8");
+  } catch {
+    // Best-effort persistence.
+  }
+}
+function restoreSessionState(id: string): TaskState | undefined {
+  try {
+    if (!existsSync(persistPath(id))) return undefined;
+    const parsed = JSON.parse(readFileSync(persistPath(id), "utf8")) as TaskState;
+    if (parsed && Array.isArray(parsed.tasks) && typeof parsed.nextId === "number") {
+      return { tasks: parsed.tasks, nextId: parsed.nextId };
+    }
+  } catch {
+    // Corrupt or unreadable file — ignore.
+  }
+  return undefined;
+}
+
 const sid = (ctx: any): string => ctx.sessionManager.getSessionId() ?? "";
 const freshState = (): TaskState => ({ tasks: [], nextId: 1 });
 const getSessionState = (sessionId: string): TaskState => sessions.get(sessionId) ?? freshState();
 
 // Reconstruct tasks state from session messages history
 export function replayFromBranch(ctx: any): TaskState {
+  const id = sid(ctx);
+  const branch = ctx.sessionManager.getBranch();
+  const len = branch.length;
+  const cached = replayCache.get(id);
+  if (cached && cached.len === len) {
+    return cached.state;
+  }
+  replayComputeCount++;
   let result = freshState();
-  for (const entry of ctx.sessionManager.getBranch()) {
+  for (const entry of branch) {
     if (entry.type !== "message") continue;
     const msg = entry.message;
     if (msg?.role !== "toolResult" || msg.toolName !== TOOL_NAME) continue;
@@ -121,6 +167,7 @@ export function replayFromBranch(ctx: any): TaskState {
       };
     }
   }
+  replayCache.set(id, { len, state: result });
   return result;
 }
 
@@ -559,6 +606,7 @@ export default function (pi: ExtensionAPI) {
       const state = getSessionState(id);
       const result = applyMutation(state, action, params);
       sessions.set(id, result.state);
+      saveSessionState(id, result.state);
 
       const details: TaskDetails = {
         action,
@@ -684,7 +732,24 @@ export default function (pi: ExtensionAPI) {
     let id: string;
     try {
       id = sid(ctx);
-      sessions.set(id, replayFromBranch(ctx));
+      const branch = ctx.sessionManager.getBranch();
+      const replayed = replayFromBranch(ctx);
+      const hasTodoHistory = branch.some(
+        (e: any) => e?.message?.role === "toolResult" && e?.message?.toolName === TOOL_NAME,
+      );
+      // Fallback to disk only when the message history hasn't been replayed yet,
+      // so a restart can recover in-progress tasks.
+      if (!hasTodoHistory) {
+        const restored = restoreSessionState(id);
+        if (restored) {
+          sessions.set(id, restored);
+          replayCache.set(id, { len: branch.length, state: restored });
+        } else {
+          sessions.set(id, replayed);
+        }
+      } else {
+        sessions.set(id, replayed);
+      }
     } catch (e) {
       if (!/stale after session replacement/.test(String(e))) throw e;
       return;
@@ -711,6 +776,7 @@ export default function (pi: ExtensionAPI) {
       if (!/stale after session replacement/.test(String(e))) throw e;
     }
     sessions.delete(id);
+    replayCache.delete(id);
     if (id === "" || id === activeRenderSession) {
       try {
         todoOverlay?.dispose();
@@ -737,5 +803,18 @@ export default function (pi: ExtensionAPI) {
 // ---------------------------------------------------------------------------
 export function __resetState(): void {
   sessions.clear();
+  replayCache.clear();
+  replayComputeCount = 0;
+  if (activeRenderSession) {
+    try {
+      unlinkSync(persistPath(activeRenderSession));
+    } catch {
+      // File may not exist.
+    }
+  }
   activeRenderSession = "";
+}
+
+export function __replayComputeCount(): number {
+  return replayComputeCount;
 }

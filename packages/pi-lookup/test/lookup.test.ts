@@ -49,6 +49,36 @@ describe("pi-lookup context7", () => {
       /Library not found on Context7/,
     );
   });
+
+  it("caches identical lookups so only one network round-trip occurs", async () => {
+    let calls = 0;
+    globalThis.fetch = (async (url: string | URL | Request, _init?: RequestInit) => {
+      calls++;
+      const urlStr = url.toString();
+      if (urlStr.includes("/search")) {
+        return { ok: true, json: async () => ({ results: [{ id: "lib-vue" }] }) } as Response;
+      }
+      if (urlStr.includes("/lib-vue")) {
+        return {
+          ok: true,
+          headers: new Headers({ "content-type": "application/json" }),
+          text: async () =>
+            JSON.stringify({
+              content: "Vue docs",
+              metadata: { title: "Vue Docs", url: "https://vuejs.org" },
+            }),
+        } as Response;
+      }
+      return { ok: false, status: 404 } as Response;
+    }) as any;
+
+    const r1 = await context7Tool.execute("c1", { libraryName: "vue" });
+    const r2 = await context7Tool.execute("c2", { libraryName: "vue" });
+    expect(r1.details.libraryId).toBe("lib-vue");
+    expect(r2.details.libraryId).toBe("lib-vue");
+    // search + docs on first call, then a cache hit with zero extra fetches.
+    expect(calls).toBe(2);
+  });
 });
 
 describe("pi-lookup deepwiki", () => {
@@ -79,5 +109,26 @@ describe("pi-lookup deepwiki", () => {
     expect(result.details.provider).toBe("deepwiki");
     expect(result.details.repo).toBe("facebook/react");
     expect(result.content[0].text).toBe("Here is the answer about facebook/react.");
+  });
+
+  it("caches identical questions so only one network round-trip occurs", async () => {
+    let calls = 0;
+    globalThis.fetch = (async (_url: string | URL | Request, _init?: RequestInit) => {
+      calls++;
+      return {
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            jsonrpc: "2.0",
+            result: { content: [{ type: "text", text: "Vue answer" }] },
+          }),
+      } as Response;
+    }) as any;
+
+    const r1 = await deepwikiTool.execute("c1", { repo: "vuejs/core", question: "how?" });
+    const r2 = await deepwikiTool.execute("c2", { repo: "vuejs/core", question: "how?" });
+    expect(r1.content[0].text).toBe("Vue answer");
+    expect(r2.content[0].text).toBe("Vue answer");
+    expect(calls).toBe(1);
   });
 });

@@ -10,6 +10,10 @@ import { Type } from "@sinclair/typebox";
 
 const CONTEXT7_API = "https://context7.com/api";
 
+// Short-lived cache so repeated doc lookups for the same library don't re-hit the API.
+const CONTEXT7_CACHE_TTL_MS = 10 * 60 * 1000;
+const context7Cache = new Map<string, { expires: number; content: string; libraryId: string }>();
+
 type Context7SearchResponse = {
   results?: Array<{ id: string; name?: string }>;
 };
@@ -48,6 +52,21 @@ export const context7Tool = {
 
     if (!libraryName) throw new Error("libraryName is required.");
 
+    const cacheKey = `${libraryName}|${topic ?? ""}|${maxTokens}`;
+    const now = Date.now();
+    const cached = context7Cache.get(cacheKey);
+    if (cached && cached.expires > now) {
+      return {
+        content: [{ type: "text" as const, text: cached.content }],
+        details: {
+          provider: "context7",
+          libraryId: cached.libraryId,
+          topic,
+          contentLength: cached.content.length,
+        },
+      };
+    }
+
     const requestSignal = AbortSignal.any([
       ...(signal ? [signal] : []),
       AbortSignal.timeout(30000),
@@ -62,7 +81,17 @@ export const context7Tool = {
     if (!searchData.results?.length) {
       throw new Error(`Library not found on Context7: ${libraryName}`);
     }
-    const libraryId = searchData.results[0].id;
+    const rawId = searchData.results[0].id;
+    if (!rawId) {
+      throw new Error(`Context7 returned a result without an id for: ${libraryName}`);
+    }
+    // Encode each path segment so ids containing special characters are safe in the URL
+    // while preserving the org/name structure (e.g. "mongodb/docs").
+    const libraryId = rawId
+      .split("/")
+      .filter((seg) => seg.length > 0)
+      .map((seg) => encodeURIComponent(seg))
+      .join("/");
 
     // Step 2: fetch docs
     const docParams = new URLSearchParams();
@@ -92,8 +121,10 @@ export const context7Tool = {
     lines.push(docs.content || "(no content returned)");
     if (docs.metadata?.url) lines.push("", `Source: ${docs.metadata.url}`);
 
+    const content = lines.join("\n").trim();
+    context7Cache.set(cacheKey, { expires: now + CONTEXT7_CACHE_TTL_MS, content, libraryId });
     return {
-      content: [{ type: "text" as const, text: lines.join("\n").trim() }],
+      content: [{ type: "text" as const, text: content }],
       details: { provider: "context7", libraryId, topic, contentLength: docs.content?.length ?? 0 },
     };
   },

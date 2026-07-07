@@ -239,6 +239,12 @@ function buildDockerArgs(image: string, command: string, workspaceDir: string): 
     "no-new-privileges",
     "--user",
     "1000:1000",
+    "--memory",
+    "256m",
+    "--pids-limit",
+    "128",
+    "--cpus",
+    "1.0",
     "-v",
     `${workspaceDir}:/workspace:rw`,
     image,
@@ -258,6 +264,27 @@ function renderCommand(template: string, pocPath: string, inSandbox: boolean): s
     .replace(/{{file}}/g, targetPath)
     .replace(/{{bin}}/g, binPath)
     .replace(/{{class}}/g, className);
+}
+
+/**
+ * Translate a spawnSync result into a robust exit code.
+ *
+ * `spawnSync` returns `status: null` AND `signal: null` when it cannot even start
+ * the child (e.g. the binary is missing → ENOENT, or the docker daemon is
+ * unavailable). The previous `result.status ?? (result.signal ? 1 : 0)` then
+ * collapsed to `0`, making a never-executed PoC look successful — which let
+ * PromoteFinding promote an investigating case to CONFIRMED without the PoC
+ * ever running. We fail closed: a spawn error or a missing status/signal is
+ * always a non-zero exit.
+ */
+function spawnExitCode(result: {
+  status: number | null;
+  signal: string | null;
+  error?: Error;
+}): number {
+  if (result.error) return 127;
+  if (result.status !== null) return result.status;
+  return 1;
 }
 
 function runSandboxed(pocPath: string, language: PocLanguage): PocRun {
@@ -283,10 +310,11 @@ function runSandboxed(pocPath: string, language: PocLanguage): PocRun {
       maxBuffer: MAX_BUFFER,
     });
 
-    const output = sanitizeOutput((result.stdout ?? "") + (result.stderr ?? ""));
+    const spawnErr = result.error ? `\n[spawn error] ${result.error.message}` : "";
+    const output = sanitizeOutput((result.stdout ?? "") + (result.stderr ?? "") + spawnErr);
     return {
       path: pocPath,
-      exitCode: result.status ?? (result.signal ? 1 : 0),
+      exitCode: spawnExitCode(result),
       output,
       ranAt,
       sandbox: true,
@@ -314,11 +342,15 @@ function runLocal(pocPath: string, language: PocLanguage): PocRun {
     throw new Error("Language config has no run command");
   }
 
-  // For local execution, split the run command into binary and args.
+  // The run template is `<interpreter> <file>`. Preserve multi-arg run commands for
+  // normal paths, but keep a space-containing PoC path as a single argument (no shell
+  // is used, so args are passed verbatim).
   const command = renderCommand(language.run, pocPath, false);
-  const [interpreter, ...args] = command.split(" ");
-  // Note: the file path is already substituted in the args if {{file}} was used.
-  // We just need to spawn.
+  const trimmed = command.trim();
+  const firstSpace = trimmed.indexOf(" ");
+  const interpreter = firstSpace === -1 ? trimmed : trimmed.slice(0, firstSpace);
+  const rest = firstSpace === -1 ? "" : trimmed.slice(firstSpace + 1);
+  const args = pocPath.includes(" ") ? (rest ? [rest] : []) : rest ? rest.split(" ") : [];
 
   const result = spawnSync(interpreter, args, {
     encoding: "utf8",
@@ -326,10 +358,11 @@ function runLocal(pocPath: string, language: PocLanguage): PocRun {
     maxBuffer: MAX_BUFFER,
   });
 
-  const output = sanitizeOutput((result.stdout ?? "") + (result.stderr ?? ""));
+  const spawnErr = result.error ? `\n[spawn error] ${result.error.message}` : "";
+  const output = sanitizeOutput((result.stdout ?? "") + (result.stderr ?? "") + spawnErr);
   return {
     path: pocPath,
-    exitCode: result.status ?? (result.signal ? 1 : 0),
+    exitCode: spawnExitCode(result),
     output,
     ranAt,
     sandbox: false,

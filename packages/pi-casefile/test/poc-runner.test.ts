@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -17,6 +18,8 @@ beforeEach(() => {
 afterEach(async () => {
   delete process.env.PI_POC_ROOT;
   delete process.env.PI_POC_ALLOW_ABSOLUTE;
+  delete process.env.PI_POC_DEFAULT_LANGUAGE;
+  delete process.env.PI_POC_LANGUAGES;
   await rm(tempDir, { recursive: true, force: true });
 });
 
@@ -56,5 +59,40 @@ describe("poc-runner", () => {
     expect(result.output).not.toContain("\x1b[31m");
     expect(result.output).not.toContain("\x00");
     expect(result.output).toContain("hello world");
+  });
+
+  it("fails closed when the interpreter is missing (no false exit 0)", () => {
+    // Define a language whose interpreter does not exist, and force it via the
+    // default-language env. This reproduces the spawn ENOENT path: previously the
+    // PoC would report exitCode 0 and get promoted to CONFIRMED without running.
+    process.env.PI_POC_DEFAULT_LANGUAGE = "ghost";
+    process.env.PI_POC_LANGUAGES = JSON.stringify({
+      ghost: { image: "alpine", run: "definitely_missing_interpreter_xyz {{file}}" },
+    });
+
+    const poc = join(tempDir, "poc.txt");
+    writeFileSync(poc, "echo hi", "utf8");
+
+    const result = runPoc(poc, false);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.output).toContain("[spawn error]");
+  });
+
+  it("fails closed when docker is missing (sandbox path)", () => {
+    // Only meaningful when docker is NOT installed; if it is, the sandbox would
+    // actually run and we can't deterministically assert fail-closed.
+    let hasDocker = false;
+    try {
+      hasDocker = spawnSync("docker", ["--version"]).status === 0;
+    } catch {
+      hasDocker = false;
+    }
+    if (hasDocker) return;
+
+    const shPoc = join(tempDir, "poc.sh");
+    writeFileSync(shPoc, "#!/bin/sh\necho hi", "utf8");
+
+    const result = runPoc(shPoc, true);
+    expect(result.exitCode).not.toBe(0);
   });
 });

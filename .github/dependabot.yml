@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # Keep npm dependencies (incl. @earendil-works/pi-* and @sinclair/typebox) current.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+
+  # Keep GitHub Actions workflows themselves up to date.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+      - "github-actions"
