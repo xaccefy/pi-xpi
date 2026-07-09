@@ -190,6 +190,88 @@ describe("pi-xtodo simplified tests", () => {
     }
   });
 
+  it("update accepts string ids (LLM tool-call coercion)", async () => {
+    const todoTool = pi.tools[0];
+    await todoTool.execute("1", { action: "create", subject: "Coerce me" }, null, null, mockCtx);
+    const update = await todoTool.execute(
+      "2",
+      { action: "update", id: "1" as unknown as number, status: "in_progress" },
+      null,
+      null,
+      mockCtx,
+    );
+    assert.ok(!update.isError, update.content[0].text);
+    assert.ok(update.content[0].text.includes("Updated #1 (pending → in_progress)"));
+
+    const got = await todoTool.execute(
+      "3",
+      { action: "get", id: "1" as unknown as number },
+      null,
+      null,
+      mockCtx,
+    );
+    assert.ok(got.content[0].text.includes("[in_progress]"));
+  });
+
+  it("update rejects empty subject and mutations on deleted tasks", async () => {
+    const todoTool = pi.tools[0];
+    await todoTool.execute("1", { action: "create", subject: "Keep me" }, null, null, mockCtx);
+
+    const empty = await todoTool.execute(
+      "2",
+      { action: "update", id: 1, subject: "   " },
+      null,
+      null,
+      mockCtx,
+    );
+    assert.ok(empty.isError);
+    assert.ok(empty.content[0].text.includes("subject cannot be empty"));
+
+    await todoTool.execute("3", { action: "delete", id: 1 }, null, null, mockCtx);
+    const onDeleted = await todoTool.execute(
+      "4",
+      { action: "update", id: 1, subject: "ghost" },
+      null,
+      null,
+      mockCtx,
+    );
+    assert.ok(onDeleted.isError);
+    assert.ok(onDeleted.content[0].text.includes("is deleted"));
+  });
+
+  it("allows deep blockedBy chains without false cycle errors", async () => {
+    const todoTool = pi.tools[0];
+    for (let i = 1; i <= 8; i++) {
+      await todoTool.execute(
+        String(i),
+        { action: "create", subject: `T${i}` },
+        null,
+        null,
+        mockCtx,
+      );
+    }
+    for (let i = 2; i <= 8; i++) {
+      const r = await todoTool.execute(
+        `u${i}`,
+        { action: "update", id: i, addBlockedBy: [i - 1] },
+        null,
+        null,
+        mockCtx,
+      );
+      assert.ok(!r.isError, `update #${i} failed: ${r.content[0].text}`);
+    }
+    // Real cycle must still be rejected: #1 → #8 would close the chain.
+    const cycle = await todoTool.execute(
+      "cycle",
+      { action: "update", id: 1, addBlockedBy: [8] },
+      null,
+      null,
+      mockCtx,
+    );
+    assert.ok(cycle.isError);
+    assert.ok(cycle.content[0].text.includes("would create a cycle"));
+  });
+
   it("skips replay when branch length is unchanged (cache hit, no recompute)", async () => {
     const todoTool = pi.tools[0];
     sessionManager.sessionId = "cache-skip-session";

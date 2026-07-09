@@ -182,15 +182,48 @@ const VALID_TRANSITIONS: Record<TaskStatus, TaskStatus[]> = {
 };
 
 function hasCycle(tasks: Task[], taskId: number, newBlockedBy: number[]): boolean {
+  // newBlockedBy is the full replacement dependency list for taskId (not a delta).
   const adj = new Map(
-    tasks.map((t) => [
-      t.id,
-      t.id === taskId ? [...(t.blockedBy ?? []), ...newBlockedBy] : [...(t.blockedBy ?? [])],
-    ]),
+    tasks.map((t) => [t.id, t.id === taskId ? [...newBlockedBy] : [...(t.blockedBy ?? [])]]),
   );
-  const dfs = (node: number, depth: number): boolean =>
-    depth > 5 || (adj.get(node) ?? []).some((n) => dfs(n, depth + 1));
-  return dfs(taskId, 0);
+  const visiting = new Set<number>();
+  const visited = new Set<number>();
+
+  const dfs = (node: number): boolean => {
+    if (visiting.has(node)) return true;
+    if (visited.has(node)) return false;
+    visiting.add(node);
+    for (const neighbor of adj.get(node) ?? []) {
+      if (dfs(neighbor)) return true;
+    }
+    visiting.delete(node);
+    visited.add(node);
+    return false;
+  };
+
+  // Only taskId's outbound edges changed; any new cycle must be reachable from it.
+  return dfs(taskId);
+}
+
+/** Coerce tool-call ids (models often send numeric strings) to finite numbers. */
+function coerceId(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+function coerceIdList(value: unknown): number[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: number[] = [];
+  for (const item of value) {
+    const n = coerceId(item);
+    if (n === undefined) return undefined;
+    out.push(n);
+  }
+  return out;
 }
 
 interface ReducerOutput {
@@ -208,7 +241,9 @@ function applyMutation(state: TaskState, action: TaskAction, params: any): Reduc
   switch (action) {
     case "create": {
       if (!params.subject?.trim()) return err("subject required for create");
-      const blocked = params.blockedBy ?? [];
+      const blocked =
+        params.blockedBy === undefined ? [] : (coerceIdList(params.blockedBy) ?? null);
+      if (blocked === null) return err("blockedBy must be an array of numbers");
       for (const dep of blocked) {
         const depTask = tasks.find((t) => t.id === dep);
         if (!depTask) return err(`blockedBy: #${dep} not found`);
@@ -216,7 +251,7 @@ function applyMutation(state: TaskState, action: TaskAction, params: any): Reduc
       }
       const newTask: Task = {
         id: nextId++,
-        subject: params.subject,
+        subject: String(params.subject).trim(),
         status: "pending",
         ...(params.description && { description: params.description }),
         ...(params.activeForm && { activeForm: params.activeForm }),
@@ -233,9 +268,23 @@ function applyMutation(state: TaskState, action: TaskAction, params: any): Reduc
 
     case "update": {
       if (params.id === undefined) return err("id required for update");
-      const idx = tasks.findIndex((t) => t.id === params.id);
-      if (idx === -1) return err(`#${params.id} not found`);
+      const id = coerceId(params.id);
+      if (id === undefined) return err("id must be a number");
+      const idx = tasks.findIndex((t) => t.id === id);
+      if (idx === -1) return err(`#${id} not found`);
       const cur = tasks[idx];
+      if (cur.status === "deleted") return err(`#${cur.id} is deleted`);
+
+      const addBlockedBy =
+        params.addBlockedBy !== undefined ? coerceIdList(params.addBlockedBy) : undefined;
+      if (params.addBlockedBy !== undefined && addBlockedBy === undefined) {
+        return err("addBlockedBy must be an array of numbers");
+      }
+      const removeBlockedBy =
+        params.removeBlockedBy !== undefined ? coerceIdList(params.removeBlockedBy) : undefined;
+      if (params.removeBlockedBy !== undefined && removeBlockedBy === undefined) {
+        return err("removeBlockedBy must be an array of numbers");
+      }
 
       const hasMutation =
         params.subject !== undefined ||
@@ -244,9 +293,13 @@ function applyMutation(state: TaskState, action: TaskAction, params: any): Reduc
         params.status !== undefined ||
         params.owner !== undefined ||
         params.metadata !== undefined ||
-        params.addBlockedBy?.length ||
-        params.removeBlockedBy?.length;
+        (addBlockedBy?.length ?? 0) > 0 ||
+        (removeBlockedBy?.length ?? 0) > 0;
       if (!hasMutation) return err("update requires at least one mutable field");
+
+      if (params.subject !== undefined && !String(params.subject).trim()) {
+        return err("subject cannot be empty");
+      }
 
       let status = cur.status;
       if (params.status !== undefined) {
@@ -257,12 +310,12 @@ function applyMutation(state: TaskState, action: TaskAction, params: any): Reduc
       }
 
       let blocked = cur.blockedBy ? [...cur.blockedBy] : [];
-      if (params.removeBlockedBy?.length) {
-        const rm = new Set(params.removeBlockedBy);
+      if (removeBlockedBy?.length) {
+        const rm = new Set(removeBlockedBy);
         blocked = blocked.filter((d) => !rm.has(d));
       }
-      if (params.addBlockedBy?.length) {
-        for (const dep of params.addBlockedBy) {
+      if (addBlockedBy?.length) {
+        for (const dep of addBlockedBy) {
           if (dep === cur.id) return err(`cannot block #${cur.id} on itself`);
           const depTask = tasks.find((t) => t.id === dep);
           if (!depTask) return err(`addBlockedBy: #${dep} not found`);
@@ -287,7 +340,7 @@ function applyMutation(state: TaskState, action: TaskAction, params: any): Reduc
       const updated: Task = {
         ...cur,
         status,
-        ...(params.subject !== undefined && { subject: params.subject }),
+        ...(params.subject !== undefined && { subject: String(params.subject).trim() }),
         ...(params.description !== undefined && { description: params.description }),
         ...(params.activeForm !== undefined && { activeForm: params.activeForm }),
         ...(params.owner !== undefined && { owner: params.owner }),
@@ -323,8 +376,10 @@ function applyMutation(state: TaskState, action: TaskAction, params: any): Reduc
 
     case "get": {
       if (params.id === undefined) return err("id required for get");
-      const task = tasks.find((t) => t.id === params.id);
-      if (!task) return err(`#${params.id} not found`);
+      const id = coerceId(params.id);
+      if (id === undefined) return err("id must be a number");
+      const task = tasks.find((t) => t.id === id);
+      if (!task) return err(`#${id} not found`);
 
       const blocks: number[] = [];
       for (const t of tasks) {
@@ -343,8 +398,10 @@ function applyMutation(state: TaskState, action: TaskAction, params: any): Reduc
 
     case "delete": {
       if (params.id === undefined) return err("id required for delete");
-      const idx = tasks.findIndex((t) => t.id === params.id);
-      if (idx === -1) return err(`#${params.id} not found`);
+      const id = coerceId(params.id);
+      if (id === undefined) return err("id must be a number");
+      const idx = tasks.findIndex((t) => t.id === id);
+      if (idx === -1) return err(`#${id} not found`);
       const cur = tasks[idx];
       if (cur.status === "deleted") return err(`#${cur.id} is already deleted`);
       tasks[idx] = { ...cur, status: "deleted" };
@@ -633,7 +690,9 @@ export default function (pi: ExtensionAPI) {
         (args.action === "update" || args.action === "get" || args.action === "delete") &&
         args.id !== undefined
       ) {
-        const subj = state.tasks.find((t) => t.id === args.id)?.subject;
+        const callId = coerceId(args.id);
+        const subj =
+          callId !== undefined ? state.tasks.find((t) => t.id === callId)?.subject : undefined;
         text += ` ${theme.fg("accent", subj ?? `#${args.id}`)}`;
       } else if (args.action === "list" && args.status) {
         text += ` ${theme.fg("muted", args.status === "in_progress" ? "in progress" : args.status)}`;
@@ -647,10 +706,16 @@ export default function (pi: ExtensionAPI) {
       if (details) {
         const p = details.params as any;
         if (details.action === "create") status = details.tasks[details.tasks.length - 1]?.status;
-        else if (details.action === "update")
-          status = p.status ?? details.tasks.find((t) => t.id === p.id)?.status;
-        else if (details.action === "delete")
-          status = details.tasks.find((t) => t.id === p.id)?.status;
+        else if (details.action === "update") {
+          const callId = coerceId(p.id);
+          status =
+            p.status ??
+            (callId !== undefined ? details.tasks.find((t) => t.id === callId)?.status : undefined);
+        } else if (details.action === "delete") {
+          const callId = coerceId(p.id);
+          status =
+            callId !== undefined ? details.tasks.find((t) => t.id === callId)?.status : undefined;
+        }
       }
       if (status)
         return new Text(
