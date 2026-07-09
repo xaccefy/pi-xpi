@@ -6,16 +6,78 @@
  */
 
 import { Type } from "@sinclair/typebox";
+import { TtlLruCache } from "./cache.ts";
 
 const DEEPWIKI_MCP_URL = "https://mcp.deepwiki.com/mcp";
 const DEEPWIKI_TOOL = "ask_question";
 const DEFAULT_TIMEOUT_MS = 30_000;
-
-// Short-lived cache so repeated questions about the same repo don't re-hit the MCP server.
 const DEEPWIKI_CACHE_TTL_MS = 10 * 60 * 1000;
-const deepwikiCache = new Map<string, { expires: number; text: string }>();
+const deepwikiCache = new TtlLruCache<string>(DEEPWIKI_CACHE_TTL_MS, 64);
 
 type McpContentItem = { type: string; text?: string };
+
+type McpJsonRpc = {
+  result?: { content?: McpContentItem[]; isError?: boolean };
+  error?: { message?: string };
+};
+
+/** Parse a single JSON-RPC MCP tools/call response into joined text content. */
+function textFromMcpMessage(msg: McpJsonRpc): string {
+  if (msg.error?.message) {
+    throw new Error(`DeepWiki error: ${msg.error.message}`);
+  }
+  if (msg.result?.isError) {
+    const errText = (msg.result.content ?? [])
+      .filter((i) => i.type === "text" && i.text)
+      .map((i) => i.text)
+      .join("\n");
+    throw new Error(errText || "DeepWiki tool returned isError=true");
+  }
+  const parts = (msg.result?.content ?? [])
+    .filter((i) => i.type === "text" && i.text)
+    .map((i) => i.text as string);
+  if (parts.length === 0) {
+    throw new Error("DeepWiki returned empty content");
+  }
+  return parts.join("\n");
+}
+
+/**
+ * MCP Streamable HTTP may return application/json OR text/event-stream.
+ * Never treat raw protocol text as a successful answer (that poisons the cache).
+ */
+function extractDeepwikiText(body: string, contentType: string): string {
+  const looksLikeSse =
+    contentType.includes("text/event-stream") ||
+    /^\s*event:/m.test(body) ||
+    /^\s*data:/m.test(body);
+
+  if (looksLikeSse) {
+    let last: McpJsonRpc | undefined;
+    for (const line of body.split(/\r?\n/)) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        last = JSON.parse(payload) as McpJsonRpc;
+      } catch {
+        // skip non-JSON data frames
+      }
+    }
+    if (!last) {
+      throw new Error("DeepWiki returned SSE without a parseable JSON-RPC payload");
+    }
+    return textFromMcpMessage(last);
+  }
+
+  let msg: McpJsonRpc;
+  try {
+    msg = JSON.parse(body) as McpJsonRpc;
+  } catch {
+    throw new Error("DeepWiki returned a non-JSON response");
+  }
+  return textFromMcpMessage(msg);
+}
 
 export const deepwikiTool = {
   name: "deepwiki",
@@ -43,83 +105,54 @@ export const deepwikiTool = {
     if (!question) throw new Error("question is required.");
 
     const cacheKey = `${repo}|${question}`;
-    const now = Date.now();
-    const cached = deepwikiCache.get(cacheKey);
-    if (cached && cached.expires > now) {
-      return {
-        content: [{ type: "text" as const, text: cached.text }],
-        details: { provider: "deepwiki", repo, question },
-      };
-    }
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
-    if (signal) {
-      if (signal.aborted) controller.abort(signal.reason);
-      else signal.addEventListener("abort", () => controller.abort(signal.reason), { once: true });
-    }
 
     try {
-      const body = JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "tools/call",
-        params: { name: DEEPWIKI_TOOL, arguments: { repo, question } },
+      const finalText = await deepwikiCache.getOrLoad(cacheKey, async () => {
+        const requestSignal = AbortSignal.any([
+          ...(signal ? [signal] : []),
+          AbortSignal.timeout(DEFAULT_TIMEOUT_MS),
+        ]);
+
+        const body = JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: DEEPWIKI_TOOL, arguments: { repo, question } },
+        });
+
+        const response = await fetch(DEEPWIKI_MCP_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json, text/event-stream",
+          },
+          body,
+          signal: requestSignal,
+        });
+
+        if (!response.ok) {
+          throw new Error(`DeepWiki returned ${response.status}: ${response.statusText}`);
+        }
+
+        const text = await response.text();
+        const contentType =
+          (typeof response.headers?.get === "function"
+            ? response.headers.get("content-type")
+            : undefined) ?? "";
+        return extractDeepwikiText(text, contentType);
       });
 
-      const response = await fetch(DEEPWIKI_MCP_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json, text/event-stream",
-        },
-        body,
-        signal: controller.signal,
-      });
-
-      if (!response.ok) {
-        throw new Error(`DeepWiki returned ${response.status}: ${response.statusText}`);
-      }
-
-      const text = await response.text();
-      const textParts: string[] = [];
-
-      // Try to parse as JSON-RPC response
-      try {
-        const msg = JSON.parse(text);
-        if (msg.result?.content && Array.isArray(msg.result.content)) {
-          for (const item of msg.result.content as McpContentItem[]) {
-            if (item.type === "text" && item.text) textParts.push(item.text);
-          }
-        } else if (msg.error?.message) {
-          throw new Error(`DeepWiki error: ${msg.error.message}`);
-        }
-      } catch (parseErr) {
-        // Fallback: server returned plain text
-        if (parseErr instanceof SyntaxError) {
-          textParts.push(text.slice(0, 5000));
-        } else {
-          throw parseErr;
-        }
-      }
-
-      const finalText = textParts.join("\n") || text.slice(0, 5000);
-      deepwikiCache.set(cacheKey, { expires: now + DEEPWIKI_CACHE_TTL_MS, text: finalText });
       return {
         content: [{ type: "text" as const, text: finalText }],
         details: { provider: "deepwiki", repo, question },
       };
     } catch (error) {
-      if (controller.signal.aborted) {
-        // Distinguish between our internal timeout and a parent-signal abort
-        const reason = signal?.aborted
-          ? "DeepWiki aborted by caller"
-          : `DeepWiki timed out after ${DEFAULT_TIMEOUT_MS}ms`;
-        throw new Error(reason);
+      const msg = (error as Error).message ?? String(error);
+      if (signal?.aborted) throw new Error("DeepWiki aborted by caller");
+      if (/aborted|timeout|TimeoutError/i.test(msg) || msg.includes("The operation was aborted")) {
+        throw new Error(`DeepWiki timed out after ${DEFAULT_TIMEOUT_MS}ms`);
       }
-      throw new Error(`DeepWiki failed: ${(error as Error).message}`);
-    } finally {
-      clearTimeout(timer);
+      throw new Error(`DeepWiki failed: ${msg}`);
     }
   },
 };

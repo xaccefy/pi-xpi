@@ -1,6 +1,6 @@
 {
   "name": "@xaccefy/pi-lookup",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Web search, page fetch, library docs (Context7), and GitHub repo Q&A (DeepWiki) for Pi Agent",
   "keywords": [
     "pi-package",
@@ -30,6 +30,7 @@
     "src/websearch.ts",
     "src/context7.ts",
     "src/deepwiki.ts",
+    "src/cache.ts",
     "README.md",
     "LICENSE"
   ],

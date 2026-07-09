@@ -13,14 +13,22 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { abortableSleep, isTransientHttpStatus } from "./cache.ts";
 
 // ── Constants & Environment ──────────────────────────────────────────
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const DAEMON_PORT = process.env.PI_WEBSEARCH_PORT || "3210";
+function resolveDaemonPort(): string {
+  const raw = (process.env.PI_WEBSEARCH_PORT || "3210").trim();
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) return "3210";
+  return String(n);
+}
+const DAEMON_PORT = resolveDaemonPort();
 const DAEMON_URL = `http://127.0.0.1:${DAEMON_PORT}`;
+let shuttingDown = false;
 
 const POLL_INTERVAL_MS = 350;
 const STARTUP_RETRIES = 15;
@@ -60,9 +68,12 @@ async function checkDaemonRunning(): Promise<boolean> {
 }
 
 function startDaemon(): void {
+  if (shuttingDown) return;
   const scriptPath = getDaemonScriptPath();
   if (!scriptPath) {
-    return;
+    throw new Error(
+      "open-websearch package not found. Run npm/bun install so open-websearch is available.",
+    );
   }
 
   daemonProcess = spawn("node", [scriptPath, "serve", "--port", DAEMON_PORT], {
@@ -71,6 +82,8 @@ function startDaemon(): void {
     windowsHide: true,
     detached: false,
   });
+  // Don't pin the event loop solely because the child is alive.
+  daemonProcess.unref?.();
 
   daemonProcess.on("exit", () => {
     daemonProcess = null;
@@ -86,21 +99,19 @@ process.on("exit", () => {
 });
 
 async function ensureDaemonRunning(): Promise<boolean> {
-  if (await checkDaemonRunning()) {
-    return true;
-  }
-
-  if (startupPromise) {
-    return startupPromise;
-  }
+  if (shuttingDown) return false;
+  // Assign the shared promise BEFORE any await so concurrent callers coalesce
+  // onto one spawn instead of each forking a daemon and orphaning children.
+  if (startupPromise) return startupPromise;
 
   startupPromise = (async () => {
-    startDaemon();
+    if (await checkDaemonRunning()) return true;
+    if (shuttingDown) return false;
+    if (!daemonProcess) startDaemon();
     for (let i = 0; i < STARTUP_RETRIES; i++) {
+      if (shuttingDown) return false;
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-      if (await checkDaemonRunning()) {
-        return true;
-      }
+      if (await checkDaemonRunning()) return true;
     }
     return false;
   })();
@@ -113,6 +124,15 @@ async function ensureDaemonRunning(): Promise<boolean> {
 }
 
 async function stopDaemon(): Promise<void> {
+  shuttingDown = true;
+  // Wait for any in-flight startup so we don't kill then re-spawn.
+  if (startupPromise) {
+    try {
+      await startupPromise;
+    } catch {
+      // ignore
+    }
+  }
   if (daemonProcess) {
     try {
       daemonProcess.kill();
@@ -135,23 +155,33 @@ async function fetchWithRetry(
       ]),
     });
 
-  try {
-    const res = await doFetch();
-    if (res.ok) return res;
-    throw new Error(`HTTP ${res.status}`);
-  } catch (err) {
-    // Don't retry if the parent signal aborted — that's an intentional cancel, not a transient error
-    if (parentSignal?.aborted) throw err;
+  const first = await doFetch();
+  if (first.ok) return first;
 
-    await new Promise((r) => setTimeout(r, 150));
-    const retry = await doFetch();
-    // On retry, fail loudly instead of returning a non-ok response that callers would
-    // try to parse as JSON and surface a confusing downstream error.
-    if (!retry.ok) {
-      throw new Error(`HTTP ${retry.status} after retry`);
-    }
-    return retry;
+  const status = first.status;
+  try {
+    first.body?.cancel();
+  } catch {
+    // ignore
   }
+
+  // Only retry transient failures; permanent 4xx should fail fast.
+  if (!isTransientHttpStatus(status)) {
+    throw new Error(`HTTP ${status}`);
+  }
+  if (parentSignal?.aborted) throw new Error(`HTTP ${status}`);
+
+  await abortableSleep(150, parentSignal);
+  const retry = await doFetch();
+  if (!retry.ok) {
+    try {
+      retry.body?.cancel();
+    } catch {
+      // ignore
+    }
+    throw new Error(`HTTP ${retry.status} after retry`);
+  }
+  return retry;
 }
 
 function validateAndParseUrl(input: string): URL {
@@ -308,11 +338,15 @@ export default function websearchExtension(pi: ExtensionAPI) {
         if (!params.url) {
           throw new Error("Missing required 'url' parameter");
         }
-        const targetUrl = validateAndParseUrl(params.url).toString();
+        const parsedUrl = validateAndParseUrl(params.url);
+        const targetUrl = parsedUrl.toString();
 
+        // Match on hostname only — never substring-match the full URL, which would
+        // route e.g. https://evil.example/?q=github.com to the GitHub README fetcher.
         let endpoint = "/fetch-web";
+        const host = parsedUrl.hostname.toLowerCase();
         for (const entry of DOMAIN_ENDPOINT_MAP) {
-          if (targetUrl.includes(entry.match)) {
+          if (host === entry.match || host.endsWith(`.${entry.match}`)) {
             endpoint = entry.endpoint;
             break;
           }
@@ -370,8 +404,12 @@ export default function websearchExtension(pi: ExtensionAPI) {
   // ── Session Event Bindings ──────────────────────────────────────────
 
   pi.on("session_start", async () => {
+    // Fresh session can spawn again even if a prior shutdown ran in-process.
+    shuttingDown = false;
     // Don't block session start on daemon startup; the tools await it when they need it.
-    void ensureDaemonRunning();
+    void ensureDaemonRunning().catch(() => {
+      // Best-effort warm-up; tools will surface a clear error on demand.
+    });
   });
 
   pi.on("session_shutdown", async () => {
