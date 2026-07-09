@@ -133,6 +133,96 @@ describe("pi-codeintel tool tests", () => {
     assert.strictEqual(archResult.details.counts.files_count, 2);
   });
 
+  it("indexes top-level and arrow-function callers under foreign_keys=ON", async () => {
+    fs.writeFileSync(
+      path.join(tempDir, "toplevel.ts"),
+      `
+      function helper() { return 1; }
+      // top-level call
+      helper();
+      // arrow / const function caller
+      const main = () => { helper(); };
+      main();
+      `,
+    );
+
+    const pi = new MockExtensionAPI();
+    codebaseExtension(pi as any);
+    const indexTool = pi.tools.find((t) => t.name === "CodebaseIndex");
+    const findRefTool = pi.tools.find((t) => t.name === "CodebaseFindReferences");
+
+    await indexTool.execute("i0", { workspace: tempDir, force: true }, null, null, null);
+    const refs = await findRefTool.execute(
+      "r0",
+      { symbolName: "helper", workspace: tempDir },
+      null,
+      null,
+      null,
+    );
+    assert.ok(
+      refs.details.references.length >= 2,
+      `expected top-level + arrow callers, got ${refs.details.references.length}: ${refs.content[0].text}`,
+    );
+    const text = refs.content[0].text;
+    assert.ok(text.includes("(global)") || text.includes("toplevel"), text);
+    assert.ok(text.includes("main"), `arrow caller main should appear:\n${text}`);
+  });
+
+  it("resolves import aliases to the exported symbol id", async () => {
+    const aliasDir = path.join(tempDir, "alias");
+    fs.mkdirSync(aliasDir, { recursive: true });
+    fs.writeFileSync(path.join(aliasDir, "lib.ts"), `export function helper() { eval("1"); }`);
+    fs.writeFileSync(
+      path.join(aliasDir, "app.ts"),
+      `import { helper as h } from "./lib";\nexport function run() { h(); }`,
+    );
+
+    const pi = new MockExtensionAPI();
+    codebaseExtension(pi as any);
+    const indexTool = pi.tools.find((t) => t.name === "CodebaseIndex");
+    const traceTool = pi.tools.find((t) => t.name === "CodebaseTraceCallPath");
+
+    await indexTool.execute("ia", { workspace: aliasDir, force: true }, null, null, null);
+    const res = await traceTool.execute(
+      "ta",
+      { targetSymbol: "eval", workspace: aliasDir },
+      null,
+      null,
+      null,
+    );
+    const text = res.content[0].text;
+    assert.ok(text.includes("run"), `alias path should include run:\n${text}`);
+    assert.ok(text.includes("helper"), `alias path should include helper:\n${text}`);
+  });
+
+  it("qualifies methods so same-named methods on different classes do not collide", async () => {
+    fs.writeFileSync(
+      path.join(tempDir, "classes.ts"),
+      `
+      class A { render() { eval("a"); } }
+      class B { render() { console.log("b"); } }
+      export function useA() { new A().render(); }
+      `,
+    );
+
+    const pi = new MockExtensionAPI();
+    codebaseExtension(pi as any);
+    const indexTool = pi.tools.find((t) => t.name === "CodebaseIndex");
+    const findTool = pi.tools.find((t) => t.name === "CodebaseFindSymbol");
+
+    await indexTool.execute("ic", { workspace: tempDir, force: true }, null, null, null);
+    const found = await findTool.execute(
+      "fc",
+      { query: "render", workspace: tempDir },
+      null,
+      null,
+      null,
+    );
+    const names = (found.details.matches as { name: string }[]).map((m) => m.name);
+    assert.ok(names.includes("A.render"), `expected A.render, got ${names.join(",")}`);
+    assert.ok(names.includes("B.render"), `expected B.render, got ${names.join(",")}`);
+  });
+
   it("disambiguates same-named functions across files via callee_id (no false paths)", async () => {
     const collisionDir = path.join(tempDir, "collision");
     fs.mkdirSync(collisionDir, { recursive: true });

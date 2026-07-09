@@ -24,6 +24,8 @@ async function getTs() {
   return tsInstance;
 }
 
+// Cap open workspace DBs so long-lived agents don't leak FDs across many roots.
+const MAX_DB_INSTANCES = 8;
 const dbInstances = new Map<string, DatabaseSync>();
 
 function getDbPath(workspace: string): string {
@@ -36,12 +38,45 @@ function getDbPath(workspace: string): string {
   return path.join(piDir, "codebase.db");
 }
 
+/** Normalize to posix-style relative paths so resolveModule works on Windows too. */
+function toPosixRel(p: string): string {
+  return p.split(path.sep).join("/");
+}
+
 async function getDb(workspace: string): Promise<DatabaseSync> {
   const absWorkspace = path.resolve(workspace);
-  const cached = dbInstances.get(absWorkspace);
-  if (cached) return cached;
-
   const dbPath = getDbPath(absWorkspace);
+  const cached = dbInstances.get(absWorkspace);
+  if (cached) {
+    // If the on-disk DB was wiped (test cleanup / workspace reset), drop the stale handle.
+    if (!fs.existsSync(dbPath)) {
+      try {
+        cached.close();
+      } catch {
+        // ignore
+      }
+      dbInstances.delete(absWorkspace);
+    } else {
+      // Touch for simple LRU: re-insert at end.
+      dbInstances.delete(absWorkspace);
+      dbInstances.set(absWorkspace, cached);
+      return cached;
+    }
+  }
+
+  // Evict oldest entries when over capacity.
+  while (dbInstances.size >= MAX_DB_INSTANCES) {
+    const oldest = dbInstances.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    const oldDb = dbInstances.get(oldest);
+    dbInstances.delete(oldest);
+    try {
+      oldDb?.close();
+    } catch {
+      // Best-effort close.
+    }
+  }
+
   const db = new DatabaseSync(dbPath);
   // Enable foreign-key enforcement so ON DELETE CASCADE actually fires
   // (SQLite keeps FK off by default; bun:sqlite in particular defaults it off).
@@ -243,8 +278,13 @@ interface ParsedCall {
 
 interface ParsedImport {
   moduleName: string;
-  symbolName: string;
+  /** Local binding used at call sites (may be an alias). */
+  localName: string;
+  /** Exported name in the target module (propertyName, or localName if unaliased). */
+  importedName: string;
 }
+
+const GLOBAL_CALLER = "(global)";
 
 function parseSourceFile(ts: any, filePath: string, content: string) {
   const sourceFile = ts.createSourceFile(filePath, content, ts.ScriptTarget.Latest, true);
@@ -254,6 +294,7 @@ function parseSourceFile(ts: any, filePath: string, content: string) {
   const imports: ParsedImport[] = [];
 
   let currentFunction: string | null = null;
+  let currentClass: string | null = null;
 
   function getDocstring(node: any): string {
     const sourceText = sourceFile.text;
@@ -273,66 +314,111 @@ function parseSourceFile(ts: any, filePath: string, content: string) {
     return line + 1;
   }
 
+  function pushSymbol(name: string, kind: string, node: any, signature: string): void {
+    symbols.push({
+      name,
+      kind,
+      startLine: getLineOfPos(node.getStart(sourceFile)),
+      endLine: getLineOfPos(node.getEnd()),
+      docstring: getDocstring(node),
+      signature,
+    });
+  }
+
   function visit(node: any) {
     if (ts.isImportDeclaration(node)) {
       const moduleName = node.moduleSpecifier.getText(sourceFile).replace(/['"]/g, "");
       if (node.importClause) {
         if (node.importClause.name) {
-          imports.push({ moduleName, symbolName: node.importClause.name.text });
+          // default import: `import Foo from "./m"` — local and imported both "default"-ish
+          const local = node.importClause.name.text;
+          imports.push({ moduleName, localName: local, importedName: "default" });
         }
         if (node.importClause.namedBindings) {
           if (ts.isNamedImports(node.importClause.namedBindings)) {
             for (const element of node.importClause.namedBindings.elements) {
-              imports.push({ moduleName, symbolName: element.name.text });
+              const localName = element.name.text;
+              // `import { helper as h }` → local h, imported helper
+              const importedName = element.propertyName?.text ?? localName;
+              imports.push({ moduleName, localName, importedName });
             }
           } else if (ts.isNamespaceImport(node.importClause.namedBindings)) {
-            imports.push({ moduleName, symbolName: node.importClause.namedBindings.name.text });
+            const local = node.importClause.namedBindings.name.text;
+            imports.push({ moduleName, localName: local, importedName: "*" });
           }
         }
       }
     }
 
-    let isDecl = false;
-    let name = "";
-    let kind = "";
-    let signature = "";
     const savedFunction = currentFunction;
+    const savedClass = currentClass;
 
     if (ts.isClassDeclaration(node) && node.name) {
-      name = node.name.text;
-      kind = "Class";
-      isDecl = true;
-      signature = `class ${name}`;
-    } else if (ts.isFunctionDeclaration(node) && node.name) {
-      name = node.name.text;
-      kind = "Function";
-      isDecl = true;
-      currentFunction = name;
-      signature = node.getText(sourceFile).split("{")[0].trim();
-    } else if (ts.isMethodDeclaration(node) && node.name) {
-      name = node.name.getText(sourceFile);
-      kind = "Method";
-      isDecl = true;
-      currentFunction = name;
-      signature = node.getText(sourceFile).split("{")[0].trim();
-    } else if (ts.isInterfaceDeclaration(node) && node.name) {
-      name = node.name.text;
-      kind = "Interface";
-      isDecl = true;
-      signature = `interface ${name}`;
+      const name = node.name.text;
+      pushSymbol(name, "Class", node, `class ${name}`);
+      currentClass = name;
+      ts.forEachChild(node, visit);
+      currentClass = savedClass;
+      currentFunction = savedFunction;
+      return;
     }
 
-    if (isDecl && name) {
-      const startLine = getLineOfPos(node.getStart(sourceFile));
-      const endLine = getLineOfPos(node.getEnd());
-      symbols.push({
-        name,
-        kind,
-        startLine,
-        endLine,
-        docstring: getDocstring(node),
-        signature,
-      });
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      const name = node.name.text;
+      pushSymbol(name, "Function", node, node.getText(sourceFile).split("{")[0].trim());
+      currentFunction = name;
+      ts.forEachChild(node, visit);
+      currentFunction = savedFunction;
+      return;
+    }
+
+    if (ts.isMethodDeclaration(node) && node.name) {
+      const methodName = node.name.getText(sourceFile);
+      // Qualify methods so ClassA.render and ClassB.render don't collide.
+      const name = currentClass ? `${currentClass}.${methodName}` : methodName;
+      pushSymbol(name, "Method", node, node.getText(sourceFile).split("{")[0].trim());
+      currentFunction = name;
+      ts.forEachChild(node, visit);
+      currentFunction = savedFunction;
+      return;
+    }
+
+    if (ts.isConstructorDeclaration(node)) {
+      const name = currentClass ? `${currentClass}.constructor` : "constructor";
+      pushSymbol(name, "Constructor", node, node.getText(sourceFile).split("{")[0].trim());
+      currentFunction = name;
+      ts.forEachChild(node, visit);
+      currentFunction = savedFunction;
+      return;
+    }
+
+    if (ts.isInterfaceDeclaration(node) && node.name) {
+      pushSymbol(node.name.text, "Interface", node, `interface ${node.name.text}`);
+    }
+
+    // const foo = () => {} / const foo = function() {} / let foo = async () => {}
+    if (ts.isVariableStatement(node)) {
+      for (const decl of node.declarationList.declarations) {
+        if (!ts.isIdentifier(decl.name) || !decl.initializer) continue;
+        const init = decl.initializer;
+        const isFn = ts.isArrowFunction(init) || ts.isFunctionExpression(init);
+        if (isFn) {
+          const name = decl.name.text;
+          pushSymbol(
+            name,
+            "Function",
+            decl,
+            `${node.getText(sourceFile).split("{")[0].split("=")[0].trim()} = …`,
+          );
+          const prev = currentFunction;
+          currentFunction = name;
+          ts.forEachChild(init, visit);
+          currentFunction = prev;
+        } else {
+          ts.forEachChild(init, visit);
+        }
+      }
+      return;
     }
 
     if (ts.isCallExpression(node)) {
@@ -345,7 +431,7 @@ function parseSourceFile(ts: any, filePath: string, content: string) {
       }
       if (calleeName) {
         calls.push({
-          callerName: currentFunction || "(global)",
+          callerName: currentFunction || GLOBAL_CALLER,
           calleeName,
           line: getLineOfPos(node.getStart(sourceFile)),
         });
@@ -354,9 +440,23 @@ function parseSourceFile(ts: any, filePath: string, content: string) {
 
     ts.forEachChild(node, visit);
     currentFunction = savedFunction;
+    currentClass = savedClass;
   }
 
   visit(sourceFile);
+
+  // Always include a synthetic (global) symbol so top-level call edges satisfy FK.
+  if (!symbols.some((s) => s.name === GLOBAL_CALLER)) {
+    symbols.push({
+      name: GLOBAL_CALLER,
+      kind: "Global",
+      startLine: 1,
+      endLine: 1,
+      docstring: "",
+      signature: "(global)",
+    });
+  }
+
   return { symbols, calls, imports };
 }
 
@@ -429,6 +529,7 @@ async function indexWorkspace(
   walkDir(absRoot, (p) => filePaths.push(p));
 
   const selectFile = db.prepare("SELECT hash FROM files WHERE path = ?");
+  const selectSymbolsByFile = db.prepare("SELECT id, name FROM symbols WHERE file_path = ?");
   const deleteFile = db.prepare("DELETE FROM files WHERE path = ?");
   const deleteSymbols = db.prepare("DELETE FROM symbols WHERE file_path = ?");
   const deleteCalls = db.prepare("DELETE FROM calls WHERE file_path = ?");
@@ -447,22 +548,31 @@ async function indexWorkspace(
     "INSERT INTO imports (file_path, module_name, symbol_name) VALUES (?, ?, ?)",
   );
 
-  // Pass 1: parse every file up front so cross-file import resolution has the full
-  // symbol table. A callee imported from another module must resolve to THAT module's
-  // symbol id (otherwise callee_id is useless for disambiguating same-named functions).
+  // Pass 1: hash first so unchanged workspaces can early-return without AST parse.
   interface ParsedFile {
     relPath: string;
     hash: string;
     size: number;
-    symbols: { name: string; kind: string; startLine: number; endLine: number; docstring?: string; signature?: string }[];
+    content?: string;
+    unchanged: boolean;
+    symbols: {
+      name: string;
+      kind: string;
+      startLine: number;
+      endLine: number;
+      docstring?: string;
+      signature?: string;
+    }[];
     calls: { callerName: string; calleeName: string; line: number }[];
-    imports: { moduleName: string; symbolName: string }[];
+    imports: { moduleName: string; localName: string; importedName: string }[];
   }
   const parsedAll: ParsedFile[] = [];
-  const fileSymIds = new Map<string, Map<string, string>>(); // relPath -> (symbol name -> id)
+  // relPath -> (symbol name -> preferred id). Overloads keep the first declaration.
+  const fileSymIds = new Map<string, Map<string, string>>();
 
+  let anyChanged = force;
   for (const p of filePaths) {
-    const relPath = path.relative(absRoot, p);
+    const relPath = toPosixRel(path.relative(absRoot, p));
     let content = "";
     try {
       content = fs.readFileSync(p, "utf-8");
@@ -476,25 +586,78 @@ async function indexWorkspace(
       continue;
     }
     const hash = getFileHash(content);
-    let symbols: ParsedFile["symbols"] = [];
-    let calls: ParsedFile["calls"] = [];
-    let imports: ParsedFile["imports"] = [];
-    try {
-      const parsed = parseSourceFile(ts, relPath, content);
-      symbols = parsed.symbols;
-      calls = parsed.calls;
-      imports = parsed.imports;
-    } catch {
-      skippedFiles++;
+    const existing = selectFile.get(relPath) as { hash: string } | undefined;
+    const unchanged = !force && !!existing && existing.hash === hash;
+    if (!unchanged) anyChanged = true;
+    parsedAll.push({
+      relPath,
+      hash,
+      size,
+      content,
+      unchanged,
+      symbols: [],
+      calls: [],
+      imports: [],
+    });
+  }
+
+  // Fast path: nothing on disk changed vs the ledger — skip AST work entirely.
+  if (!anyChanged && parsedAll.length > 0) {
+    const totalSymbols = (
+      db.prepare("SELECT count(*) as count FROM symbols").get() as { count: number }
+    ).count;
+    const totalCalls = (
+      db.prepare("SELECT count(*) as count FROM calls").get() as { count: number }
+    ).count;
+    return {
+      totalFiles: parsedAll.length,
+      updatedFiles: 0,
+      skippedFiles: parsedAll.length,
+      totalSymbols,
+      totalCalls,
+    };
+  }
+
+  // Pass 2: parse changed files; load symbol maps for unchanged from DB (for import resolution).
+  for (const pf of parsedAll) {
+    if (pf.unchanged) {
+      const rows = selectSymbolsByFile.all(pf.relPath) as { id: string; name: string }[];
+      const symMap = new Map<string, string>();
+      for (const row of rows) {
+        if (!symMap.has(row.name)) symMap.set(row.name, row.id);
+      }
+      fileSymIds.set(pf.relPath, symMap);
+      // Still need AST for edge refresh when *other* files changed.
+      try {
+        const parsed = parseSourceFile(ts, pf.relPath, pf.content || "");
+        pf.symbols = parsed.symbols;
+        pf.calls = parsed.calls;
+        pf.imports = parsed.imports;
+      } catch {
+        // keep empty; edge write will no-op
+      }
+      delete pf.content;
       continue;
     }
-    const symMap = new Map<string, string>();
-    for (const sym of symbols) {
-      const symId = `${relPath}:${sym.name}:${sym.kind}:${sym.startLine}`;
-      symMap.set(sym.name, symId);
+
+    try {
+      const parsed = parseSourceFile(ts, pf.relPath, pf.content || "");
+      pf.symbols = parsed.symbols;
+      pf.calls = parsed.calls;
+      pf.imports = parsed.imports;
+    } catch {
+      skippedFiles++;
+      delete pf.content;
+      continue;
     }
-    fileSymIds.set(relPath, symMap);
-    parsedAll.push({ relPath, hash, size, symbols, calls, imports });
+    delete pf.content;
+
+    const symMap = new Map<string, string>();
+    for (const sym of pf.symbols) {
+      const symId = `${pf.relPath}:${sym.name}:${sym.kind}:${sym.startLine}`;
+      if (!symMap.has(sym.name)) symMap.set(sym.name, symId);
+    }
+    fileSymIds.set(pf.relPath, symMap);
   }
 
   // Resolve a relative module specifier ("./fileB", "../x/y") to a known relPath.
@@ -502,9 +665,61 @@ async function indexWorkspace(
     if (!moduleName.startsWith(".")) return null;
     const dir = path.posix.dirname(importerRel);
     const base = path.posix.normalize(path.posix.join(dir, moduleName));
-    const candidates = [base, `${base}.ts`, `${base}.tsx`, `${base}.js`, `${base}.jsx`, `${base}/index.ts`];
+    const candidates = [
+      base,
+      `${base}.ts`,
+      `${base}.tsx`,
+      `${base}.js`,
+      `${base}.jsx`,
+      `${base}/index.ts`,
+      `${base}/index.tsx`,
+      `${base}/index.js`,
+    ];
     for (const c of candidates) if (fileSymIds.has(c)) return c;
     return null;
+  }
+
+  // Write call/import edges using the current symbol-id map so cross-file
+  // references stay valid even when only the callee file changed.
+  function writeEdges(pf: (typeof parsedAll)[number]): void {
+    deleteCalls.run(pf.relPath);
+    deleteImports.run(pf.relPath);
+
+    // local binding -> remote symbol id (resolve by *imported* export name)
+    const importSym = new Map<string, string>();
+    for (const imp of pf.imports) {
+      const targetRel = resolveModule(pf.relPath, imp.moduleName);
+      if (!targetRel) continue;
+      const tid =
+        fileSymIds.get(targetRel)?.get(imp.importedName) ??
+        // default import often maps to a class/function with the local name in CJS/TS interop
+        (imp.importedName === "default"
+          ? fileSymIds.get(targetRel)?.get(imp.localName)
+          : undefined);
+      if (tid) importSym.set(imp.localName, tid);
+    }
+
+    const localSym = fileSymIds.get(pf.relPath);
+    const globalId = localSym?.get(GLOBAL_CALLER) ?? `${pf.relPath}:${GLOBAL_CALLER}:Global:1`;
+
+    // Ensure synthetic (global) symbol exists so top-level call edges satisfy FK
+    // even when we only refresh edges for an unchanged file on an older DB.
+    insertSymbol.run(globalId, pf.relPath, GLOBAL_CALLER, "Global", 1, 1, null, "(global)");
+    localSym?.set(GLOBAL_CALLER, globalId);
+
+    for (const call of pf.calls) {
+      // Prefer the real symbol id; fall back to (global) so FK never fails.
+      const callerId = localSym?.get(call.callerName) ?? globalId;
+      // Prefer the imported symbol's id (cross-file, via local alias), then same-file,
+      // else null (queries fall back to callee_name).
+      const calleeId = importSym.get(call.calleeName) ?? localSym?.get(call.calleeName) ?? null;
+      insertCall.run(callerId, call.calleeName, calleeId, pf.relPath, call.line);
+    }
+
+    for (const imp of pf.imports) {
+      // Store local binding for display; resolution used importedName above.
+      insertImport.run(pf.relPath, imp.moduleName, imp.localName);
+    }
   }
 
   db.exec("BEGIN");
@@ -513,12 +728,27 @@ async function indexWorkspace(
       totalFiles++;
       const existing = selectFile.get(pf.relPath);
       if (!force && existing && existing.hash === pf.hash) {
+        // File content unchanged — keep symbols, but re-resolve call edges so
+        // they pick up symbol-id changes in imported modules.
+        try {
+          db.exec("SAVEPOINT file_edges");
+          writeEdges(pf);
+          db.exec("RELEASE file_edges");
+        } catch {
+          try {
+            db.exec("ROLLBACK TO file_edges");
+            db.exec("RELEASE file_edges");
+          } catch {
+            // ignore nested rollback failure
+          }
+        }
         skippedFiles++;
         continue;
       }
 
       try {
         updatedFiles++;
+        db.exec("SAVEPOINT file_upsert");
 
         // Transactional clear
         deleteFile.run(pf.relPath);
@@ -542,30 +772,16 @@ async function indexWorkspace(
           );
         }
 
-        // Map imported names -> the imported module's concrete symbol id.
-        const importSym = new Map<string, string>();
-        for (const imp of pf.imports) {
-          const targetRel = resolveModule(pf.relPath, imp.moduleName);
-          if (targetRel) {
-            const tid = fileSymIds.get(targetRel)?.get(imp.symbolName);
-            if (tid) importSym.set(imp.symbolName, tid);
-          }
-        }
-
-        const localSym = fileSymIds.get(pf.relPath);
-        for (const call of pf.calls) {
-          const callerId = localSym?.get(call.callerName) || `${pf.relPath}:${call.callerName}:(global)`;
-          // Prefer the imported symbol's id (cross-file), then a same-file symbol,
-          // else null (queries fall back to callee_name).
-          const calleeId = importSym.get(call.calleeName) ?? localSym?.get(call.calleeName) ?? null;
-          insertCall.run(callerId, call.calleeName, calleeId, pf.relPath, call.line);
-        }
-
-        for (const imp of pf.imports) {
-          insertImport.run(pf.relPath, imp.moduleName, imp.symbolName);
-        }
+        writeEdges(pf);
+        db.exec("RELEASE file_upsert");
       } catch {
-        // A single unparseable file must not crash the entire index
+        // Roll back this file only; keep the outer transaction.
+        try {
+          db.exec("ROLLBACK TO file_upsert");
+          db.exec("RELEASE file_upsert");
+        } catch {
+          // ignore
+        }
         skippedFiles++;
       }
     }
@@ -600,18 +816,29 @@ async function indexWorkspace(
   return { totalFiles, updatedFiles, skippedFiles, totalSymbols, totalCalls };
 }
 
+// Throttle automatic reindex so rapid sequential queries don't re-walk the tree.
+const ENSURE_INDEX_MIN_MS = 2_000;
+const lastEnsureIndexAt = new Map<string, number>();
+
 /**
- * Ensure the workspace has been indexed. If the DB is empty (no files),
- * run a full index automatically so query tools work on first call
- * without the agent needing to explicitly call CodebaseIndex first.
+ * Ensure the workspace index is warm. Runs a cheap incremental reindex
+ * (hash-based skip of unchanged files), throttled so bursty tool calls
+ * within ENSURE_INDEX_MIN_MS share one walk.
  */
 async function ensureIndexed(workspace: string): Promise<DatabaseSync> {
-  const db = await getDb(workspace);
-  const fileCount = db.prepare("SELECT count(*) as count FROM files").get().count;
-  if (fileCount === 0) {
-    const ts = await getTs();
-    await indexWorkspace(db, ts, path.resolve(workspace), false);
+  const abs = path.resolve(workspace);
+  const db = await getDb(abs);
+  const now = Date.now();
+  const last = lastEnsureIndexAt.get(abs) ?? 0;
+  if (now - last < ENSURE_INDEX_MIN_MS) {
+    // Still reindex if the DB is empty (first query after wipe).
+    const fileCount = (db.prepare("SELECT count(*) as count FROM files").get() as { count: number })
+      .count;
+    if (fileCount > 0) return db;
   }
+  const ts = await getTs();
+  await indexWorkspace(db, ts, abs, false);
+  lastEnsureIndexAt.set(abs, Date.now());
   return db;
 }
 
@@ -784,9 +1011,9 @@ export default function codebaseExtension(pi: ExtensionAPI) {
       const db = await ensureIndexed(workspace);
       const name = params.symbolName as string;
 
-      const ids = (db.prepare("SELECT id FROM symbols WHERE name = ?").all(name) as { id: string }[]).map(
-        (r) => r.id,
-      );
+      const ids = (
+        db.prepare("SELECT id FROM symbols WHERE name = ?").all(name) as { id: string }[]
+      ).map((r) => r.id);
       const inSql = ids.length ? `c.callee_id IN (${ids.map(() => "?").join(",")}) OR ` : "";
       const stmt = db.prepare(`
         SELECT c.callee_name, c.file_path, c.line, s.name as caller_name, s.kind as caller_kind
@@ -833,10 +1060,16 @@ export default function codebaseExtension(pi: ExtensionAPI) {
       const direction = params.direction as "inbound" | "outbound";
       const depth = (params.depth as number | undefined) ?? 3;
 
-      const visited = new Set<string>();
       const lines: string[] = [`Call Graph for "${startSym}" (${direction}, max depth ${depth}):`];
 
-      function traceInbound(calleeId: string, calleeName: string, currentDepth: number, indent: string) {
+      // Per-root visited set so multi-definition starts and diamond graphs keep alternate branches.
+      function traceInbound(
+        calleeId: string,
+        calleeName: string,
+        currentDepth: number,
+        indent: string,
+        visited: Set<string>,
+      ) {
         if (currentDepth > depth || visited.has(calleeId)) return;
         visited.add(calleeId);
 
@@ -850,11 +1083,17 @@ export default function codebaseExtension(pi: ExtensionAPI) {
 
         for (const c of callers) {
           lines.push(`${indent}↖ ${c.caller} [${c.kind}] (${c.file_path}:${c.line})`);
-          traceInbound(c.caller_id, c.caller, currentDepth + 1, `${indent}  `);
+          traceInbound(c.caller_id, c.caller, currentDepth + 1, `${indent}  `, visited);
         }
       }
 
-      function traceOutbound(callerId: string, callerName: string, currentDepth: number, indent: string) {
+      function traceOutbound(
+        callerId: string,
+        callerName: string,
+        currentDepth: number,
+        indent: string,
+        visited: Set<string>,
+      ) {
         if (currentDepth > depth || visited.has(callerId)) return;
         visited.add(callerId);
 
@@ -866,7 +1105,21 @@ export default function codebaseExtension(pi: ExtensionAPI) {
         const callees = callStmt.all(callerId) as any[];
         for (const c of callees) {
           lines.push(`${indent}↘ ${c.callee_name} (${c.file_path}:${c.line})`);
-          traceOutbound(c.callee_id ?? c.callee_name, c.callee_name, currentDepth + 1, `${indent}  `);
+          if (c.callee_id) {
+            traceOutbound(c.callee_id, c.callee_name, currentDepth + 1, `${indent}  `, visited);
+          } else {
+            // Name-only edge: expand to all symbols with that name for multi-hop.
+            const nexts = db
+              .prepare("SELECT id, name FROM symbols WHERE name = ?")
+              .all(c.callee_name) as { id: string; name: string }[];
+            if (nexts.length === 0) {
+              traceOutbound(c.callee_name, c.callee_name, currentDepth + 1, `${indent}  `, visited);
+            } else {
+              for (const n of nexts) {
+                traceOutbound(n.id, n.name, currentDepth + 1, `${indent}  `, new Set(visited));
+              }
+            }
+          }
         }
       }
 
@@ -876,12 +1129,12 @@ export default function codebaseExtension(pi: ExtensionAPI) {
       }[];
       if (startSyms.length === 0) {
         // Symbol not indexed: fall back to a name-only match so the trace still runs.
-        if (direction === "inbound") traceInbound(startSym, startSym, 1, "  ");
-        else traceOutbound(startSym, startSym, 1, "  ");
+        if (direction === "inbound") traceInbound(startSym, startSym, 1, "  ", new Set());
+        else traceOutbound(startSym, startSym, 1, "  ", new Set());
       } else if (direction === "inbound") {
-        for (const s of startSyms) traceInbound(s.id, s.name, 1, "  ");
+        for (const s of startSyms) traceInbound(s.id, s.name, 1, "  ", new Set());
       } else {
-        for (const s of startSyms) traceOutbound(s.id, s.name, 1, "  ");
+        for (const s of startSyms) traceOutbound(s.id, s.name, 1, "  ", new Set());
       }
 
       if (lines.length === 1) {
@@ -947,7 +1200,9 @@ export default function codebaseExtension(pi: ExtensionAPI) {
         const name = sym.name;
         const newPath = [name, ...currentPath];
 
-        if (sourceFilter && name.toLowerCase().includes(sourceFilter.toLowerCase())) {
+        // Exact match (case-insensitive). Substring matching caused false positives
+        // like sourceFilter "run" matching "otherRun".
+        if (sourceFilter && name.toLowerCase() === sourceFilter.toLowerCase()) {
           paths.push(newPath);
           return;
         }
@@ -1007,14 +1262,28 @@ export default function codebaseExtension(pi: ExtensionAPI) {
       const workspace = (params.workspace as string) || process.cwd();
       const db = await ensureIndexed(workspace);
 
-      // Top Hotspot Functions (Highest Inbound Call Count)
+      // Top Hotspot Functions (Highest Inbound Call Count).
+      // Aggregate on callee first, then join a single representative symbol — joining
+      // symbols by bare name before GROUP BY multiplies counts for common names.
       const hotspotStmt = db.prepare(`
-        SELECT c.callee_name, count(*) as call_count, s.file_path, s.kind
-        FROM calls c
-        LEFT JOIN symbols s ON s.name = c.callee_name
-        GROUP BY c.callee_name
-        ORDER BY call_count DESC
-        LIMIT 10
+        SELECT
+          stats.callee_name,
+          stats.call_count,
+          s.file_path,
+          s.kind
+        FROM (
+          SELECT
+            COALESCE(callee_id, callee_name) as key,
+            callee_name,
+            count(*) as call_count
+          FROM calls
+          GROUP BY COALESCE(callee_id, callee_name)
+          ORDER BY call_count DESC
+          LIMIT 10
+        ) stats
+        LEFT JOIN symbols s ON s.id = stats.key OR (s.name = stats.callee_name AND stats.key = stats.callee_name)
+        GROUP BY stats.key
+        ORDER BY stats.call_count DESC
       `);
       const hotspots = hotspotStmt.all() as any[];
 
