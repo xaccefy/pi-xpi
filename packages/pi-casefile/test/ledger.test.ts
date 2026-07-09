@@ -14,6 +14,7 @@ import {
   setCasefilePath,
   unlinkCasesResult,
   updateCaseResult,
+  writeCaseReport,
 } from "../src/ledger.ts";
 
 const addCase = (input: Parameters<typeof addCaseResult>[0]) => {
@@ -124,6 +125,74 @@ describe("casefile sqlite ledger", () => {
     const unlinked = unlinkCasesResult(caseA.id, caseB.id);
     assert.strictEqual(unlinked.changed, true);
     assert.ok(!unlinked.source.linkedCaseIds.includes(caseB.id));
+  });
+
+  it("preserves exploit-chain links across CaseUpdate (no REPLACE cascade)", () => {
+    const a = addCase({ title: "Link source" });
+    const b = addCase({ title: "Link target" });
+    linkCasesResult(a.id, b.id);
+
+    const updated = updateCaseResult(a.id, { summary: "material field change" });
+    assert.strictEqual(updated.changed, true);
+    assert.ok(
+      updated.record.linkedCaseIds.includes(b.id),
+      "update must not wipe case_links via INSERT OR REPLACE cascade",
+    );
+
+    const reloaded = readCasefile().find((c) => c.id === a.id);
+    assert.ok(reloaded?.linkedCaseIds.includes(b.id));
+  });
+
+  it("promotes hypothesis → investigating using evidence already on the case", () => {
+    const record = addCase({
+      title: "IDOR with prior evidence",
+      status: "hypothesis",
+      evidence: "source→sink already recorded",
+      confidence: "medium",
+    });
+
+    // Status-only update must succeed when fields already exist on the record.
+    const updated = updateCaseResult(record.id, { status: "investigating" });
+    assert.strictEqual(updated.changed, true);
+    assert.strictEqual(updated.record.status, "investigating");
+  });
+
+  it("rejects field mutations on killed and reported cases", () => {
+    const killed = addCase({
+      title: "Dead lead",
+      evidence: "not a vuln",
+    });
+    updateCaseResult(killed.id, {
+      status: "killed",
+      assumptions: ["matches documented behavior"],
+    });
+    assert.throws(
+      () => updateCaseResult(killed.id, { summary: "should not stick" }),
+      /Cannot mutate a killed case/,
+    );
+
+    const live = addCase({
+      title: "Confirmed then reported",
+      status: "investigating",
+      evidence: "repro steps",
+      confidence: "high",
+      impact: "data leak",
+      severity: "high",
+      poc: "/tmp/poc.sh",
+    });
+    promoteFindingResult(live.id, {
+      path: "/tmp/poc.sh",
+      exitCode: 0,
+      ranAt: "2024-01-01T00:00:00Z",
+      sandbox: true,
+    });
+    // CaseReport writes reportPath before status can advance to reported.
+    writeCaseReport(live.id);
+    updateCaseResult(live.id, { status: "reported" });
+    assert.throws(
+      () => updateCaseResult(live.id, { summary: "should not stick" }),
+      /Cannot mutate a reported case/,
+    );
   });
 
   it("searchCases pushes filters into SQL (tag, severity, minSeverity, since, field, pagination)", () => {

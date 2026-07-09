@@ -13,10 +13,22 @@ Use Casefile to maintain durable security investigation state across agent turns
 1. Check existing cases before opening a new one with CaseList or CaseSearch.
 2. Open new leads with CaseAdd as `hypothesis` or `investigating`.
 3. Promote cases with CaseUpdate only after materially new evidence, proof, impact, blockers, remediation, or status changes.
-4. Mark `confirmed` only when evidence and a PoC or repro are recorded.
+4. Mark `confirmed` only via PromoteFinding after a real PoC exit 0 (evidence, impact, severity, poc required).
 5. Use CaseLink and CaseUnlink for exploit chains. Do not edit linked case IDs directly.
-6. Use CaseReport only for confirmed or already reported cases.
+6. Use CaseReport only for confirmed or already reported cases, then CaseUpdate status=`reported`.
 7. Use `killed` for disproven, duplicate, or dead-end leads, and include evidence, blockers, next step, or assumptions explaining why.
+
+## State machine
+
+```
+hypothesis → investigating → confirmed → reported
+                 ↓               ↓
+              blocked         killed (terminal)
+```
+
+- investigating requires evidence + confidence
+- confirmed requires PromoteFinding (not CaseUpdate)
+- killed/reported are terminal (no field edits or re-links)
 
 ## Tool Map
 

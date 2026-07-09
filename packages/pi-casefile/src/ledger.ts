@@ -419,14 +419,21 @@ function validateTransition(
   if (to === "blocked") return;
 
   type Rule = (u: CaseUpdate, current?: CaseRecord) => string | null;
+
+  // Transition rules must consult both the update payload AND the current record.
+  // Agents often promote status alone after evidence was already written in a prior update.
+  const requireInvestigatingFields: Rule = (u, cur) => {
+    // Normalize so whitespace-only evidence cannot satisfy the gate.
+    const evidence = normalizeText(u.evidence ?? cur?.evidence);
+    const confidence = u.confidence ?? cur?.confidence;
+    if (!evidence) return "INVESTIGATING requires evidence (source→sink trace)";
+    if (!confidence) return "INVESTIGATING requires confidence level";
+    return null;
+  };
+
   const transitions: Partial<Record<CaseStatus, Partial<Record<CaseStatus, Rule>>>> = {
     hypothesis: {
-      investigating: (u) =>
-        !u.evidence
-          ? "INVESTIGATING requires evidence (source→sink trace)"
-          : !u.confidence
-            ? "INVESTIGATING requires confidence level"
-            : null,
+      investigating: requireInvestigatingFields,
       confirmed: () => "Cannot jump hypothesis → confirmed; promote to investigating first",
       reported: () => "Cannot jump hypothesis → reported; confirm first",
     },
@@ -443,12 +450,7 @@ function validateTransition(
       investigating: () => null,
     },
     blocked: {
-      investigating: (u) =>
-        !u.evidence
-          ? "INVESTIGATING requires evidence (source→sink trace)"
-          : !u.confidence
-            ? "INVESTIGATING requires confidence level"
-            : null,
+      investigating: requireInvestigatingFields,
       hypothesis: () => null,
     },
   };
@@ -514,7 +516,11 @@ function buildRecord(input: NormalizedCaseInput, existing?: CaseRecord): CaseRec
   };
 }
 
-function findDuplicateCaseInDb(db: DatabaseSync, candidate: CaseRecord): CaseRecord | undefined {
+function findDuplicateCaseInDb(
+  db: DatabaseSync,
+  candidate: Pick<CaseRecord, "title" | "target" | "endpoint" | "bugClass">,
+  excludeId?: string,
+): CaseRecord | undefined {
   const title = normalizeMatchText(candidate.title);
   if (!title) return undefined;
 
@@ -522,9 +528,12 @@ function findDuplicateCaseInDb(db: DatabaseSync, candidate: CaseRecord): CaseRec
   const endpoint = normalizeMatchText(candidate.endpoint);
   const bugClass = normalizeMatchText(candidate.bugClass);
 
-  // We query all cases where status is not killed, then match in JS for normalized forms
-  const stmt = db.prepare("SELECT * FROM cases WHERE status != 'killed'");
-  const rows = stmt.all();
+  // Query non-killed cases, then match normalized title/scope in JS.
+  const rows = excludeId
+    ? (db
+        .prepare("SELECT * FROM cases WHERE status != 'killed' AND id != ?")
+        .all(excludeId) as any[])
+    : (db.prepare("SELECT * FROM cases WHERE status != 'killed'").all() as any[]);
 
   for (const row of rows) {
     if (
@@ -533,9 +542,9 @@ function findDuplicateCaseInDb(db: DatabaseSync, candidate: CaseRecord): CaseRec
       normalizeMatchText(row.endpoint as string) === endpoint &&
       normalizeMatchText(row.bugClass as string) === bugClass
     ) {
-      // Find links
-      const linkStmt = db.prepare("SELECT target_id FROM case_links WHERE source_id = ?");
-      const links = linkStmt.all(row.id) as { target_id: string }[];
+      const links = db
+        .prepare("SELECT target_id FROM case_links WHERE source_id = ?")
+        .all(row.id) as { target_id: string }[];
       return mapRow(
         row,
         links.map((l) => l.target_id),
@@ -547,9 +556,11 @@ function findDuplicateCaseInDb(db: DatabaseSync, candidate: CaseRecord): CaseRec
 
 // ── SQLite Mutation Actions ───────────────────────────────────────────
 
-function insertOrReplaceCase(db: DatabaseSync, record: CaseRecord) {
+function upsertCase(db: DatabaseSync, record: CaseRecord) {
+  // Use ON CONFLICT DO UPDATE (not INSERT OR REPLACE) so FK CASCADE does not
+  // wipe case_links when updating an existing primary key.
   const stmt = db.prepare(`
-    INSERT OR REPLACE INTO cases (
+    INSERT INTO cases (
       id, title, status, confidence, severity, priority, target, endpoint, bugClass,
       summary, evidence, impact, nextStep, poc, remediation,
       references_json, blockers_json, tags_json, assumptions_json, poc_verified_json,
@@ -560,6 +571,30 @@ function insertOrReplaceCase(db: DatabaseSync, record: CaseRecord) {
       ?, ?, ?, ?, ?,
       ?, ?, ?, ?
     )
+    ON CONFLICT(id) DO UPDATE SET
+      title = excluded.title,
+      status = excluded.status,
+      confidence = excluded.confidence,
+      severity = excluded.severity,
+      priority = excluded.priority,
+      target = excluded.target,
+      endpoint = excluded.endpoint,
+      bugClass = excluded.bugClass,
+      summary = excluded.summary,
+      evidence = excluded.evidence,
+      impact = excluded.impact,
+      nextStep = excluded.nextStep,
+      poc = excluded.poc,
+      remediation = excluded.remediation,
+      references_json = excluded.references_json,
+      blockers_json = excluded.blockers_json,
+      tags_json = excluded.tags_json,
+      assumptions_json = excluded.assumptions_json,
+      poc_verified_json = excluded.poc_verified_json,
+      reported_at = excluded.reported_at,
+      report_path = excluded.report_path,
+      created_at = excluded.created_at,
+      updated_at = excluded.updated_at
   `);
 
   stmt.run(
@@ -606,7 +641,7 @@ export function addCaseResult(input: CaseInput): CaseAddResult {
     };
   }
 
-  insertOrReplaceCase(db, record);
+  upsertCase(db, record);
   return { record, created: true };
 }
 
@@ -615,6 +650,16 @@ export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResu
   const current = getCaseById(id);
   if (!current) {
     throw new Error(`Case not found: ${id}`);
+  }
+
+  // Terminal states: block all mutations (status and field edits). The transition
+  // gate only runs on status changes, so without this reported/killed cases could
+  // still be rewritten via field-only updates.
+  if (current.status === "killed") {
+    throw new Error("Cannot mutate a killed case; open a new case if the lead is revived");
+  }
+  if (current.status === "reported") {
+    throw new Error("Cannot mutate a reported case; file a follow-up case instead");
   }
 
   const optionalFields = [
@@ -636,7 +681,7 @@ export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResu
     }
   }
 
-  const next = buildRecord(
+  let next = buildRecord(
     {
       ...optionalPatch,
       status: update.status ?? current.status,
@@ -654,6 +699,12 @@ export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResu
   if (update.status && update.status !== current.status) {
     validateTransition(current.status, next.status, update, current);
   }
+
+  // Demoting off confirmed invalidates prior PoC verification — re-promote required.
+  if (current.status === "confirmed" && next.status === "investigating") {
+    next = { ...next, pocVerified: undefined };
+  }
+
   validateCase(next);
 
   // Check material equality (we ignore links since links are mutated via CaseLink)
@@ -667,32 +718,7 @@ export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResu
     return { record: current, changed: false, reason };
   }
 
-  // Duplicate checks excluding current
-  const title = normalizeMatchText(next.title);
-  const target = normalizeMatchText(next.target);
-  const endpoint = normalizeMatchText(next.endpoint);
-  const bugClass = normalizeMatchText(next.bugClass);
-
-  const stmt = db.prepare("SELECT * FROM cases WHERE status != 'killed' AND id != ?");
-  const rows = stmt.all(id);
-  let duplicate: CaseRecord | undefined;
-  for (const row of rows) {
-    if (
-      normalizeMatchText(row.title as string) === title &&
-      normalizeMatchText(row.target as string) === target &&
-      normalizeMatchText(row.endpoint as string) === endpoint &&
-      normalizeMatchText(row.bugClass as string) === bugClass
-    ) {
-      const linkStmt = db.prepare("SELECT target_id FROM case_links WHERE source_id = ?");
-      const links = linkStmt.all(row.id) as { target_id: string }[];
-      duplicate = mapRow(
-        row,
-        links.map((l) => l.target_id),
-      );
-      break;
-    }
-  }
-
+  const duplicate = findDuplicateCaseInDb(db, next, id);
   if (duplicate) {
     return {
       record: current,
@@ -701,7 +727,7 @@ export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResu
     };
   }
 
-  insertOrReplaceCase(db, next);
+  upsertCase(db, next);
   return { record: next, changed: true };
 }
 
@@ -757,7 +783,7 @@ export function promoteFindingResult(id: string, verification: PocVerification):
   );
   validateCase(next);
 
-  insertOrReplaceCase(db, next);
+  upsertCase(db, next);
   return { record: next, changed: true };
 }
 
@@ -772,6 +798,12 @@ export function linkCasesResult(sourceId: string, targetId: string): CaseLinkRes
   const target = getCaseById(targetId);
   if (!source) throw new Error(`Case not found: ${sourceId}`);
   if (!target) throw new Error(`Case not found: ${targetId}`);
+  if (source.status === "killed" || source.status === "reported") {
+    throw new Error(`Cannot link terminal case ${sourceId} (${source.status})`);
+  }
+  if (target.status === "killed" || target.status === "reported") {
+    throw new Error(`Cannot link terminal case ${targetId} (${target.status})`);
+  }
 
   const checkStmt = db.prepare("SELECT 1 FROM case_links WHERE source_id = ? AND target_id = ?");
   const exists = checkStmt.get(sourceId, targetId);
@@ -781,14 +813,25 @@ export function linkCasesResult(sourceId: string, targetId: string): CaseLinkRes
   }
 
   // Atomic insert both directions into junction table
-  const linkStmt = db.prepare("INSERT INTO case_links (source_id, target_id) VALUES (?, ?)");
-  linkStmt.run(sourceId, targetId);
-  linkStmt.run(targetId, sourceId);
+  db.exec("BEGIN");
+  try {
+    const linkStmt = db.prepare("INSERT INTO case_links (source_id, target_id) VALUES (?, ?)");
+    linkStmt.run(sourceId, targetId);
+    linkStmt.run(targetId, sourceId);
 
-  const now = new Date().toISOString();
-  const updateTimeStmt = db.prepare("UPDATE cases SET updated_at = ? WHERE id = ?");
-  updateTimeStmt.run(now, sourceId);
-  updateTimeStmt.run(now, targetId);
+    const now = new Date().toISOString();
+    const updateTimeStmt = db.prepare("UPDATE cases SET updated_at = ? WHERE id = ?");
+    updateTimeStmt.run(now, sourceId);
+    updateTimeStmt.run(now, targetId);
+    db.exec("COMMIT");
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // ignore
+    }
+    throw err;
+  }
 
   const finalSource = getCaseById(sourceId)!;
   const finalTarget = getCaseById(targetId)!;
@@ -801,6 +844,12 @@ export function unlinkCasesResult(sourceId: string, targetId: string): CaseLinkR
   const target = getCaseById(targetId);
   if (!source) throw new Error(`Case not found: ${sourceId}`);
   if (!target) throw new Error(`Case not found: ${targetId}`);
+  if (source.status === "killed" || source.status === "reported") {
+    throw new Error(`Cannot unlink terminal case ${sourceId} (${source.status})`);
+  }
+  if (target.status === "killed" || target.status === "reported") {
+    throw new Error(`Cannot unlink terminal case ${targetId} (${target.status})`);
+  }
 
   const checkStmt = db.prepare("SELECT 1 FROM case_links WHERE source_id = ? AND target_id = ?");
   const exists = checkStmt.get(sourceId, targetId);
@@ -809,15 +858,26 @@ export function unlinkCasesResult(sourceId: string, targetId: string): CaseLinkR
     return { source, target, changed: false, reason: "Cases are not linked" };
   }
 
-  const unlinkStmt = db.prepare(
-    "DELETE FROM case_links WHERE (source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?)",
-  );
-  unlinkStmt.run(sourceId, targetId, targetId, sourceId);
+  db.exec("BEGIN");
+  try {
+    const unlinkStmt = db.prepare(
+      "DELETE FROM case_links WHERE (source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?)",
+    );
+    unlinkStmt.run(sourceId, targetId, targetId, sourceId);
 
-  const now = new Date().toISOString();
-  const updateTimeStmt = db.prepare("UPDATE cases SET updated_at = ? WHERE id = ?");
-  updateTimeStmt.run(now, sourceId);
-  updateTimeStmt.run(now, targetId);
+    const now = new Date().toISOString();
+    const updateTimeStmt = db.prepare("UPDATE cases SET updated_at = ? WHERE id = ?");
+    updateTimeStmt.run(now, sourceId);
+    updateTimeStmt.run(now, targetId);
+    db.exec("COMMIT");
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // ignore
+    }
+    throw err;
+  }
 
   const finalSource = getCaseById(sourceId)!;
   const finalTarget = getCaseById(targetId)!;
@@ -1039,6 +1099,11 @@ export function writeCaseReport(id: string): { path: string; record: CaseRecord 
     throw new Error("Case reports require a confirmed or reported case");
   }
 
+  // Reported cases are terminal artifacts — return the existing report path if present.
+  if (current.status === "reported" && current.reportPath && existsSync(current.reportPath)) {
+    return { path: current.reportPath, record: current };
+  }
+
   const db = getDb();
   const dbPath = getCasefilePath();
 
@@ -1094,6 +1159,6 @@ export function writeCaseReport(id: string): { path: string; record: CaseRecord 
     updatedAt: new Date().toISOString(),
   };
 
-  insertOrReplaceCase(db, next);
+  upsertCase(db, next);
   return { path: reportPath, record: next };
 }

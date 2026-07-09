@@ -3,7 +3,7 @@
  *
  * Tools: CaseAdd, CaseUpdate, PromoteFinding, CaseGet, CaseList, CaseSearch, CaseLink, CaseUnlink, CaseReport
  * Command: /casefile — interactive dashboard
- * Event: before_agent_start — injects case summary context into the system prompt
+ * Event: before_agent_start — injects cyber workflow (+ active case list) once per user prompt
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -324,11 +324,20 @@ class CasefileDashboard {
 }
 
 // ── Context injection ─────────────────────────────────────────────────
+// Injected once per user prompt via before_agent_start (not every tool turn).
+// Skills are opt-in; this keeps bounty discipline always present even with an empty ledger.
 
 const STATIC_CYBER_WORKFLOW = `
-# Cyber Workflow
+# Cyber Workflow (Attacker-Oriented)
 
-Every finding starts HYPOTHESIS. Nothing reaches CONFIRMED without a working PoC on disk. Optimize for correctness over novelty. Prefer rejecting a real bug temporarily rather than reporting a false positive. Every confirmed finding must survive skeptical review by another experienced security researcher.
+Think like a real external attacker, not a code reviewer. Technical bugs are cheap; **reachable attacker impact** is what matters for bounty-valid findings.
+
+Every lead starts HYPOTHESIS. Nothing reaches CONFIRMED without:
+1. a working PoC on disk,
+2. a proven attacker path (who can trigger it, from where),
+3. demonstrated C/I/A impact (not theoretical).
+
+Prefer killing a cute-but-unusable bug over reporting noise. Every confirmed finding must survive skeptical review by another experienced security researcher **and** a program triage engineer.
 
 ## State Machine (CaseAdd → CaseUpdate → CaseReport)
 
@@ -343,95 +352,146 @@ HYPOTHESIS ──→ INVESTIGATING ──→ CONFIRMED ──→ REPORTED
 
 | Advance To | Required Case Fields | Must Exist on Disk |
 |-----------|---------------------|--------------------|
-| INVESTIGATING | \`evidence\` (source→sink trace), \`confidence\` | Path trace in notes |
-| **CONFIRMED** | \`evidence\`, **\`poc\`**, \`impact\`, \`severity\`, **\`impact_proof\`** | **PoC script + run.log with exit code 0, impact evidence on disk** |
-| KILLED | \`assumptions\` (why it died) | — |
+| INVESTIGATING | \`evidence\` (source→sink + **attacker reachability**), \`confidence\` | Path trace in notes |
+| **CONFIRMED** | \`evidence\`, **\`poc\`**, \`impact\` (attacker-real), \`severity\`, **\`impact_proof\`** | **PoC script + run.log exit 0 + proof of impact** |
+| KILLED | \`assumptions\` (why it died: no path / no impact / not applicable) | — |
 | REPORTED | Only after \`CaseReport(id)\` succeeds | Report file |
 
 **Rule: If a required field is empty, you cannot advance.** \`CaseUpdate({status:"confirmed", poc:""})\` is invalid. The fields are the gates.
 
 ---
 
-## 1. Evidence-First Doctrine (Highest Priority)
+## 0. Attacker Model (Read First)
+
+Before escalating any finding, answer in evidence:
+
+1. **Who is the attacker?** (unauth internet, low-priv user, tenant peer, SSRF pivot, etc.)
+2. **What can they already do without the bug?** (baseline privileges)
+3. **What extra power does the bug grant beyond that baseline?**
+4. **Is the path realistic in production?** (auth, CSRF, WAF, network, feature flags, admin-only)
+
+If you cannot name a concrete attacker who gains something they should not have → do **not** confirm. Keep as hypothesis/investigating, or kill as \`insufficient_impact\` / \`environmental_issue\`.
+
+**Non-applicable / weak-impact defaults (KILL or do not promote):**
+- Self-XSS / self-DoS only (attacker harms only their own session/account)
+- Requires admin/root/already-trusted role that already has the same power
+- Local-only, offline, or impossible deployment assumptions
+- Spec-compliant / documented intentional behavior
+- Needs physical access, victim to paste payload into their own console, or other social-engineering-only steps with no trust-boundary break
+- "Interesting" logic quirks with **no confidentiality, integrity, availability, or financial effect**
+- PoC proves a code path exists but **not** that a real victim asset is affected
+
+Technical validity ≠ bounty validity. A true bug with no attacker-usable impact is still a kill for confirmed/report.
+
+---
+
+## 1. Evidence-First Doctrine
 Evidence overrides intuition. Never present speculation as fact. Every security claim must be traceable to:
 - Observed behavior (logs, responses, error traces)
 - Reproduced behavior (exact steps, scripts)
 - Source code / protocol analysis
 - Documented platform behavior
-If evidence is insufficient: explicitly state uncertainty, propose the next experiment, and do not escalate the finding. Produce the strongest conclusion supported by available evidence; never assume success where verification is incomplete.
+If evidence is insufficient: state uncertainty, propose the next experiment, do not escalate. Never assume success where verification is incomplete.
 
 ---
 
-## 2. Adversarial Self-Review (Mandatory Before CONFIRMED)
-Before confirming any vulnerability, argue against yourself:
-1. Explain why this might NOT be a vulnerability (e.g. intended behavior, sandbox limit, misconfiguration).
-2. List alternative explanations for the observed behavior.
-3. Explain why each alternative was rejected.
-4. Describe what specific evidence disproves those alternatives.
+## 2. Impact Gate (Mandatory Before CONFIRMED)
+
+Prove at least **one** real attacker-facing violation:
+
+| Category | Required proof |
+|----------|----------------|
+| **Confidentiality** | Attacker reads data they must not see (other users/tenants/secrets) |
+| **Integrity** | Attacker changes data/state they must not control |
+| **Availability** | Attacker degrades service for **others** (not only self) |
+| **Financial / authz** | Direct money, privilege, or account takeover path |
+
+Impact text must answer: *who is hurt, what is lost, how the attacker reaches it.*  
+Vague impact like "could be dangerous" or "may lead to RCE" without a path is not impact_proof.
+
+If impact is only theoretical, needs a second unproven bug, or is not yet capable from the attacker's seat → stay INVESTIGATING (chain it) or KILL \`insufficient_impact\`. Do **not** confirm "valid but non-applicable" findings.
 
 ---
 
-## 3. False Positive Audit Checklist
-Attempt to falsify the finding. Immediately KILL the case if any of the following apply:
-- The behavior matches intended or documented specs.
-- The issue is caused by browser quirks, testing mistakes, or cache artifacts.
-- Framework/middleware protections render it unexploitable in production.
-- Environmental limitations prevent crossing a security boundary.
+## 3. Adversarial Self-Review (Mandatory Before CONFIRMED)
+Argue against yourself:
+1. Why this might NOT be a vulnerability (intended, sandbox, misconfig, already authorized).
+2. Alternative explanations for the observation.
+3. Why each alternative was rejected **with evidence**.
+4. What blocks a real attacker today (auth, CSRF, network, role checks) and whether each is bypassed.
+5. Would a program triage say "informative / N/A" because impact is self-only or privileged-only?
 
 ---
 
-## 4. Root Cause Before Impact
-Do not map "Behavior → Impact". You must trace:
+## 4. False Positive / Non-Applicable Kill Checklist
+KILL immediately when any apply:
+- Matches documented/spec behavior (\`intended_behavior\`)
+- Browser quirk, test artifact, or cache noise
+- Framework/middleware/WAF blocks the path and is not bypassed (\`framework_protection\`)
+- Requires privileges the attacker already has or cannot obtain (\`environmental_issue\`)
+- No C/I/A/financial effect for anyone but the attacker themselves (\`insufficient_impact\`)
+- Exploit unreliable / not reproducible twice (\`exploit_unreliable\`)
+- Duplicate of an existing case (\`duplicate\`)
+
+---
+
+## 5. Root Cause → Boundary → Impact (Not Behavior → Hype)
+Trace:
 \`\`\`
-Observed Behavior ──→ Root Cause ──→ Security Boundary Broken ──→ Actual Impact
+Entry (attacker-controlled) ──→ Reachable code path ──→ Trust boundary crossed ──→ Victim impact
 \`\`\`
-- Minimum confirmation: Must reproduce successfully at least twice or via two independent methods.
-- Document case details structured as: **Observed Facts**, **Assumptions**, **Unknowns**, **Experiments Remaining**.
+- Minimum: reproduce successfully at least twice or via two independent methods.
+- Record: **Observed Facts**, **Assumptions**, **Unknowns**, **Experiments Remaining**.
+- If the bug is only a **primitive** (e.g. open redirect, limited SSRF, info leak of non-sensitive data), either chain to high impact or keep severity honest — do not inflate.
 
 ---
 
-## 5. Duplicate Check
-Before creating any new case, ask:
-- Is this actually new?
-- Could it be another manifestation of an existing case?
-- Do multiple endpoints share the same underlying root cause?
-Keep the database clean; consolidate related endpoints into single root-cause cases.
+## 6. Duplicate Check
+Before CaseAdd:
+- Is this new?
+- Same root cause as an open case?
+- Multiple endpoints, one bug?
+Continue the existing case ID when scope matches.
 
 ---
 
-## 6. Report-Readiness Gate
-Before marking Ready for Report:
-- Can another researcher reproduce this deterministically?
-- Are the steps completely reproducible?
-- Is the impact justified without inflating severity? (Would the vendor agree with this impact? Is a real trust boundary crossed?)
-- Are exact root causes and remedial code changes detailed?
+## 7. Report-Readiness Gate
+Before REPORTED:
+- Another researcher can reproduce deterministically
+- Steps are complete and production-realistic
+- Impact is justified without inflation (would the vendor agree?)
+- Root cause and fix guidance are concrete
+- Attacker model + victim impact are explicit in the write-up
 
 ---
 
-## 7. Permanent KILLED Case Cataloging
-Keep killed cases documented with a clear classification in the ledger:
+## 8. Permanent KILLED Cataloging
+Keep killed reasons explicit in assumptions/blockers:
 - \`intended_behavior\`
 - \`duplicate\`
 - \`framework_protection\`
 - \`exploit_unreliable\`
 - \`insufficient_impact\`
 - \`environmental_issue\`
-Documenting why ideas were rejected prevents revisiting the same dead ends.
-`;
+- \`not_applicable\` (true bug / interesting behavior, no realistic attacker value)
+Documenting kills prevents re-opening dead ends.
+`.trim();
 
-function buildCaseContext(records: CaseRecord[]): string {
+function sanitizeContextText(v?: string, max = 160): string | undefined {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: strip C0 controls from untrusted case text
+  const controlChars = /[\r\n\t\u0000-\u001F\u007F\u2028\u2029]+/g;
+  const s = v
+    ?.replace(controlChars, " ")
+    .replace(/[<>]/g, (c) => (c === "<" ? "‹" : "›"))
+    .replace(/([\\`*_{}[\]()#+\-.!])/g, "\\$1")
+    .replace(/\s+/g, " ")
+    .trim();
+  return s ? (s.length > max ? `${s.slice(0, max - 1)}…` : s) : undefined;
+}
+
+/** Active-case ledger summary only (no workflow). Empty when nothing is open. */
+function buildCaseListContext(records: CaseRecord[]): string {
   if (records.length === 0) return "";
-
-  const safe = (v?: string, max = 160) => {
-    const controlChars = /[\r\n\t\u0000-\u001F\u007F\u2028\u2029]+/g;
-    const s = v
-      ?.replace(controlChars, " ")
-      .replace(/[<>]/g, (c) => (c === "<" ? "‹" : "›"))
-      .replace(/([\\`*_{}[\]()#+\-.!])/g, "\\$1")
-      .replace(/\s+/g, " ")
-      .trim();
-    return s ? (s.length > max ? `${s.slice(0, max - 1)}…` : s) : undefined;
-  };
 
   const count = (s: string) => records.filter((r) => r.status === s).length;
   const lines: string[] = [
@@ -454,9 +514,11 @@ function buildCaseContext(records: CaseRecord[]): string {
     if (!subset.length) continue;
     lines.push(`  ${label}:`);
     for (const c of subset) {
-      const n = safe(c.nextStep, 180);
+      const n = sanitizeContextText(c.nextStep, 180);
       const extra = status === "confirmed" ? ` [${c.severity ?? "?"}]` : "";
-      lines.push(`  - ${c.id}: ${safe(c.title, 140) ?? "(untitled)"}${extra}${n ? ` → ${n}` : ""}`);
+      lines.push(
+        `  - ${c.id}: ${sanitizeContextText(c.title, 140) ?? "(untitled)"}${extra}${n ? ` → ${n}` : ""}`,
+      );
     }
   }
 
@@ -464,14 +526,20 @@ function buildCaseContext(records: CaseRecord[]): string {
   if (highPrio.length > 0) {
     lines.push("  High priority:");
     for (const c of highPrio) {
-      lines.push(`  - ${c.id}: ${safe(c.title, 140) ?? "(untitled)"} [${c.priority}]`);
+      lines.push(
+        `  - ${c.id}: ${sanitizeContextText(c.title, 140) ?? "(untitled)"} [${c.priority}]`,
+      );
     }
   }
 
   lines.push("</casefile_context>");
-  lines.push(STATIC_CYBER_WORKFLOW);
-
   return lines.join("\n");
+}
+
+/** Always includes cyber workflow; attaches case list when active cases exist. */
+function buildAgentInjection(active: CaseRecord[]): string {
+  const caseList = buildCaseListContext(active);
+  return caseList ? `${caseList}\n\n${STATIC_CYBER_WORKFLOW}` : STATIC_CYBER_WORKFLOW;
 }
 
 // ── Main extension ────────────────────────────────────────────────────
@@ -650,6 +718,22 @@ export default function casefileExtension(pi: ExtensionAPI) {
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       const run = runPoc(params.poc_path as string, params.local !== true);
+
+      // Fail closed without throwing: non-zero PoC must leave the case investigating.
+      if (run.exitCode !== 0) {
+        const record = getCaseById(params.id as string);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `PoC failed (exit ${run.exitCode}). Case remains investigating.\nOutput:\n${run.output}`,
+            },
+          ],
+          isError: true,
+          details: { record, run },
+        };
+      }
+
       const result = promoteFindingResult(params.id as string, {
         path: run.path,
         exitCode: run.exitCode,
@@ -662,10 +746,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
         content: [
           {
             type: "text",
-            text:
-              run.exitCode === 0
-                ? `PoC verified (exit ${run.exitCode}). Case promoted to confirmed:\n${formatCaseDetail(record)}`
-                : `PoC failed (exit ${run.exitCode}). Case remains investigating.\nOutput:\n${run.output}`,
+            text: `PoC verified (exit ${run.exitCode}). Case promoted to confirmed:\n${formatCaseDetail(record)}`,
           },
         ],
         details: { record, run },
@@ -1024,22 +1105,23 @@ export default function casefileExtension(pi: ExtensionAPI) {
   // ── Event: Inject context into system prompt ──
 
   pi.on("before_agent_start", async () => {
+    // Once per user prompt (not every tool turn). Always inject workflow so empty
+    // ledgers still get attacker discipline; attach case list only when useful.
+    let active: CaseRecord[] = [];
     try {
       const records = readCasefile();
-      const active = records.filter((r) => r.status !== "killed" && r.status !== "reported");
-      if (active.length === 0) return;
-
-      const caseContext = buildCaseContext(active);
-      return {
-        message: {
-          customType: "casefile_summary",
-          content: caseContext,
-          display: false,
-        },
-      };
+      active = records.filter((r) => r.status !== "killed" && r.status !== "reported");
     } catch {
-      // No database yet
+      // No database yet — still inject workflow.
     }
+
+    return {
+      message: {
+        customType: "casefile_summary",
+        content: buildAgentInjection(active),
+        display: false,
+      },
+    };
   });
 
   // ── Event: Update status bar ──

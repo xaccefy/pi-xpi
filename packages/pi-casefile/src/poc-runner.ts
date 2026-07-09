@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 
 export type PocRun = {
   path: string;
@@ -145,16 +145,16 @@ function resolveLanguage(pocPath: string): { key: string; language: PocLanguage 
     if (shebangKey) return { key: shebangKey, language: languages[shebangKey] };
   }
 
-  // 2. Project type detection.
-  const projectType = detectProjectType(languages);
-  if (projectType && languages[projectType]) {
-    // If the file extension matches the project type or type has no extension restrictions, use it.
-    return { key: projectType, language: languages[projectType] };
-  }
-
-  // 3. Extension-based fallback.
+  // 2. Extension-based language (prefer the PoC file itself over ambient project markers).
+  // A .py PoC in a Node monorepo must still run under python, not node.
   if (extKey && languages[extKey]) {
     return { key: extKey, language: languages[extKey] };
+  }
+
+  // 3. Project type detection only when the extension is unknown/unmapped.
+  const projectType = detectProjectType(languages);
+  if (projectType && languages[projectType]) {
+    return { key: projectType, language: languages[projectType] };
   }
 
   // 4. Unknown extension: allow env override specifying a single language key.
@@ -186,13 +186,12 @@ function validatePocPath(pocPath: string): string {
     throw new Error("PoC path contains null bytes");
   }
 
-  const parts = normalized.split(/[\\/]/);
-  if (parts.includes("..")) {
-    throw new Error(`PoC path contains traversal segments: ${pocPath}`);
-  }
-
   const root = getProjectRoot();
-  if (!normalized.startsWith(`${root}/`) && normalized !== root) {
+  // Use path.relative so prefix-sibling escapes like /tmp/proj vs /tmp/proj-evil are rejected.
+  // startsWith(`${root}/`) would accept /tmp/proj-evil when root is /tmp/proj.
+  const rel = relative(root, normalized);
+  const outsideWorkspace = rel === "" ? false : rel.startsWith("..") || isAbsolute(rel);
+  if (outsideWorkspace) {
     const allowAbsolute = process.env.PI_POC_ALLOW_ABSOLUTE === "1";
     if (!allowAbsolute) {
       throw new Error(

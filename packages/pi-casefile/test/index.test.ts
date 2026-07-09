@@ -254,6 +254,21 @@ describe("casefile extension", () => {
     expect(duplicateUnlink.content[0].text).toContain("Unlink unchanged");
   });
 
+  test("always injects cyber workflow even with an empty ledger", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+
+    const handler = pi.events.get("before_agent_start")?.[0];
+    expect(handler).toBeFunction();
+    const result = await handler();
+
+    expect(result.message.customType).toBe("casefile_summary");
+    expect(result.message.display).toBe(false);
+    expect(result.message.content).toContain("# Cyber Workflow");
+    expect(result.message.content).toContain("Evidence-First Doctrine");
+    expect(result.message.content).not.toContain("<casefile_context>");
+  });
+
   test("injects only active cases into before_agent_start context", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
@@ -310,6 +325,8 @@ describe("casefile extension", () => {
     expect(result.message.content).not.toContain("This should not be injected");
     expect(result.message.content).not.toContain("Killed duplicate");
     expect(result.message.content).not.toContain("Already reported");
+    // Workflow still rides along with the case list.
+    expect(result.message.content).toContain("# Cyber Workflow");
   });
 
   test("includes hypothesis and blocked cases in prompt context", async () => {
