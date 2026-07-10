@@ -116,8 +116,16 @@ let replayComputeCount = 0;
 // Disk persistence: survive agent/session restarts. The branch message history
 // remains the source of truth; this is a fallback when history isn't replayed yet.
 const XTODO_DIR = join(homedir(), ".pi", "xtodo");
+/** Reject path separators / traversal so session ids cannot escape XTODO_DIR. */
+function safeSessionFileId(id: string): string {
+  const cleaned = String(id ?? "")
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/^\.+/, "")
+    .slice(0, 128);
+  return cleaned || "default";
+}
 function persistPath(id: string): string {
-  return join(XTODO_DIR, `${id}.json`);
+  return join(XTODO_DIR, `${safeSessionFileId(id)}.json`);
 }
 function saveSessionState(id: string, state: TaskState): void {
   try {
@@ -205,22 +213,38 @@ function hasCycle(tasks: Task[], taskId: number, newBlockedBy: number[]): boolea
   return dfs(taskId);
 }
 
-/** Coerce tool-call ids (models often send numeric strings) to finite numbers. */
+/** Coerce tool-call ids (models often send numeric strings) to positive integers. */
 function coerceId(value: unknown): number | undefined {
-  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "number" && Number.isInteger(value) && value > 0) return value;
   if (typeof value === "string" && value.trim() !== "") {
     const n = Number(value);
-    if (Number.isFinite(n)) return n;
+    // Reject "2.7", "1e2", NaN — only plain positive integers.
+    if (Number.isInteger(n) && n > 0 && String(n) === value.trim()) return n;
   }
   return undefined;
+}
+
+/** Drop a deleted task id from every other task's blockedBy list. */
+function scrubBlockedBy(tasks: Task[], deletedId: number): void {
+  for (let i = 0; i < tasks.length; i++) {
+    const t = tasks[i];
+    if (!t.blockedBy?.length) continue;
+    const next = t.blockedBy.filter((d) => d !== deletedId);
+    if (next.length !== t.blockedBy.length) {
+      tasks[i] = { ...t, blockedBy: next.length ? next : undefined };
+    }
+  }
 }
 
 function coerceIdList(value: unknown): number[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const out: number[] = [];
+  const seen = new Set<number>();
   for (const item of value) {
     const n = coerceId(item);
     if (n === undefined) return undefined;
+    if (seen.has(n)) continue;
+    seen.add(n);
     out.push(n);
   }
   return out;
@@ -348,6 +372,11 @@ function applyMutation(state: TaskState, action: TaskAction, params: any): Reduc
         metadata,
       };
       tasks[idx] = updated;
+      // Soft-delete via status=deleted must also free dependents (same as delete action).
+      // Use params.status: after the early deleted-guard, TS narrows `status` away from "deleted".
+      if (params.status === "deleted") {
+        scrubBlockedBy(tasks, cur.id);
+      }
       const transitionStr = cur.status !== status ? ` (${cur.status} → ${status})` : "";
       return {
         state: { tasks, nextId },
@@ -405,6 +434,8 @@ function applyMutation(state: TaskState, action: TaskAction, params: any): Reduc
       const cur = tasks[idx];
       if (cur.status === "deleted") return err(`#${cur.id} is already deleted`);
       tasks[idx] = { ...cur, status: "deleted" };
+      // Dependents must not stay blocked on a tombstone forever.
+      scrubBlockedBy(tasks, cur.id);
       return {
         state: { tasks, nextId },
         text: `Deleted #${cur.id}: ${cur.subject}`,

@@ -15,9 +15,11 @@ Follow the XPI evidence-first doctrine: a claim is only real when a PoC on disk 
 ## 1. Recon (research, don't guess)
 - `ExploitSearch` for techniques mapped to the target's stack.
 - `web_search` for CVEs / advisories / prior reports; `context7` / `deepwiki` for framework internals.
+- `web_fetch` to pull the full content of a specific target URL/page when you already have a link.
+- If the target is a codebase you can read, map it first with **codeintel**: `CodebaseGetArchitecture` for layout, `CodebaseFindSymbol` / `CodebaseGetDefinition` to locate sources & sinks, and `CodebaseTraceCallPath` / `CodebaseGetCallGraph` to prove unprivileged reachability.
 
 ## 2. Hypothesis → case
-- `CaseAdd(status: hypothesis, endpoint, bugClass, target)` per hypothesis, with the source→sink observation as `evidence`.
+- `CaseAdd(title: "<short title>", status: hypothesis, endpoint, bugClass, target)` per hypothesis, with the source→sink observation as `evidence`. (`title` is a required field.)
 - `CaseList` / `CaseSearch` first to dedupe; `CaseLink` findings that chain.
 
 ## 3. Verify with a PoC (hard gate)

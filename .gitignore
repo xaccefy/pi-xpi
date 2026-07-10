@@ -3,6 +3,7 @@ node_modules/
 
 # Local npm auth (never commit tokens)
 .npmrc
+.npmrc-publish
 
 # Build output
 dist/

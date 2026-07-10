@@ -1,47 +1,57 @@
 # pi-lookup
 
-`pi-lookup` is a suite of web search, page retrieval, library documentation, and repository Q&A tools designed to feed high-fidelity external information into the agent context. **No API keys or external authentication configurations are required to use this package.**
+Web search, page fetch, library docs (Context7), and GitHub repo Q&A (DeepWiki) for Pi Agent. **No API keys** for search/fetch/docs (DeepWiki is public-repo only).
 
-## Features
-
-- **Daemon-Based Search & Fetch**: Integrates with the local `open-websearch` daemon to perform search engine queries and retrieve stripped, clean markdown content from target URLs.
-- **Context7 Integration**: Resolves npm library names and retrieves current documentation fragments up to a specified token threshold.
-- **DeepWiki Q&A**: Queries public GitHub repositories using a JSON-RPC MCP tunnel, returning synthesized answers with file-path citations.
-
-## Installation
+## Install
 
 ```bash
-pi install npm:pi-lookup
+pi install npm:@xaccefy/pi-lookup
 ```
 
-## Tools Specification
+## Tools
 
 ### `web_search`
-Queries search engines via the local `open-websearch` daemon.
-- **Parameters**:
-  - `query` (string, required): The search string.
-  - `limit` (number, optional, default: 10): Max results.
-  - `engines` (array of strings, optional): Target engines (e.g. `duckduckgo`, `brave`, `bing`).
+Queries engines via the local `open-websearch` daemon (no API key).
+
+- `query` (required)
+- `limit` (optional, default 10)
+- `engines` (optional, e.g. `duckduckgo`, `brave`, `bing`)
 
 ### `web_fetch`
-Downloads web page contents and parses them to clean markdown.
-- **Parameters**:
-  - `url` (string, required): The destination HTTP/HTTPS URL.
+Fetches a URL as clean text/markdown (GitHub READMEs use a dedicated path).
+
+- `url` (required, http/https)
+
+**SPA / JS-rendered pages:** if the daemon only returns a thin HTML shell, `web_fetch` re-renders with system Chromium (`--headless --dump-dom`) when available and swaps in the richer text.
+
+| Variable | Purpose |
+|----------|---------|
+| `PI_CHROMIUM_PATH` | Absolute path to chromium/chrome binary |
+| `PI_WEBSEARCH_PORT` | Daemon port (default `3210`) |
+
+Fallback binaries checked: `/usr/bin/chromium`, `/usr/sbin/chromium`, Chrome stable paths, etc. If Chromium is missing, static extraction is returned as-is.
 
 ### `context7`
-Fetches API documentation and code examples for a given framework.
-- **Parameters**:
-  - `libraryName` (string, required): Library name (e.g., `react`, `next.js`, `zod`).
-  - `topic` (string, optional): Specific API category/hook to search for.
-  - `maxTokens` (number, optional, default: 10000): Token limit.
+Up-to-date library docs + examples.
+
+- `libraryName` (required, e.g. `react`)
+- `topic` (optional, e.g. `hooks`)
+- `maxTokens` (optional, default 10000)
 
 ### `deepwiki`
-Asks repository-level questions of public GitHub codebases.
-- **Parameters**:
-  - `repo` (string, required): Repo target in `"owner/name"` format.
-  - `question` (string, required): Natural language question.
+Natural-language Q&A over a public GitHub repo.
 
-## Lifecycle Management
+- `repo` (required, `owner/name`)
+- `question` (required)
 
-- **Startup**: Upon session initialization, the extension verifies if the `open-websearch` daemon is active on the port configured via `PI_WEBSEARCH_PORT` (default `3210`). If inactive, it spawns the daemon process automatically.
-- **Shutdown**: Automatically terminates the daemon process when the agent session shut downs.
+## Lifecycle
+
+- **session_start**: best-effort warm-up of the `open-websearch` daemon (non-blocking).
+- **session_shutdown**: stops the daemon process started by this extension.
+
+## Development
+
+```bash
+bun test packages/pi-lookup
+bun run typecheck
+```

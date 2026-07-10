@@ -9,6 +9,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 
 import {
   addCaseResult,
@@ -542,6 +545,58 @@ function buildAgentInjection(active: CaseRecord[]): string {
   return caseList ? `${caseList}\n\n${STATIC_CYBER_WORKFLOW}` : STATIC_CYBER_WORKFLOW;
 }
 
+// ── XP (offensive / exploit) mode toggle ─────────────────────────────
+// Casefile historically injected the cyber workflow into every prompt.
+// For normal dev work that is just noise, so XP mode defaults OFF. Enable
+// it for offensive/audit sessions to get the full attacker discipline back.
+// Toggle with /xp (or /xp on|off); override per-session with PI_XP_MODE.
+// Pure helpers exported for unit tests.
+
+export const XP_MODE_ENV = "PI_XP_MODE";
+export type XpMode = "on" | "off";
+
+export function getXpModeStatePath(): string {
+  try {
+    return join(dirname(getCasefilePath()), "xp-mode");
+  } catch {
+    return join(homedir(), ".pi", "xp-mode");
+  }
+}
+
+export function readXpMode(
+  envValue: string | undefined = process.env[XP_MODE_ENV],
+  statePath: string = getXpModeStatePath(),
+): XpMode {
+  const env = (envValue ?? "").trim().toLowerCase();
+  if (env === "on" || env === "1" || env === "true") return "on";
+  if (env === "off" || env === "0" || env === "false") return "off";
+  try {
+    if (existsSync(statePath)) {
+      const v = readFileSync(statePath, "utf8").trim().toLowerCase();
+      if (v === "on") return "on";
+      if (v === "off") return "off";
+    }
+  } catch {
+    // ignore and fall through to default
+  }
+  return "off";
+}
+
+export function writeXpMode(state: XpMode, statePath: string = getXpModeStatePath()): void {
+  try {
+    writeFileSync(statePath, state, "utf8");
+  } catch {
+    // best-effort; env var can still override at runtime
+  }
+}
+
+export function parseXpModeArg(args: string, current: XpMode): XpMode {
+  const arg = (args ?? "").trim().toLowerCase();
+  if (arg === "on") return "on";
+  if (arg === "off") return "off";
+  return current === "on" ? "off" : "on";
+}
+
 // ── Main extension ────────────────────────────────────────────────────
 
 export default function casefileExtension(pi: ExtensionAPI) {
@@ -976,6 +1031,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
     name: "CaseUnlink",
     label: "Unlink Cases",
     description: "Remove a bidirectional link between two cases.",
+    promptSnippet: "Remove a link between two cases",
+    promptGuidelines: [
+      "Use CaseUnlink to detach two cases that were previously linked with CaseLink (e.g. when a chain step is disproven or no longer relevant).",
+    ],
     parameters: UnlinkSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
@@ -1068,6 +1127,21 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
   });
 
+  // ── Command: /xp (toggle offensive XP mode) ──
+
+  pi.registerCommand("xp", {
+    description:
+      "Toggle casefile XP (offensive) mode. ON injects the full cyber workflow each prompt; OFF (default) keeps context quiet for normal dev work. Usage: /xp [on|off]",
+    handler: async (args, ctx) => {
+      const next = parseXpModeArg(args ?? "", readXpMode());
+      writeXpMode(next);
+      ctx.ui.notify(
+        `Casefile XP mode: ${next.toUpperCase()} (takes effect on the next prompt)`,
+        next === "on" ? "info" : "warning",
+      );
+    },
+  });
+
   // ── Command: /casefile ──
 
   pi.registerCommand("casefile", {
@@ -1103,10 +1177,15 @@ export default function casefileExtension(pi: ExtensionAPI) {
   });
 
   // ── Event: Inject context into system prompt ──
+  // XP (offensive) mode is OFF by default so normal dev work stays quiet.
+  // Only when enabled do we inject the cyber workflow (and case list) each
+  // prompt. This keeps the agent focused during everyday development while
+  // still allowing the full attacker discipline to be switched on for
+  // offensive/audit/bounty sessions.
 
   pi.on("before_agent_start", async () => {
-    // Once per user prompt (not every tool turn). Always inject workflow so empty
-    // ledgers still get attacker discipline; attach case list only when useful.
+    if (readXpMode() === "off") return;
+
     let active: CaseRecord[] = [];
     try {
       const records = readCasefile();

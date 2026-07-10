@@ -21,6 +21,6 @@ For each candidate, emit:
 - Recommended remediation strategy
 
 ## Tracking
-- `CaseAdd(status: hypothesis, endpoint, bugClass, target)` for each candidate, with the source→sink observation as `evidence`.
+- `CaseAdd(title: "<short title>", status: hypothesis, endpoint, bugClass, target)` for each candidate, with the source→sink observation as `evidence`.
 - `CaseList` / `CaseSearch` first to avoid duplicate hypotheses.
 - Do NOT write PoCs — that is `exploit-dev`'s job. Report findings; the coordinator promotes them after verification.

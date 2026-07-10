@@ -851,6 +851,11 @@ export default function codebaseExtension(pi: ExtensionAPI) {
     label: "Index Codebase",
     description:
       "Scan and build/update a persistent AST-based SQLite codebase index of the workspace.",
+    promptSnippet: "Build or refresh the codebase AST/SQLite index",
+    promptGuidelines: [
+      "Run CodebaseIndex to build or force-refresh the persistent AST/SQLite index before deep codebase analysis, or to pick up many new/changed files.",
+      "The other Codebase* tools auto-index the workspace on first use, so you usually only need this for an explicit initial build or a forced full re-index.",
+    ],
     parameters: IndexSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
@@ -899,6 +904,11 @@ export default function codebaseExtension(pi: ExtensionAPI) {
     name: "CodebaseFindSymbol",
     label: "Find Symbol",
     description: "Search for symbols in the index matching a pattern or kind.",
+    promptSnippet: "Find symbols (functions/classes/types) by name or kind in the codebase",
+    promptGuidelines: [
+      "Use CodebaseFindSymbol whenever the user asks to locate, find, or search for a function, class, type, or any symbol by name or kind across the codebase.",
+      "Prefer this over grep for codebase discovery or 'where is X defined' questions when you want structured matches with file/line and signatures; a kind filter (e.g. Function, Class) narrows results.",
+    ],
     parameters: FindSymbolSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
@@ -952,6 +962,11 @@ export default function codebaseExtension(pi: ExtensionAPI) {
     name: "CodebaseGetDefinition",
     label: "Get Definition",
     description: "Find the declaration details and source code of a symbol.",
+    promptSnippet: "Get a symbol's declaration and source code",
+    promptGuidelines: [
+      "Use CodebaseGetDefinition to read the full declaration, signature, and source snippet of a specific symbol once you know its name.",
+      "Prefer this over CodebaseFindSymbol when you already know the exact symbol name and want its implementation, not a list of candidates.",
+    ],
     parameters: GetSymbolSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
@@ -1004,6 +1019,11 @@ export default function codebaseExtension(pi: ExtensionAPI) {
     name: "CodebaseFindReferences",
     label: "Find References",
     description: "Search for all code locations calling or referencing a symbol.",
+    promptSnippet: "Find all callers/references to a symbol",
+    promptGuidelines: [
+      "Use CodebaseFindReferences to find every place that calls or references a symbol — essential for impact analysis, refactoring safety, and tracing how a function is used.",
+      "Reach for this when the user asks 'who uses X', 'what calls X', or when assessing the blast radius of a change.",
+    ],
     parameters: GetSymbolSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
@@ -1051,6 +1071,11 @@ export default function codebaseExtension(pi: ExtensionAPI) {
     name: "CodebaseGetCallGraph",
     label: "Get Call Graph",
     description: "Trace inbound or outbound call pathways for a symbol.",
+    promptSnippet: "Trace inbound/outbound call paths for a symbol",
+    promptGuidelines: [
+      "Use CodebaseGetCallGraph to visualize how a symbol is reached (inbound) or what it calls (outbound), up to a configurable depth.",
+      "Use for architecture understanding, control-flow tracing, and mapping how data or control reaches a function through the call graph.",
+    ],
     parameters: CallGraphSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
@@ -1154,6 +1179,11 @@ export default function codebaseExtension(pi: ExtensionAPI) {
     label: "Trace Call Path",
     description:
       "Scan call graph database paths to trace call routes leading to a target function or symbol.",
+    promptSnippet: "Trace call routes leading to a target symbol",
+    promptGuidelines: [
+      "Use CodebaseTraceCallPath to find concrete call chains that reach a target function — e.g. to prove a user-controlled input flows into a sensitive sink.",
+      "Ideal for taint/flow analysis, exploit-chain construction, and proving reachability from an entry point to a vulnerable function; constrain the start with sourceSymbol to find only paths from a specific entry point.",
+    ],
     parameters: TraceCallPathSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
@@ -1256,6 +1286,11 @@ export default function codebaseExtension(pi: ExtensionAPI) {
     name: "CodebaseGetArchitecture",
     label: "Get Codebase Architecture",
     description: "Summarize top-level directory layout, key imports, and hotspot functions.",
+    promptSnippet: "Summarize codebase layout, hotspot functions, and imports",
+    promptGuidelines: [
+      "Use CodebaseGetArchitecture for a high-level overview: directory structure, most-called (hotspot) functions, top imported modules, and corpus size.",
+      "Reach for this whenever the user asks to 'analyze the codebase', understand the project structure, onboard to a repo, or find the most important/central functions.",
+    ],
     parameters: WorkspaceSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {

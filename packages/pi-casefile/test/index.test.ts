@@ -108,7 +108,7 @@ describe("casefile extension", () => {
       "CaseUpdate",
       "PromoteFinding",
     ]);
-    expect([...pi.commands.keys()]).toEqual(["casefile"]);
+    expect([...pi.commands.keys()].sort()).toEqual(["casefile", "xp"]);
     expect(pi.events.has("session_start")).toBe(true);
     expect(pi.events.has("before_agent_start")).toBe(true);
     expect(pi.events.has("tool_result")).toBe(true);
@@ -254,106 +254,175 @@ describe("casefile extension", () => {
     expect(duplicateUnlink.content[0].text).toContain("Unlink unchanged");
   });
 
-  test("always injects cyber workflow even with an empty ledger", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
+  test("XP mode is off by default: before_agent_start injects nothing", async () => {
+    const previous = process.env.PI_XP_MODE;
+    delete process.env.PI_XP_MODE;
+    try {
+      const pi = createFakePi();
+      casefileExtension(pi as any);
 
-    const handler = pi.events.get("before_agent_start")?.[0];
-    expect(handler).toBeFunction();
-    const result = await handler();
-
-    expect(result.message.customType).toBe("casefile_summary");
-    expect(result.message.display).toBe(false);
-    expect(result.message.content).toContain("# Cyber Workflow");
-    expect(result.message.content).toContain("Evidence-First Doctrine");
-    expect(result.message.content).not.toContain("<casefile_context>");
+      const handler = pi.events.get("before_agent_start")?.[0];
+      expect(handler).toBeFunction();
+      const result = await handler();
+      expect(result).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.PI_XP_MODE;
+      else process.env.PI_XP_MODE = previous;
+    }
   });
 
-  test("injects only active cases into before_agent_start context", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
+  test("XP mode on: injects cyber workflow even with an empty ledger", async () => {
+    const previous = process.env.PI_XP_MODE;
+    process.env.PI_XP_MODE = "on";
+    try {
+      const pi = createFakePi();
+      casefileExtension(pi as any);
 
-    await executeTool(pi, "CaseAdd", {
-      title: "Active <payload> lead",
-      status: "investigating",
-      summary: "This should not be injected",
-      evidence: "Observed suspicious response",
-      confidence: "low",
-      nextStep: "Test <payload> safely",
-    });
-    const killed = await executeTool(pi, "CaseAdd", {
-      title: "Killed duplicate",
-      status: "investigating",
-      evidence: "Duplicate",
-      confidence: "low",
-    });
-    await executeTool(pi, "CaseUpdate", {
-      id: killed.details.record.id,
-      status: "killed",
-      assumptions: ["Duplicate lead with no new evidence"],
-    });
-    const reported = await executeTool(pi, "CaseAdd", {
-      title: "Already reported",
-      status: "investigating",
-      evidence: "Resolved finding",
-      confidence: "high",
-      poc: "Reproduced before patch",
-      impact: "Was exploitable",
-      severity: "high",
-      remediation: "Patch shipped",
-    });
-    await executeTool(pi, "PromoteFinding", {
-      id: reported.details.record.id,
-      poc_path: "/mock/poc.sh",
-    });
-    await executeTool(pi, "CaseReport", { id: reported.details.record.id });
-    await executeTool(pi, "CaseUpdate", {
-      id: reported.details.record.id,
-      status: "reported",
-      remediation: "Patch shipped",
-    });
+      const handler = pi.events.get("before_agent_start")?.[0];
+      expect(handler).toBeFunction();
+      const result = await handler();
 
-    const handler = pi.events.get("before_agent_start")?.[0];
-    expect(handler).toBeFunction();
-
-    const result = await handler();
-    expect(result.message.customType).toBe("casefile_summary");
-    expect(result.message.display).toBe(false);
-    expect(result.message.content).toContain("Active security cases: 1 total");
-    expect(result.message.content).toContain("Active ‹payload› lead");
-    expect(result.message.content).toContain("Test ‹payload› safely");
-    expect(result.message.content).not.toContain("This should not be injected");
-    expect(result.message.content).not.toContain("Killed duplicate");
-    expect(result.message.content).not.toContain("Already reported");
-    // Workflow still rides along with the case list.
-    expect(result.message.content).toContain("# Cyber Workflow");
+      expect(result.message.customType).toBe("casefile_summary");
+      expect(result.message.display).toBe(false);
+      expect(result.message.content).toContain("# Cyber Workflow");
+      expect(result.message.content).toContain("Evidence-First Doctrine");
+      expect(result.message.content).not.toContain("<casefile_context>");
+    } finally {
+      if (previous === undefined) delete process.env.PI_XP_MODE;
+      else process.env.PI_XP_MODE = previous;
+    }
   });
 
-  test("includes hypothesis and blocked cases in prompt context", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
+  test("XP mode on: injects only active cases into before_agent_start context", async () => {
+    const previous = process.env.PI_XP_MODE;
+    process.env.PI_XP_MODE = "on";
+    try {
+      const pi = createFakePi();
+      casefileExtension(pi as any);
 
-    await executeTool(pi, "CaseAdd", {
-      title: "Hypothesis lead",
-      status: "hypothesis",
-    });
-    const blocked = await executeTool(pi, "CaseAdd", {
-      title: "Blocked lead",
-      status: "investigating",
-      evidence: "Need env access",
-      confidence: "low",
-    });
-    await executeTool(pi, "CaseUpdate", {
-      id: blocked.details.record.id,
-      status: "blocked",
-      blockers: ["Needs environment access"],
-    });
+      await executeTool(pi, "CaseAdd", {
+        title: "Active <payload> lead",
+        status: "investigating",
+        summary: "This should not be injected",
+        evidence: "Observed suspicious response",
+        confidence: "low",
+        nextStep: "Test <payload> safely",
+      });
+      const killed = await executeTool(pi, "CaseAdd", {
+        title: "Killed duplicate",
+        status: "investigating",
+        evidence: "Duplicate",
+        confidence: "low",
+      });
+      await executeTool(pi, "CaseUpdate", {
+        id: killed.details.record.id,
+        status: "killed",
+        assumptions: ["Duplicate lead with no new evidence"],
+      });
+      const reported = await executeTool(pi, "CaseAdd", {
+        title: "Already reported",
+        status: "investigating",
+        evidence: "Resolved finding",
+        confidence: "high",
+        poc: "Reproduced before patch",
+        impact: "Was exploitable",
+        severity: "high",
+        remediation: "Patch shipped",
+      });
+      await executeTool(pi, "PromoteFinding", {
+        id: reported.details.record.id,
+        poc_path: "/mock/poc.sh",
+      });
+      await executeTool(pi, "CaseReport", { id: reported.details.record.id });
+      await executeTool(pi, "CaseUpdate", {
+        id: reported.details.record.id,
+        status: "reported",
+        remediation: "Patch shipped",
+      });
 
-    const handler = pi.events.get("before_agent_start")?.[0];
-    const result = await handler();
+      const handler = pi.events.get("before_agent_start")?.[0];
+      expect(handler).toBeFunction();
 
-    expect(result.message.content).toContain("Hypothesis lead");
-    expect(result.message.content).toContain("Blocked lead");
+      const result = await handler();
+      expect(result.message.customType).toBe("casefile_summary");
+      expect(result.message.display).toBe(false);
+      expect(result.message.content).toContain("Active security cases: 1 total");
+      expect(result.message.content).toContain("Active ‹payload› lead");
+      expect(result.message.content).toContain("Test ‹payload› safely");
+      expect(result.message.content).not.toContain("This should not be injected");
+      expect(result.message.content).not.toContain("Killed duplicate");
+      expect(result.message.content).not.toContain("Already reported");
+      // Workflow still rides along with the case list.
+      expect(result.message.content).toContain("# Cyber Workflow");
+    } finally {
+      if (previous === undefined) delete process.env.PI_XP_MODE;
+      else process.env.PI_XP_MODE = previous;
+    }
+  });
+
+  test("XP mode on: includes hypothesis and blocked cases in prompt context", async () => {
+    const previous = process.env.PI_XP_MODE;
+    process.env.PI_XP_MODE = "on";
+    try {
+      const pi = createFakePi();
+      casefileExtension(pi as any);
+
+      await executeTool(pi, "CaseAdd", {
+        title: "Hypothesis lead",
+        status: "hypothesis",
+      });
+      const blocked = await executeTool(pi, "CaseAdd", {
+        title: "Blocked lead",
+        status: "investigating",
+        evidence: "Need env access",
+        confidence: "low",
+      });
+      await executeTool(pi, "CaseUpdate", {
+        id: blocked.details.record.id,
+        status: "blocked",
+        blockers: ["Needs environment access"],
+      });
+
+      const handler = pi.events.get("before_agent_start")?.[0];
+      const result = await handler();
+
+      expect(result.message.content).toContain("Hypothesis lead");
+      expect(result.message.content).toContain("Blocked lead");
+    } finally {
+      if (previous === undefined) delete process.env.PI_XP_MODE;
+      else process.env.PI_XP_MODE = previous;
+    }
+  });
+
+  test("/xp command toggles mode and gates injection", async () => {
+    const previous = process.env.PI_XP_MODE;
+    delete process.env.PI_XP_MODE;
+    try {
+      const pi = createFakePi();
+      casefileExtension(pi as any);
+      const notifications: string[] = [];
+      const ctx = {
+        hasUI: false,
+        ui: {
+          notify: (message: string) => notifications.push(message),
+          setStatus: () => {},
+        },
+      };
+
+      const handler = pi.events.get("before_agent_start")?.[0];
+      expect(await handler()).toBeUndefined();
+
+      await pi.commands.get("xp").handler("on", ctx);
+      expect(notifications.some((n) => n.includes("ON"))).toBe(true);
+      const onResult = await handler();
+      expect(onResult.message.content).toContain("# Cyber Workflow");
+
+      await pi.commands.get("xp").handler("off", ctx);
+      expect(await handler()).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.PI_XP_MODE;
+      else process.env.PI_XP_MODE = previous;
+    }
   });
 
   test("supports the non-ui dashboard command and status updates", async () => {

@@ -1,51 +1,70 @@
 # pi-casefile
 
-`pi-casefile` is a local-first case ledger and validation harness designed to track offensive security investigations, bug bounty findings, and CTF progress. It features a SQLite storage engine and an isolated PoC execution runner.
+Local-first security case ledger for Pi Agent. Tracks hypotheses → confirmed findings with a hard PoC gate, SQLite storage, and an isolated PoC runner.
 
-## Features
-
-- **State Management**: Enforces strict lifecycle transitions across states (`hypothesis`, `investigating`, `confirmed`, `blocked`, `killed`, `reported`).
-- **PoC Runner**: Validates vulnerability reachability in an isolated Docker sandbox with `--network none` or locally on the host.
-- **SQL Backend**: Syncs case information to SQLite via Node's `node:sqlite` or Bun's `bun:sqlite` compat layers.
-- **Reporting**: Automatically compiles markdown vulnerability reports for confirmed or reported findings.
-
-## Installation
+## Install
 
 ```bash
-pi install npm:pi-casefile
+pi install npm:@xaccefy/pi-casefile
 ```
 
-## Environment Variables
+Or via the XPI umbrella package: `pi install npm:@xaccefy/pi-xpi`
 
-- `CASEFILE_PATH`: Set explicit absolute path to the SQLite database file.
-- `CASEFILE_SCOPE`: Scope database storage. Options: `project` (default, stores in `.pi/casefile.db` or `.casefile/casefile.db` relative to workspace root) or `global` (stores in `~/.pi/casefile/casefile.db` or `~/.casefile/casefile.db`).
+## XP mode (default OFF)
 
-## Core Workflow & State Transitions
+The cyber-workflow context injection is **quiet by default** so normal dev work is not flooded with security process text.
 
-The ledger acts as a state gate to ensure finding validity:
-1. **Hypothesis**: Initial lead tracking (`CaseAdd`).
-2. **Investigation**: Move to `investigating` when code paths or reachability trace are identified (`CaseUpdate`).
-3. **Confirmation**: Validate with a working PoC script (`PromoteFinding`). Requires the PoC script to exit with code `0`.
-4. **Chaining**: Link low-impact primitives to build high-impact chains (`CaseLink`).
-5. **Reporting**: Compile markdown report (`CaseReport`) and transition finding to `reported` (`CaseUpdate`).
+| Control | Effect |
+|---------|--------|
+| `/xp` | Toggle ON/OFF |
+| `/xp on` / `/xp off` | Set explicitly |
+| `PI_XP_MODE=on` | Force ON for this process (overrides file) |
+| `PI_XP_MODE=off` | Force OFF |
 
-## Tools Reference
+When **ON**, every prompt injects the attacker-oriented cyber workflow plus any active (non-killed/non-reported) cases. When **OFF**, nothing is injected; tools remain available.
 
-| Tool | Action | Requirements |
-|---|---|---|
-| `CaseAdd` | Create a new hypothesis or investigation case | Title, target (scope) |
-| `CaseUpdate` | Modify case details (remediation, impact, status) | ID, field updates |
-| `PromoteFinding` | Run on-disk PoC script to transition status to `confirmed` | ID, `poc_path`, `local` flag |
-| `CaseGet` | Retrieve full JSON details of a case | ID |
-| `CaseList` | Query and filter cases by status/confidence/tags | Filter flags, limit, offset |
-| `CaseSearch` | Perform full-text search across specific case fields | Query string, optional field |
-| `CaseLink` | Create a bidirectional link between two cases | Source ID, Target ID |
-| `CaseUnlink` | Remove link between two cases | Source ID, Target ID |
-| `CaseReport` | Write markdown report to disk | ID (must be `confirmed` or `reported`) |
+State is persisted next to the ledger as `xp-mode` (e.g. `.pi/xp-mode`).
 
-## Development and Testing
+## Environment
 
-Run tests via Bun:
+| Variable | Purpose |
+|----------|---------|
+| `PI_CASEFILE_PATH` | Absolute path to the SQLite ledger file |
+| `CASEFILE_WORKSPACE_ROOT` / `PI_WORKSPACE_ROOT` | Override workspace root used to place `.pi/casefile.db` |
+
+Default DB path: `<workspace>/.pi/casefile.db`
+
+## State machine
+
+```
+hypothesis → investigating → confirmed → reported
+                 ↓               ↓
+              blocked         killed (terminal)
+```
+
+- **investigating** requires `evidence` + `confidence`
+- **confirmed** only via `PromoteFinding` (PoC exit 0) — `CaseUpdate(status:"confirmed")` is rejected
+- **reported** requires `CaseReport` first
+- **killed** / **reported** are terminal (no further field edits)
+
+There is **no** `impact_proof` tool field. Put proof text in `impact` or `evidence`.
+
+## Tools
+
+| Tool | Use |
+|------|-----|
+| `CaseAdd` | Open a case (`title` required; start as `hypothesis` or `investigating`) |
+| `CaseUpdate` | Evidence, impact, severity, status (not direct confirm) |
+| `PromoteFinding` | Run on-disk PoC (Docker sandbox by default; `local:true` for host) → confirm on exit 0 |
+| `CaseGet` / `CaseList` / `CaseSearch` | Read / filter / search |
+| `CaseLink` / `CaseUnlink` | Bidirectional exploit chains |
+| `CaseReport` | Markdown report for confirmed/reported cases |
+
+Commands: `/casefile` (dashboard), `/xp` (XP mode).
+
+## Development
+
 ```bash
-bun test
+bun test packages/pi-casefile
+bun run typecheck
 ```

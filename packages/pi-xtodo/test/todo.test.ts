@@ -272,6 +272,57 @@ describe("pi-xtodo simplified tests", () => {
     assert.ok(cycle.content[0].text.includes("would create a cycle"));
   });
 
+  it("delete scrubs dependents' blockedBy so they are not stuck on a tombstone", async () => {
+    const todoTool = pi.tools[0];
+    await todoTool.execute("1", { action: "create", subject: "Blocker" }, null, null, mockCtx);
+    await todoTool.execute(
+      "2",
+      { action: "create", subject: "Dependent", blockedBy: [1] },
+      null,
+      null,
+      mockCtx,
+    );
+
+    await todoTool.execute("3", { action: "delete", id: 1 }, null, null, mockCtx);
+    const got = await todoTool.execute("4", { action: "get", id: 2 }, null, null, mockCtx);
+    assert.ok(!got.content[0].text.includes("blockedBy"), got.content[0].text);
+
+    // Same via status=deleted update path.
+    await todoTool.execute("5", { action: "create", subject: "B2" }, null, null, mockCtx);
+    await todoTool.execute(
+      "6",
+      { action: "update", id: 2, addBlockedBy: [3] },
+      null,
+      null,
+      mockCtx,
+    );
+    await todoTool.execute(
+      "7",
+      { action: "update", id: 3, status: "deleted" },
+      null,
+      null,
+      mockCtx,
+    );
+    const got2 = await todoTool.execute("8", { action: "get", id: 2 }, null, null, mockCtx);
+    assert.ok(!got2.content[0].text.includes("blockedBy"), got2.content[0].text);
+  });
+
+  it("rejects non-integer / non-positive ids", async () => {
+    const todoTool = pi.tools[0];
+    await todoTool.execute("1", { action: "create", subject: "T" }, null, null, mockCtx);
+
+    for (const bad of [1.5, "2.7", "1e2", 0, -1, "0", "abc"]) {
+      const r = await todoTool.execute(
+        `bad-${bad}`,
+        { action: "update", id: bad as unknown as number, status: "in_progress" },
+        null,
+        null,
+        mockCtx,
+      );
+      assert.ok(r.isError, `expected error for id=${JSON.stringify(bad)}: ${r.content[0].text}`);
+    }
+  });
+
   it("skips replay when branch length is unchanged (cache hit, no recompute)", async () => {
     const todoTool = pi.tools[0];
     sessionManager.sessionId = "cache-skip-session";

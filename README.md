@@ -1,83 +1,106 @@
 # XPI
 
-Security tools for Pi Agent: casefile tracking, web search, library docs, exploit technique search.
+Security tools for Pi Agent: casefile tracking, web search, library docs, exploit technique search, code intelligence, and todos.
 
 ## Install
 
-You can automate the installation of XPI along with its required 3rd party extension dependencies (`pi-codex-goal` and `pi-mcp-adapter`) by running the setup script:
+Automate XPI plus third-party extension deps (`pi-codex-goal`, `pi-mcp-adapter`):
 
 ```bash
 ./install.sh
 ```
 
-Or install them manually:
+Or:
 
 ```bash
-# Install XPI
 pi install npm:@xaccefy/pi-xpi
 ```
 
-### ExploitSearch API key
+### API keys / env
 
-ExploitSearch queries the [preview.is](https://preview.is) security corpus and
-requires an API key. Get one at https://preview.is, then export it:
+| Variable | Package | Purpose |
+|----------|---------|---------|
+| `PREVIEW_IS_API_KEY` | exploitsearch | Required for `ExploitSearch` ([preview.is](https://preview.is)) |
+| `PI_XP_MODE` | casefile | `on` / `off` — force casefile cyber-workflow injection |
+| `PI_CASEFILE_PATH` | casefile | Override SQLite ledger path |
+| `PI_WEBSEARCH_PORT` | lookup | open-websearch daemon port (default `3210`) |
+| `PI_CHROMIUM_PATH` | lookup | Chromium binary for SPA re-render in `web_fetch` |
 
 ```bash
 export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 ```
 
-Add this to your shell profile (`~/.bashrc` / `~/.zshrc`) so Pi Agent picks it
-up on every session. Without the key, ExploitSearch returns a clear error
-message guiding you to set it.
-
 ## Tools
 
 | Tool | Use for |
 |------|---------|
-| ExploitSearch | Attack techniques, primitives, bypasses (preview.is, requires `PREVIEW_IS_API_KEY`) |
+| ExploitSearch | Attack techniques, primitives, bypasses (`PREVIEW_IS_API_KEY`) |
 | web_search | CVEs, advisories, documentation |
-| web_fetch | Page content retrieval |
-| context7 | Current library docs (e.g. `libraryName: "react", topic: "hooks"`) |
-| deepwiki | Ask about a GitHub repo (e.g. `repo: "facebook/react", question: "How does the reconciler work?"`) |
-| CaseAdd | New finding in the ledger |
-| CaseUpdate | Update case fields and status |
-| PromoteFinding | Run on-disk PoC, confirm on exit 0 |
-| CaseGet / CaseList / CaseSearch | Read and browse cases |
-| CaseLink / CaseUnlink | Chain findings |
-| CaseReport | Generate markdown report |
-| /casefile | Interactive case dashboard |
-| todo | Manage task lists for tracking multi-step progress |
-| /todos | TUI command to display active/completed tasks |
-| CodebaseIndex | Scan and build/update a persistent AST-based SQLite codebase index |
-| CodebaseFindSymbol | Search for symbols in the index matching a pattern or kind |
-| CodebaseGetDefinition | Find the declaration details and source code of a symbol |
-| CodebaseFindReferences | Search for all code locations calling or referencing a symbol |
-| CodebaseGetCallGraph | Trace inbound or outbound call pathways for a symbol |
-| CodebaseTraceCallPath | Scan call graph pathways leading to a target function or symbol |
-| CodebaseGetArchitecture | Summarize directory layout, key imports, and hotspot functions |
+| web_fetch | Page content; SPA pages re-rendered via Chromium when the shell is thin |
+| context7 | Current library docs |
+| deepwiki | Q&A on a public GitHub repo |
+| CaseAdd / CaseUpdate / PromoteFinding | Ledger + hard PoC gate to confirm |
+| CaseGet / CaseList / CaseSearch | Browse cases |
+| CaseLink / CaseUnlink | Exploit chains |
+| CaseReport | Markdown report |
+| /casefile | Case dashboard |
+| /xp | Toggle casefile **XP mode** (cyber workflow injection; **default OFF**) |
+| todo / /todos | Multi-step task lists |
+| Codebase* | AST index, symbols, call graph, architecture |
 
 ## Quick start
 
 ```
-/pentest api.example.com
-/bugbounty https://hackerone.com/example
-/ctf web-challenge-01
-/hunt scan for insecure input parsing
-/patch fix the vulnerability in test_file
-/harness scan, verify, and patch buffer overflows
+/engage <bugbounty|ctf|pentest> <target>   # start an engagement
+/pipeline <audit|harness|patch> <target>   # VDH/VVS discovery→validate→patch
+/xp on                                      # enable casefile cyber workflow in context
 ```
+
+Engagements and pipelines restate the workflow in the prompt body, so they work with XP mode off. Use `/xp on` when you want the full attacker discipline injected every turn.
+
+## Packages
+
+| Package | npm |
+|---------|-----|
+| Umbrella | `@xaccefy/pi-xpi` |
+| Case ledger | `@xaccefy/pi-casefile` |
+| Lookup | `@xaccefy/pi-lookup` |
+| Exploit search | `@xaccefy/pi-exploitsearch` |
+| Code intel | `@xaccefy/pi-codeintel` |
+| Todos | `@xaccefy/pi-xtodo` |
+
+See each package’s `README.md` under `packages/*/`.
 
 ## Structure
 
 ```
 pi-xpi/
-├── prompts/                 # /pentest, /bugbounty, /ctf, /hunt, /patch, /harness
-├── agents/                  # auditor, exploit-dev, patch-writer, harness definitions
+├── prompts/                 # /engage, /pipeline
+├── agents/                  # auditor, exploit-dev, patch-writer, harness
 ├── packages/
-│   ├── @xaccefy/pi-casefile         # SQLite case tracker
-│   ├── @xaccefy/pi-exploitsearch    # ExploitSearch tool
-│   ├── @xaccefy/pi-lookup           # web_search, web_fetch, context7, deepwiki
-│   ├── @xaccefy/pi-codeintel        # Codebase indexer & graph queries
-│   └── @xaccefy/pi-xtodo            # Todo tracking
+│   ├── pi-casefile
+│   ├── pi-exploitsearch
+│   ├── pi-lookup
+│   ├── pi-codeintel
+│   └── pi-xtodo
 └── package.json
 ```
+
+## Develop / release
+
+```bash
+bun install
+bun test --isolate
+bun run typecheck
+```
+
+**Release (CI):** GitHub Actions → **Release** workflow → choose `patch` / `minor` / `major`.  
+Requires repo secret `NPM_TOKEN`. The job runs tests, bumps all workspace versions, publishes every package + umbrella, tags `vX.Y.Z`, and pushes.
+
+**Local release helper:**
+
+```bash
+bun run release:patch   # or release:minor / release:major
+```
+
+(Requires a clean tree, npm auth, and push rights.)
