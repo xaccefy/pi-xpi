@@ -2,11 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  parseXpModeArg,
-  readXpMode,
-  writeXpMode,
-} from "../src/index.ts";
+import { parseXpModeArg, readXpMode, writeXpMode } from "../src/index.ts";
 
 const dirs: string[] = [];
 
