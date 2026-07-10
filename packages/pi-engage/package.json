@@ -1,6 +1,6 @@
 {
   "name": "@xaccefy/pi-engage",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Authenticated-session manager for Pi Agent — store and resolve cookie, OAuth client-credentials, and mTLS auth for authorized pentest targets",
   "keywords": [
     "pi-package",
