@@ -10,6 +10,8 @@
     "types": ["bun"]
   },
   "include": [
+    "packages/pi-engage/src/**/*.ts",
+    "packages/pi-engage/test/**/*.ts",
     "packages/pi-exploitsearch/src/**/*.ts",
     "packages/pi-exploitsearch/test/**/*.ts",
     "packages/pi-casefile/src/**/*.ts",

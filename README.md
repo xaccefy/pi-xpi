@@ -34,6 +34,7 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 
 | Tool | Use for |
 |------|---------|
+| auth / /auth | Store & resolve authenticated sessions for targets (cookie, OAuth client-credentials, mTLS) |
 | ExploitSearch | Attack techniques, primitives, bypasses (`PREVIEW_IS_API_KEY`) |
 | web_search | CVEs, advisories, documentation |
 | web_fetch | Page content; SPA pages re-rendered via Chromium when the shell is thin |
@@ -51,7 +52,7 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 ## Quick start
 
 ```
-/engage <bugbounty|ctf|pentest> <target>   # start an engagement
+/ops <bugbounty|ctf|pentest> <target>   # start an engagement
 /pipeline <audit|harness|patch> <target>   # VDH/VVS discovery→validate→patch
 /xp on                                      # enable casefile cyber workflow in context
 ```
@@ -63,6 +64,7 @@ Engagements and pipelines restate the workflow in the prompt body, so they work 
 | Package | npm |
 |---------|-----|
 | Umbrella | `@xaccefy/pi-xpi` |
+| Auth sessions | `@xaccefy/pi-engage` |
 | Case ledger | `@xaccefy/pi-casefile` |
 | Lookup | `@xaccefy/pi-lookup` |
 | Exploit search | `@xaccefy/pi-exploitsearch` |
@@ -75,7 +77,7 @@ See each package’s `README.md` under `packages/*/`.
 
 ```
 pi-xpi/
-├── prompts/                 # /engage, /pipeline
+├── prompts/                 # /ops, /pipeline
 ├── agents/                  # auditor, exploit-dev, patch-writer, harness
 ├── packages/
 │   ├── pi-casefile
