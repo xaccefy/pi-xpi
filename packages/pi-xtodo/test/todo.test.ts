@@ -4,7 +4,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import { MockExtensionAPI } from "../../../test-utils.ts";
-import { __replayComputeCount, __resetState, default as registerTodo } from "../index.ts";
+import {
+  __replayComputeCount,
+  __resetState,
+  default as registerTodo,
+  TodoParamsSchema,
+} from "../index.ts";
 
 class MockSessionManager {
   sessionId = "test-session";
@@ -34,6 +39,23 @@ describe("pi-xtodo simplified tests", () => {
     assert.strictEqual(pi.tools.length, 1);
     assert.strictEqual(pi.tools[0].name, "todo");
     assert.ok(pi.commands.todos);
+  });
+
+  it("schema uses StringEnum (type+enum), not anyOf/const Literals", () => {
+    // Providers (and Pi tool-arg validation) drop optional anyOf fields; status
+    // must be a plain string enum so status-only updates reach the reducer.
+    const status = (TodoParamsSchema as any).properties?.status;
+    assert.ok(status, "status property missing");
+    // Optional wraps the inner schema; unwrap common TypeBox shapes.
+    const inner = status.anyOf?.[0] ?? status;
+    const enumSchema = inner.enum ? inner : (inner.anyOf?.[0] ?? inner);
+    assert.ok(
+      Array.isArray(enumSchema.enum) || Array.isArray(status.enum),
+      `expected enum array, got ${JSON.stringify(status).slice(0, 200)}`,
+    );
+    // Must NOT be a Union-of-Literals (anyOf of {const: ...}).
+    const raw = JSON.stringify(status);
+    assert.ok(!raw.includes('"const"'), `status still uses const literals: ${raw.slice(0, 200)}`);
   });
 
   it("create, update, delete, list flow", async () => {

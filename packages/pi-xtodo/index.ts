@@ -8,7 +8,25 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Text, type TUI, truncateToWidth } from "@earendil-works/pi-tui";
-import { type Static, Type } from "@sinclair/typebox";
+import { type Static, type TSchema, Type } from "@sinclair/typebox";
+
+/**
+ * String enum as `{ type: "string", enum: [...] }` (provider-safe).
+ * Do NOT use Type.Union(Type.Literal...) — that becomes anyOf/const and some
+ * providers / Pi arg validators drop optional fields, so status-only updates
+ * arrive as `{ action, id }` and fail hasMutation. Same approach as rpiv-todo
+ * (via @earendil-works/pi-ai StringEnum).
+ */
+function StringEnum<T extends readonly string[]>(
+  values: T,
+  options?: { description?: string },
+): TSchema {
+  return Type.Unsafe({
+    type: "string",
+    enum: [...values],
+    ...(options?.description ? { description: options.description } : {}),
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Identity & Types
@@ -48,15 +66,14 @@ export interface TaskDetails {
 // ---------------------------------------------------------------------------
 // TypeBox Schema
 // ---------------------------------------------------------------------------
+// Use StringEnum (type+enum), NOT Type.Union(Type.Literal...) which compiles to
+// anyOf/const — several providers (and Pi's tool arg validation) drop optional
+// anyOf fields, so status-only updates arrived as {action,id} and failed with
+// "update requires at least one mutable field". Matches rpiv-todo.
 export const TodoParamsSchema = Type.Object({
-  action: Type.Union([
-    Type.Literal("create"),
-    Type.Literal("update"),
-    Type.Literal("list"),
-    Type.Literal("get"),
-    Type.Literal("delete"),
-    Type.Literal("clear"),
-  ]),
+  action: StringEnum(["create", "update", "list", "get", "delete", "clear"] as const, {
+    description: "create | update | list | get | delete | clear",
+  }),
   subject: Type.Optional(Type.String({ description: "Task subject line (required for create)" })),
   description: Type.Optional(Type.String({ description: "Long-form task description" })),
   activeForm: Type.Optional(
@@ -65,17 +82,9 @@ export const TodoParamsSchema = Type.Object({
     }),
   ),
   status: Type.Optional(
-    Type.Union(
-      [
-        Type.Literal("pending"),
-        Type.Literal("in_progress"),
-        Type.Literal("completed"),
-        Type.Literal("deleted"),
-      ],
-      {
-        description: "Target status (update) or list filter (list)",
-      },
-    ),
+    StringEnum(["pending", "in_progress", "completed", "deleted"] as const, {
+      description: "Target status (update) or list filter (list)",
+    }),
   ),
   blockedBy: Type.Optional(
     Type.Array(Type.Number(), { description: "Initial blockedBy ids (create only)" }),
