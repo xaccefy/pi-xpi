@@ -33,6 +33,7 @@
     "src/credential.ts",
     "src/store.ts",
     "src/types.ts",
+    "skills",
     "README.md",
     "LICENSE"
   ],
