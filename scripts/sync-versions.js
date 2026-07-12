@@ -23,8 +23,6 @@ for (const dir of packageDirs) {
 const rootPkgPath = join(process.cwd(), "package.json");
 const rootPkg = JSON.parse(readFileSync(rootPkgPath, "utf8"));
 versionMap[rootPkg.name] = rootPkg.version;
-for (const [_name, _version] of Object.entries(versionMap).sort()) {
-}
 
 const versions = new Set(Object.values(versionMap));
 if (versions.size > 1) {
@@ -64,8 +62,4 @@ for (const [, pkg] of Object.entries(packages)) {
   if (updated) {
     writeFileSync(pkg.path, `${JSON.stringify(pkg.data, null, "  ")}\n`);
   }
-}
-
-if (totalUpdates === 0) {
-} else {
 }

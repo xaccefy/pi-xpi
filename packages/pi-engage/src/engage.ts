@@ -2,7 +2,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { resolveSessionRequest } from "./credential.ts";
 import type { AuthMode } from "./store.ts";
 import * as store from "./store.ts";
-import type { AuthSession, EngageAction, FetchImpl, Finding, FindingSeverity } from "./types.ts";
+import type { AuthSession, FetchImpl, Finding, FindingSeverity } from "./types.ts";
 
 export interface OpResult {
   text: string;
@@ -408,4 +408,4 @@ export interface EngageScanInput {
   sessionId?: string;
 }
 
-export type { AuthSession, EngageAction };
+export type { AuthSession };

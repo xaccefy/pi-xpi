@@ -143,31 +143,11 @@ function addUnreleasedSection() {
   }
 }
 
-function getUnreleasedBody(changelogPath) {
-  const content = readFileSync(changelogPath, "utf-8");
-  const start = content.indexOf("## [Unreleased]");
-  if (start === -1) return null;
-  const after = content.slice(start + "## [Unreleased]".length);
-  const nextHeader = after.search(/^## \[/m);
-  const body = nextHeader === -1 ? after : after.slice(0, nextHeader);
-  return body;
-}
-
-function hasUnreleasedEntries() {
-  const changelogs = getChangelogs();
-  for (const changelog of changelogs) {
-    const body = getUnreleasedBody(changelog);
-    if (body && /^- /m.test(body)) return true;
-  }
-  return false;
-}
 const status = run("git status --porcelain", { silent: true });
 if (status?.trim()) {
   process.exit(1);
 }
 run("npm test");
-if (!hasUnreleasedEntries()) {
-}
 
 const version = bumpOrSetVersion(RELEASE_TARGET);
 updateChangelogsForRelease(version);
