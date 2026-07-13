@@ -91,6 +91,45 @@ describe("pi-engage", () => {
     const res = await tool.execute("c1", { action: "add", id: "s1", label: "shop" });
     assert.strictEqual((res as { isError: boolean }).isError, true);
   });
+
+  it("rejects cookie session without cookie value", async () => {
+    const tool = pi.tools[0];
+    const res = await tool.execute("c1", {
+      action: "add",
+      id: "s1",
+      mode: "cookie",
+      target: "shop.example.com",
+    });
+    assert.strictEqual((res as { isError: boolean }).isError, true);
+    assert.match(
+      (res as { content: { text: string }[] }).content[0].text,
+      /cookie mode requires a cookie/,
+    );
+  });
+
+  it("rejects oauth session without tokenUrl", async () => {
+    const tool = pi.tools[0];
+    const res = await tool.execute("c1", {
+      action: "add",
+      id: "s2",
+      mode: "oauth-client-credentials",
+      clientId: "cid",
+      clientSecret: "sec",
+    });
+    assert.strictEqual((res as { isError: boolean }).isError, true);
+    assert.match((res as { content: { text: string }[] }).content[0].text, /requires tokenUrl/);
+  });
+
+  it("rejects mtls session without certPath", async () => {
+    const tool = pi.tools[0];
+    const res = await tool.execute("c1", {
+      action: "add",
+      id: "s3",
+      mode: "mtls",
+    });
+    assert.strictEqual((res as { isError: boolean }).isError, true);
+    assert.match((res as { content: { text: string }[] }).content[0].text, /requires certPath/);
+  });
 });
 
 describe("Engage class (pdtm bridge)", () => {
@@ -102,7 +141,7 @@ describe("Engage class (pdtm bridge)", () => {
     const r = await e.run({ tool: "nuclei", url: "https://shop.example.com", sessionId: "s1" });
     assert.strictEqual(r.isError, undefined);
     const d = r.details as { command: string; exitCode: number; findings: { type: string }[] };
-    assert.match(d.command, /-H "Cookie: session=abc123"/);
+    assert.match(d.command, /-H 'Cookie: session=abc123'/);
     assert.match(d.command, /-u https:\/\/shop.example.com/);
     assert.strictEqual(d.findings.length, 1);
     assert.strictEqual(d.findings[0].type, "xss");
@@ -114,7 +153,7 @@ describe("Engage class (pdtm bridge)", () => {
     const r = await e.run({ tool: "curl", url: "https://shop.example.com/a", sessionId: "s1" });
     const d = r.details as { command: string };
     assert.match(d.command, /curl/);
-    assert.match(d.command, /-H "Cookie: session=abc123"/);
+    assert.match(d.command, /-H 'Cookie: session=abc123'/);
     assert.match(d.command, /https:\/\/shop.example.com\/a/);
   });
 
@@ -127,6 +166,32 @@ describe("Engage class (pdtm bridge)", () => {
     assert.strictEqual(d.status, 200);
     assert.match(d.curl, /curl -X GET/);
     assert.match(d.curl, /-H 'Cookie: session=abc123'/);
+  });
+
+  it("send curl command includes body", async () => {
+    const e = new Engage({ fetchImpl: fakeFetch(200, "ok") });
+    e.addSession(cookieSession());
+    const r = await e.send({
+      url: "https://shop.example.com/api",
+      sessionId: "s1",
+      method: "POST",
+      body: '{"hello":"world"}',
+    });
+    const d = r.details as { curl: string };
+    assert.match(d.curl, /-d '{"hello":"world"}'/);
+  });
+
+  it("send curl escapes single quotes in header values", async () => {
+    const e = new Engage({ fetchImpl: fakeFetch(200, "ok") });
+    e.addSession(cookieSession());
+    const r = await e.send({
+      url: "https://shop.example.com/a",
+      sessionId: "s1",
+      headers: { "X-Custom": "val'with'quote" },
+    });
+    const d = r.details as { curl: string };
+    // POSIX single-quote escaping: '...' -> '...'\''...'
+    assert.match(d.curl, /val'\\''with'\\''quote/);
   });
 
   it("spider stays in scope", async () => {
@@ -148,6 +213,21 @@ describe("Engage class (pdtm bridge)", () => {
       !visited.some((u) => u.includes("evil.example.com")),
       "should skip out-of-scope host",
     );
+  });
+
+  it("spider respects depth limit", async () => {
+    const e = new Engage({ fetchImpl: fakeFetch() });
+    e.addSession(cookieSession({ cookie: "x=1" }));
+    const r = await e.spider({
+      url: "https://shop.example.com/",
+      sessionId: "s1",
+      inScope: ["shop.example.com"],
+      depth: 0,
+    });
+    const visited = (r.details as { visited: string[] }).visited;
+    // depth: 0 means only the seed URL is fetched, no links followed.
+    assert.strictEqual(visited.length, 1);
+    assert.ok(visited[0].includes("shop.example.com"));
   });
 
   it("scan falls back to a passive header check when nuclei is absent", async () => {

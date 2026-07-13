@@ -34,6 +34,19 @@ const BASE_SECURITY_HEADERS = [
 
 /** Tools that take a positional URL (curl) vs `-u` (nuclei/httpx/ffuf/...). */
 const POSITIONAL_URL_TOOLS = new Set(["curl"]);
+const REQUEST_TIMEOUT_MS = 30_000;
+
+/** Escape a string for a POSIX single-quoted shell context (copy-paste curl commands). */
+function shellSingleQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+/** Conditionally quote for shell display — only when the arg contains special chars. */
+function shellQuote(s: string): string {
+  if (s === "") return "''";
+  if (/^[a-zA-Z0-9_@%+=:,./-]+$/.test(s)) return s;
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
 
 function ok(text: string, details?: unknown): OpResult {
   return { text, details };
@@ -78,6 +91,25 @@ export function buildToolArgs(
     ? [...authFlags, ...(target ? [target] : [])]
     : [...authFlags, ...(target ? ["-u", target] : [])];
   return [...head, ...extra];
+}
+
+/** Validate that mode-specific fields are present (catch silent auth failures early). */
+function validateSessionFields(input: EngageSetupInput): string | undefined {
+  switch (input.mode) {
+    case "cookie":
+      if (!input.cookie?.trim()) return "cookie mode requires a cookie value";
+      break;
+    case "oauth-client-credentials":
+      if (!input.tokenUrl?.trim()) return "oauth-client-credentials requires tokenUrl";
+      if (!input.clientId?.trim()) return "oauth-client-credentials requires clientId";
+      if (!input.clientSecret?.trim()) return "oauth-client-credentials requires clientSecret";
+      break;
+    case "mtls":
+      if (!input.certPath?.trim()) return "mtls requires certPath";
+      if (!input.keyPath?.trim()) return "mtls requires keyPath";
+      break;
+  }
+  return undefined;
 }
 
 /** Parse nuclei JSONL output into findings (no-op for other tools). */
@@ -169,8 +201,12 @@ export class Engage {
     if (!input.id) return err("id is required for add");
     if (!input.mode)
       return err("mode is required for add (cookie | oauth-client-credentials | mtls)");
+    const modeErr = validateSessionFields(input);
+    if (modeErr) return err(modeErr);
+    // Strip sessionId — a routing field, not part of the stored session.
+    const { sessionId: _sid, ...rest } = input;
     const session: AuthSession = {
-      ...(input as AuthSession),
+      ...(rest as AuthSession),
       createdAt: this.now,
       updatedAt: this.now,
     };
@@ -230,7 +266,7 @@ export class Engage {
     const result = await this.exec(input.tool, args);
     const parsed = parseToolOutput(input.tool, result.stdout);
     return ok(`Ran ${input.tool} (exit ${result.code})`, {
-      command: `${input.tool} ${args.map((a) => (a.includes(" ") ? JSON.stringify(a) : a)).join(" ")}`,
+      command: `${input.tool} ${args.map(shellQuote).join(" ")}`,
       exitCode: result.code,
       stderr: result.stderr.slice(0, 1000),
       stdoutSnippet: result.stdout.slice(0, 3000),
@@ -249,13 +285,19 @@ export class Engage {
     const headers: Record<string, string> = { ...auth.headers, ...(input.headers ?? {}) };
     if (s.cookie && !headers.Cookie) headers.Cookie = s.cookie;
     const method = input.method ?? "GET";
-    const res = await this.fetchImpl(input.url, { method, headers, body: input.body });
+    const res = await this.fetchImpl(input.url, {
+      method,
+      headers,
+      body: input.body,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
     const text = await res.text();
-    const curl =
-      `curl -X ${method} '${input.url}'` +
-      Object.entries(headers)
-        .map(([k, v]) => ` -H '${k}: ${v}'`)
-        .join("");
+    const curlParts = [`curl -X ${method}`, shellSingleQuote(input.url)];
+    for (const [k, v] of Object.entries(headers)) {
+      curlParts.push("-H", shellSingleQuote(`${k}: ${v}`));
+    }
+    if (input.body) curlParts.push("-d", shellSingleQuote(input.body));
+    const curl = curlParts.join(" ");
     return ok(`[${res.status}] ${input.url}`, {
       status: res.status,
       responseHeaders: Object.fromEntries(res.headers),
@@ -275,18 +317,21 @@ export class Engage {
     const auth = await resolveSessionRequest(s, this.fetchImpl);
     const base = new URL(input.url);
     const visited = new Set<string>();
-    const queue: string[] = [input.url];
     const inScope = input.inScope ?? [base.host];
     const maxDepth = input.depth ?? 2;
+    const queue: { url: string; depth: number }[] = [{ url: input.url, depth: 0 }];
     let count = 0;
-    let guard = 0;
-    while (queue.length && visited.size < 200 && guard < maxDepth * 50) {
-      guard++;
-      const u = queue.shift() as string;
+    while (queue.length && visited.size < 200) {
+      const item = queue.shift();
+      if (!item) break;
+      const { url: u, depth } = item;
       if (visited.has(u)) continue;
       visited.add(u);
       try {
-        const res = await this.fetchImpl(u, { headers: auth.headers });
+        const res = await this.fetchImpl(u, {
+          headers: auth.headers,
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
         const html = await res.text();
         count++;
         const links = extractLinks(html, base);
@@ -294,10 +339,11 @@ export class Engage {
           try {
             const abs = new URL(l, base);
             if (
+              depth + 1 <= maxDepth &&
               inScope.some((h) => abs.host === h || abs.host.endsWith(`.${h}`)) &&
               !visited.has(abs.href)
             ) {
-              queue.push(abs.href);
+              queue.push({ url: abs.href, depth: depth + 1 });
             }
           } catch {
             /* ignore */
@@ -329,7 +375,10 @@ export class Engage {
     // Passive fallback: fetch + inspect baseline security headers.
     const s = sid ? store.getSession(sid) : undefined;
     const headers = s ? (await resolveSessionRequest(s, this.fetchImpl)).headers : {};
-    const res = await this.fetchImpl(input.url, { headers });
+    const res = await this.fetchImpl(input.url, {
+      headers,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
     const h = Object.fromEntries(res.headers);
     const missing = BASE_SECURITY_HEADERS.filter((k) => !h[k]);
     return ok(

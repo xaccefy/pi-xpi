@@ -13,6 +13,11 @@ import type { AuthSession } from "./store.ts";
 import { saveSession } from "./store.ts";
 import type { FetchImpl } from "./types.ts";
 
+/** Escape a string for a POSIX single-quoted shell context. */
+function shellSingleQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
 export interface ResolvedAuth {
   /** Headers to attach to web_fetch / agent HTTP calls. */
   headers: Record<string, string>;
@@ -70,7 +75,9 @@ export function buildResolvedAuth(session: AuthSession): ResolvedAuth {
     return {
       headers: cookie ? { Cookie: cookie } : {},
       curlFlags: cookie ? ["--cookie", cookie] : [],
-      curlExample: cookie ? `curl --cookie '${cookie}' https://${host}/` : `curl https://${host}/`,
+      curlExample: cookie
+        ? `curl --cookie ${shellSingleQuote(cookie)} https://${host}/`
+        : `curl https://${host}/`,
     };
   }
 
@@ -80,7 +87,7 @@ export function buildResolvedAuth(session: AuthSession): ResolvedAuth {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       curlFlags: token ? ["-H", `Authorization: Bearer ${token}`] : [],
       curlExample: token
-        ? `curl -H 'Authorization: Bearer ${token}' https://${host}/`
+        ? `curl -H ${shellSingleQuote(`Authorization: Bearer ${token}`)} https://${host}/`
         : `curl https://${host}/`,
     };
   }
@@ -113,7 +120,8 @@ export async function resolveSessionRequest(
   signal?: AbortSignal,
 ): Promise<ResolvedAuth> {
   if (session.mode === "oauth-client-credentials" && isTokenExpired(session)) {
-    const { token, expiresAt } = await fetchClientCredentialsToken(session, signal, fetchImpl);
+    const tokenSignal = signal ?? AbortSignal.timeout(15_000);
+    const { token, expiresAt } = await fetchClientCredentialsToken(session, tokenSignal, fetchImpl);
     const refreshed: AuthSession = { ...session, accessToken: token, expiresAt };
     saveSession(refreshed);
     return buildResolvedAuth(refreshed);
