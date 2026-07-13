@@ -339,7 +339,10 @@ function applyMutation(state: TaskState, action: TaskAction, params: any): Reduc
         );
       }
 
-      if (params.subject !== undefined && (params.subject === null || !String(params.subject).trim())) {
+      if (
+        params.subject !== undefined &&
+        (params.subject === null || !String(params.subject).trim())
+      ) {
         return err("subject cannot be empty");
       }
 

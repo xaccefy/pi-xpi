@@ -261,7 +261,7 @@ describe("pi-xtodo simplified tests", () => {
     assert.ok(onDeleted.content[0].text.includes("is deleted"));
   });
 
-  it("update rejects null subject (not stored as the string \"null\")", async () => {
+  it('update rejects null subject (not stored as the string "null")', async () => {
     const todoTool = pi.tools[0];
     await todoTool.execute("1", { action: "create", subject: "Original" }, null, null, mockCtx);
     const r = await todoTool.execute(

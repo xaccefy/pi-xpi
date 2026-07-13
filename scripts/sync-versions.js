@@ -29,7 +29,6 @@ if (versions.size > 1) {
   process.exit(1);
 }
 
-let totalUpdates = 0;
 for (const [, pkg] of Object.entries(packages)) {
   let updated = false;
 
@@ -40,7 +39,6 @@ for (const [, pkg] of Object.entries(packages)) {
         if (currentVersion !== newVersion) {
           pkg.data.dependencies[depName] = newVersion;
           updated = true;
-          totalUpdates++;
         }
       }
     }
@@ -53,7 +51,6 @@ for (const [, pkg] of Object.entries(packages)) {
         if (currentVersion !== newVersion) {
           pkg.data.devDependencies[depName] = newVersion;
           updated = true;
-          totalUpdates++;
         }
       }
     }
