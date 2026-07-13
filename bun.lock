@@ -17,7 +17,6 @@
         "@earendil-works/pi-coding-agent": "*",
         "@earendil-works/pi-tui": "*",
         "@xaccefy/pi-casefile": "*",
-        "@xaccefy/pi-codeintel": "*",
         "@xaccefy/pi-engage": "*",
         "@xaccefy/pi-exploitsearch": "*",
         "@xaccefy/pi-lookup": "*",
@@ -26,29 +25,13 @@
     },
     "packages/pi-casefile": {
       "name": "@xaccefy/pi-casefile",
-      "version": "0.2.9",
+      "version": "0.3.0",
       "dependencies": {
         "@sinclair/typebox": "^0.32.34",
       },
       "devDependencies": {
         "@types/bun": "^1.3.14",
         "typescript": "^6.0.3",
-      },
-      "peerDependencies": {
-        "@earendil-works/pi-ai": "*",
-        "@earendil-works/pi-coding-agent": "*",
-        "@earendil-works/pi-tui": "*",
-      },
-    },
-    "packages/pi-codeintel": {
-      "name": "@xaccefy/pi-codeintel",
-      "version": "0.2.9",
-      "dependencies": {
-        "@sinclair/typebox": "^0.32.34",
-        "typescript": "^6.0.3",
-      },
-      "devDependencies": {
-        "@types/bun": "^1.3.14",
       },
       "peerDependencies": {
         "@earendil-works/pi-ai": "*",
@@ -58,7 +41,7 @@
     },
     "packages/pi-engage": {
       "name": "@xaccefy/pi-engage",
-      "version": "0.2.9",
+      "version": "0.3.0",
       "dependencies": {
         "@sinclair/typebox": "^0.32.34",
       },
@@ -74,7 +57,7 @@
     },
     "packages/pi-exploitsearch": {
       "name": "@xaccefy/pi-exploitsearch",
-      "version": "0.2.9",
+      "version": "0.3.0",
       "dependencies": {
         "@sinclair/typebox": "^0.32.34",
       },
@@ -90,7 +73,7 @@
     },
     "packages/pi-lookup": {
       "name": "@xaccefy/pi-lookup",
-      "version": "0.2.9",
+      "version": "0.3.0",
       "dependencies": {
         "@sinclair/typebox": "^0.32.34",
         "open-websearch": "^2.1.11",
@@ -107,7 +90,7 @@
     },
     "packages/pi-xtodo": {
       "name": "@xaccefy/pi-xtodo",
-      "version": "0.2.9",
+      "version": "0.3.0",
       "dependencies": {
         "@sinclair/typebox": "^0.32.34",
       },
@@ -298,8 +281,6 @@
     "@types/retry": ["@types/retry@0.12.0", "", {}, "sha512-wWKOClTTiizcZhXnPY4wikVAwmdYHp8q6DmC+EJUzAMsycb7HB32Kh9RN4+0gExjmPmZSAQjgURXIGATPegAvA=="],
 
     "@xaccefy/pi-casefile": ["@xaccefy/pi-casefile@workspace:packages/pi-casefile"],
-
-    "@xaccefy/pi-codeintel": ["@xaccefy/pi-codeintel@workspace:packages/pi-codeintel"],
 
     "@xaccefy/pi-engage": ["@xaccefy/pi-engage@workspace:packages/pi-engage"],
 
