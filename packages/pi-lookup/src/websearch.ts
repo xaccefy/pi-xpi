@@ -256,6 +256,20 @@ export function isPublicHttpHost(parsed: URL): boolean {
   if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
   if (host === "localhost" || host.endsWith(".localhost")) return false;
   if (host === "0.0.0.0" || host === "::1" || host === "::") return false;
+  // IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) — extract the embedded IPv4 and
+  // run the same private-range checks, otherwise it bypasses SSRF filtering.
+  // Node's URL parser normalizes ::ffff:127.0.0.1 to hex form ::ffff:7f00:1.
+  const mapped = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
+  if (mapped) {
+    host = mapped[1];
+  } else {
+    const hexMapped = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+    if (hexMapped) {
+      const g1 = parseInt(hexMapped[1], 16);
+      const g2 = parseInt(hexMapped[2], 16);
+      host = `${(g1 >> 8) & 0xff}.${g1 & 0xff}.${(g2 >> 8) & 0xff}.${g2 & 0xff}`;
+    }
+  }
   // IPv6 ULA (fc00::/7) and link-local (fe80::/10)
   if (/^f[cd][0-9a-f]{0,2}:/i.test(host) || host.startsWith("fe80:")) return false;
   if (

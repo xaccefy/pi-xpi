@@ -20,6 +20,8 @@ export default function piLookup(pi: ExtensionAPI) {
     name: context7Tool.name,
     label: context7Tool.label,
     description: context7Tool.description,
+    promptSnippet: context7Tool.promptSnippet,
+    promptGuidelines: context7Tool.promptGuidelines,
     parameters: context7Tool.parameters,
 
     async execute(_id, params, signal, _onUpdate, _ctx) {
@@ -63,6 +65,8 @@ export default function piLookup(pi: ExtensionAPI) {
     name: deepwikiTool.name,
     label: deepwikiTool.label,
     description: deepwikiTool.description,
+    promptSnippet: deepwikiTool.promptSnippet,
+    promptGuidelines: deepwikiTool.promptGuidelines,
     parameters: deepwikiTool.parameters,
 
     async execute(_id, params, signal, _onUpdate, _ctx) {
