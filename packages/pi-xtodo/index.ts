@@ -339,7 +339,7 @@ function applyMutation(state: TaskState, action: TaskAction, params: any): Reduc
         );
       }
 
-      if (params.subject !== undefined && !String(params.subject).trim()) {
+      if (params.subject !== undefined && (params.subject === null || !String(params.subject).trim())) {
         return err("subject cannot be empty");
       }
 
@@ -386,9 +386,15 @@ function applyMutation(state: TaskState, action: TaskAction, params: any): Reduc
         ...cur,
         status,
         ...(params.subject !== undefined && { subject: String(params.subject).trim() }),
-        ...(params.description !== undefined && { description: params.description }),
-        ...(params.activeForm !== undefined && { activeForm: params.activeForm }),
-        ...(params.owner !== undefined && { owner: params.owner }),
+        ...(params.description !== undefined && {
+          description: params.description === null ? undefined : params.description,
+        }),
+        ...(params.activeForm !== undefined && {
+          activeForm: params.activeForm === null ? undefined : params.activeForm,
+        }),
+        ...(params.owner !== undefined && {
+          owner: params.owner === null ? undefined : params.owner,
+        }),
         blockedBy: blocked.length ? blocked : undefined,
         metadata,
       };
@@ -779,6 +785,9 @@ export default function (pi: ExtensionAPI) {
 
     renderResult(result, _opts, theme, _context) {
       const details = result.details as TaskDetails | undefined;
+      if (details?.error) {
+        return new Text(theme.fg("error", "✗"), 0, 0);
+      }
       let status: TaskStatus | undefined;
       if (details) {
         const p = details.params as any;

@@ -261,6 +261,76 @@ describe("pi-xtodo simplified tests", () => {
     assert.ok(onDeleted.content[0].text.includes("is deleted"));
   });
 
+  it("update rejects null subject (not stored as the string \"null\")", async () => {
+    const todoTool = pi.tools[0];
+    await todoTool.execute("1", { action: "create", subject: "Original" }, null, null, mockCtx);
+    const r = await todoTool.execute(
+      "2",
+      { action: "update", id: 1, subject: null as unknown as string },
+      null,
+      null,
+      mockCtx,
+    );
+    assert.ok(r.isError);
+    assert.ok(r.content[0].text.includes("subject cannot be empty"));
+    // Verify subject wasn't changed to "null".
+    const got = await todoTool.execute("3", { action: "get", id: 1 }, null, null, mockCtx);
+    assert.ok(got.content[0].text.includes("Original"));
+  });
+
+  it("update with null description/activeForm/owner clears the field", async () => {
+    const todoTool = pi.tools[0];
+    await todoTool.execute(
+      "1",
+      {
+        action: "create",
+        subject: "Task with extras",
+        description: "some description",
+        activeForm: "working on it",
+        owner: "agent",
+      },
+      null,
+      null,
+      mockCtx,
+    );
+
+    const r = await todoTool.execute(
+      "2",
+      {
+        action: "update",
+        id: 1,
+        description: null as unknown as string,
+        activeForm: null as unknown as string,
+        owner: null as unknown as string,
+      },
+      null,
+      null,
+      mockCtx,
+    );
+    assert.ok(!r.isError, r.content[0].text);
+
+    const got = await todoTool.execute("3", { action: "get", id: 1 }, null, null, mockCtx);
+    const text = got.content[0].text;
+    assert.ok(!text.includes("description:"), `description should be cleared: ${text}`);
+    assert.ok(!text.includes("activeForm:"), `activeForm should be cleared: ${text}`);
+    assert.ok(!text.includes("owner:"), `owner should be cleared: ${text}`);
+  });
+
+  it("renderResult shows error glyph on failed operations", async () => {
+    const todoTool = pi.tools[0];
+    // Failed create (no subject) with zero existing tasks.
+    const failed = await todoTool.execute(
+      "1",
+      { action: "create", subject: "" },
+      null,
+      null,
+      mockCtx,
+    );
+    assert.ok(failed.isError);
+    const rendered = todoTool.renderResult(failed, {}, { fg: (_c: string, s: string) => s }, {});
+    assert.ok(rendered.text.includes("✗"), `expected error glyph, got: ${rendered.text}`);
+  });
+
   it("allows deep blockedBy chains without false cycle errors", async () => {
     const todoTool = pi.tools[0];
     for (let i = 1; i <= 8; i++) {
