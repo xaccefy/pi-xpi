@@ -47,7 +47,7 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 | /casefile | Case dashboard |
 | /xp | Toggle casefile **XP mode** (cyber workflow injection; **default OFF**) |
 | todo / /todos | Multi-step task lists |
-| Codebase* | AST index, symbols, call graph, architecture |
+| codebase-memory-mcp | Polyglot code indexer (158 languages). Tools: `index_repository`, `search_graph`, `trace_path`, `get_architecture`, `query_graph`. Installed by `install.sh` as an MCP server. |
 
 ## Quick start
 
@@ -59,6 +59,14 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 
 Engagements and pipelines restate the workflow in the prompt body, so they work with XP mode off. Use `/xp on` when you want the full attacker discipline injected every turn.
 
+## Code intelligence (codebase-memory-mcp)
+
+XPI uses [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) as its default code indexer. It's a single static binary that indexes **158 languages** via tree-sitter plus a Hybrid LSP type-resolution layer, exposing 14 MCP tools (`index_repository`, `search_graph`, `trace_path`, `get_architecture`, `query_graph`, `get_code_snippet`, …).
+
+`install.sh` installs it as an MCP server alongside the in-process XPI extensions. For a readable target repo, index once with `index_repository`, then `get_architecture` for layout and `trace_path` to prove source→sink reachability — across Go, Solidity, Python, Rust, TS/JS, and 150+ others.
+
+> The previous in-process `@xaccefy/pi-codeintel` package (TS/JS-only, TypeScript-compiler-based) was removed in favor of this polyglot backend. The agent falls back to `grep`/`read` when no indexer is available.
+
 ## Packages
 
 | Package | npm |
@@ -68,7 +76,6 @@ Engagements and pipelines restate the workflow in the prompt body, so they work 
 | Case ledger | `@xaccefy/pi-casefile` |
 | Lookup | `@xaccefy/pi-lookup` |
 | Exploit search | `@xaccefy/pi-exploitsearch` |
-| Code intel | `@xaccefy/pi-codeintel` |
 | Todos | `@xaccefy/pi-xtodo` |
 
 See each package’s `README.md` under `packages/*/`.
@@ -83,7 +90,7 @@ pi-xpi/
 │   ├── pi-casefile
 │   ├── pi-exploitsearch
 │   ├── pi-lookup
-│   ├── pi-codeintel
+│   ├── pi-engage
 │   └── pi-xtodo
 └── package.json
 ```

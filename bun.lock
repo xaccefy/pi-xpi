@@ -26,7 +26,7 @@
     },
     "packages/pi-casefile": {
       "name": "@xaccefy/pi-casefile",
-      "version": "0.2.5",
+      "version": "0.2.9",
       "dependencies": {
         "@sinclair/typebox": "^0.32.34",
       },
@@ -42,7 +42,7 @@
     },
     "packages/pi-codeintel": {
       "name": "@xaccefy/pi-codeintel",
-      "version": "0.2.5",
+      "version": "0.2.9",
       "dependencies": {
         "@sinclair/typebox": "^0.32.34",
         "typescript": "^6.0.3",
@@ -58,7 +58,7 @@
     },
     "packages/pi-engage": {
       "name": "@xaccefy/pi-engage",
-      "version": "0.2.5",
+      "version": "0.2.9",
       "dependencies": {
         "@sinclair/typebox": "^0.32.34",
       },
@@ -74,7 +74,7 @@
     },
     "packages/pi-exploitsearch": {
       "name": "@xaccefy/pi-exploitsearch",
-      "version": "0.2.5",
+      "version": "0.2.9",
       "dependencies": {
         "@sinclair/typebox": "^0.32.34",
       },
@@ -90,7 +90,7 @@
     },
     "packages/pi-lookup": {
       "name": "@xaccefy/pi-lookup",
-      "version": "0.2.5",
+      "version": "0.2.9",
       "dependencies": {
         "@sinclair/typebox": "^0.32.34",
         "open-websearch": "^2.1.11",
@@ -107,7 +107,7 @@
     },
     "packages/pi-xtodo": {
       "name": "@xaccefy/pi-xtodo",
-      "version": "0.2.5",
+      "version": "0.2.9",
       "dependencies": {
         "@sinclair/typebox": "^0.32.34",
       },

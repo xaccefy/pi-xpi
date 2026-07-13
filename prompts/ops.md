@@ -16,7 +16,7 @@ Follow the XPI evidence-first doctrine: a claim is only real when a PoC on disk 
 - `ExploitSearch` for techniques mapped to the target's stack.
 - `web_search` for CVEs / advisories / prior reports; `context7` / `deepwiki` for framework internals.
 - `web_fetch` to pull the full content of a specific target URL/page when you already have a link.
-- If the target is a codebase you can read, map it first with **codeintel**: `CodebaseGetArchitecture` for layout, `CodebaseFindSymbol` / `CodebaseGetDefinition` to locate sources & sinks, and `CodebaseTraceCallPath` / `CodebaseGetCallGraph` to prove unprivileged reachability.
+- If the target is a codebase you can read, map it first with **codebase-memory-mcp**: `index_repository` (once per repo), then `get_architecture` for layout, `search_graph` to locate sources & sinks by name, and `trace_path` to prove unprivileged reachability. If codebase-memory-mcp isn't installed, fall back to `grep`/`read`.
 
 ## 2. Hypothesis → case
 - `CaseAdd(title: "<short title>", status: hypothesis, endpoint, bugClass, target)` per hypothesis, with the source→sink observation as `evidence`. (`title` is a required field.)

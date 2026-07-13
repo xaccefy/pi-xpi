@@ -57,6 +57,15 @@ for pkg in pi-mcp-adapter @tintinweb/pi-subagents; do
   fi
 done
 
+# codebase-memory-mcp — default code indexer (158 languages, MCP server).
+# Static binary; ships tree-sitter grammars + Hybrid LSP type resolution.
+# Polyglot replacement for the removed in-process codeintel (TS/JS-only) package.
+if ! $PI_BIN install "npm:codebase-memory-mcp" 2>/dev/null; then
+  echo "  pi install failed for codebase-memory-mcp, falling back to npm"
+  npm install --no-save codebase-memory-mcp 2>/dev/null || echo "  (fallback skipped for codebase-memory-mcp)"
+  register_package_in_settings "npm:codebase-memory-mcp"
+fi
+
 # Setup custom subagents & prompts
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 mkdir -p ~/.pi/agent/agents

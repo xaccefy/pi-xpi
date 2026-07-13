@@ -18,8 +18,6 @@
     "packages/pi-casefile/test/**/*.ts",
     "packages/pi-lookup/src/**/*.ts",
     "packages/pi-lookup/test/**/*.ts",
-    "packages/pi-codeintel/src/**/*.ts",
-    "packages/pi-codeintel/test/**/*.ts",
     "packages/pi-xtodo/index.ts",
     "packages/pi-xtodo/test/**/*.ts"
   ]

@@ -1,7 +1,7 @@
 {
   "name": "@xaccefy/pi-xpi",
   "version": "0.2.9",
-  "description": "XPI — offensive security tools for Pi Agent. Casefile tracking, web search, library docs, exploit technique search, code intelligence, todo tracking, and authenticated-session management.",
+  "description": "XPI — offensive security tools for Pi Agent. Casefile tracking, web search, library docs, exploit technique search, todo tracking, and authenticated-session management.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -56,7 +56,6 @@
     "@xaccefy/pi-casefile": "*",
     "@xaccefy/pi-exploitsearch": "*",
     "@xaccefy/pi-lookup": "*",
-    "@xaccefy/pi-codeintel": "*",
     "@xaccefy/pi-xtodo": "*",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
@@ -66,7 +65,6 @@
     "test": "bun test --isolate",
     "test:casefile": "bun test --isolate packages/pi-casefile",
     "test:lookup": "bun test --isolate packages/pi-lookup",
-    "test:codeintel": "bun test --isolate packages/pi-codeintel",
     "test:xtodo": "bun test --isolate packages/pi-xtodo",
     "test:exploitsearch": "bun test --isolate packages/pi-exploitsearch",
     "lint": "biome check .",
