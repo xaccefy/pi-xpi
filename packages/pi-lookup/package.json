@@ -41,7 +41,7 @@
     ]
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.32.34",
+    "@sinclair/typebox": "^0.34.52",
     "open-websearch": "^2.1.11"
   },
   "devDependencies": {
