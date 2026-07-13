@@ -36,6 +36,38 @@ export type CaseSeverity = (typeof SEVERITY_VALUES)[number];
 export const PRIORITY_VALUES = ["P0", "P1", "P2", "P3", "P4"] as const;
 export type CasePriority = (typeof PRIORITY_VALUES)[number];
 
+/** Typed relationship kinds for CaseLink. Input values accepted by the tool. */
+export const LINK_KIND_VALUES = [
+  "duplicate",
+  "related",
+  "blocks",
+  "depends-on",
+  "caused-by",
+  "supersedes",
+  "mitigates",
+  "same-root-cause",
+] as const;
+export type CaseLinkKind = (typeof LINK_KIND_VALUES)[number];
+
+/** Default kind when none is specified (preserves pre-kind behavior). */
+export const DEFAULT_LINK_KIND: CaseLinkKind = "related";
+
+/**
+ * Inverse of each kind, written to the reverse row so a case lists the
+ * relationship from its own perspective. Symmetric kinds map to themselves;
+ * directional kinds produce a display-only converse (never accepted as input).
+ */
+export const LINK_KIND_INVERSE: Record<CaseLinkKind, string> = {
+  duplicate: "duplicate",
+  related: "related",
+  blocks: "blocked-by",
+  "depends-on": "dependency-of",
+  "caused-by": "causes",
+  supersedes: "superseded-by",
+  mitigates: "mitigated-by",
+  "same-root-cause": "same-root-cause",
+};
+
 export const SEARCH_FIELD_VALUES = [
   "title",
   "summary",
@@ -81,7 +113,10 @@ export type CaseRecord = {
   reportedAt?: string;
   /** Path to the generated markdown report (set only by writeCaseReport). */
   reportPath?: string;
+  /** Flat list of linked case IDs (back-compat; derived from linkedCases). */
   linkedCaseIds: string[];
+  /** Linked cases with their relationship kind, from this case's perspective. */
+  linkedCases: { id: string; kind: string }[];
   createdAt: string;
   updatedAt: string;
 };
@@ -133,6 +168,8 @@ export type CaseLinkResult = {
   target: CaseRecord;
   changed: boolean;
   reason?: string;
+  /** Relationship kind as stated by the caller (source → target). */
+  kind: string;
 };
 
 export type CaseSearchOptions = {
@@ -259,11 +296,18 @@ function getDb(): DatabaseSync {
     CREATE TABLE IF NOT EXISTS case_links (
       source_id TEXT,
       target_id TEXT,
+      kind TEXT NOT NULL DEFAULT 'related',
       PRIMARY KEY (source_id, target_id),
       FOREIGN KEY (source_id) REFERENCES cases(id) ON DELETE CASCADE,
       FOREIGN KEY (target_id) REFERENCES cases(id) ON DELETE CASCADE
     )
   `);
+  // Pre-kind ledgers lack the column; add it idempotently. SQLite has no
+  // ADD COLUMN IF NOT EXISTS, so guard via pragma table_info.
+  const linkCols = db.prepare("PRAGMA table_info(case_links)").all() as { name: string }[];
+  if (!linkCols.some((c) => c.name === "kind")) {
+    db.exec("ALTER TABLE case_links ADD COLUMN kind TEXT NOT NULL DEFAULT 'related'");
+  }
 
   // Indexes
   db.exec(`CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status)`);
@@ -276,7 +320,7 @@ function getDb(): DatabaseSync {
 }
 
 // Helper to map DB row to CaseRecord
-function mapRow(row: any, linkedCaseIds: string[] = []): CaseRecord {
+function mapRow(row: any, linkedCases: { id: string; kind: string }[] = []): CaseRecord {
   /** Safely parse a JSON column; returns [] for arrays, undefined for objects. */
   const safeParseArray = (raw: unknown): string[] => {
     if (!raw) return [];
@@ -320,7 +364,8 @@ function mapRow(row: any, linkedCaseIds: string[] = []): CaseRecord {
     pocVerified: safeParseObject(row.poc_verified_json),
     reportedAt: row.reported_at || undefined,
     reportPath: row.report_path || undefined,
-    linkedCaseIds,
+    linkedCases,
+    linkedCaseIds: linkedCases.map((l) => l.id),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -335,14 +380,14 @@ export function readCasefile(): CaseRecord[] {
   const stmt = db.prepare("SELECT * FROM cases");
   const rows = stmt.all();
 
-  // Read all links to construct linkedCaseIds map
-  const linkStmt = db.prepare("SELECT source_id, target_id FROM case_links");
-  const links = linkStmt.all() as { source_id: string; target_id: string }[];
+  // Read all links to construct linkedCases map
+  const linkStmt = db.prepare("SELECT source_id, target_id, kind FROM case_links");
+  const links = linkStmt.all() as { source_id: string; target_id: string; kind: string }[];
 
-  const linkMap = new Map<string, string[]>();
+  const linkMap = new Map<string, { id: string; kind: string }[]>();
   for (const link of links) {
     if (!linkMap.has(link.source_id)) linkMap.set(link.source_id, []);
-    linkMap.get(link.source_id)?.push(link.target_id);
+    linkMap.get(link.source_id)?.push({ id: link.target_id, kind: link.kind });
   }
 
   return rows.map((row: any) => mapRow(row, linkMap.get(row.id) ?? []));
@@ -354,12 +399,12 @@ export function getCaseById(id: string): CaseRecord | undefined {
   const row = stmt.get(id);
   if (!row) return undefined;
 
-  const linkStmt = db.prepare("SELECT target_id FROM case_links WHERE source_id = ?");
-  const links = linkStmt.all(id) as { target_id: string }[];
+  const linkStmt = db.prepare("SELECT target_id, kind FROM case_links WHERE source_id = ?");
+  const links = linkStmt.all(id) as { target_id: string; kind: string }[];
 
   return mapRow(
     row,
-    links.map((l) => l.target_id),
+    links.map((l) => ({ id: l.target_id, kind: l.kind })),
   );
 }
 
@@ -510,6 +555,7 @@ function buildRecord(input: NormalizedCaseInput, existing?: CaseRecord): CaseRec
     pocVerified: input.pocVerified ?? existing?.pocVerified,
     reportedAt: input.reportedAt ?? existing?.reportedAt,
     reportPath: input.reportPath ?? existing?.reportPath,
+    linkedCases: existing?.linkedCases ?? [],
     linkedCaseIds: existing?.linkedCaseIds ?? [],
     createdAt: existing?.createdAt ?? timestamp,
     updatedAt: timestamp,
@@ -543,11 +589,11 @@ function findDuplicateCaseInDb(
       normalizeMatchText(row.bugClass as string) === bugClass
     ) {
       const links = db
-        .prepare("SELECT target_id FROM case_links WHERE source_id = ?")
-        .all(row.id) as { target_id: string }[];
+        .prepare("SELECT target_id, kind FROM case_links WHERE source_id = ?")
+        .all(row.id) as { target_id: string; kind: string }[];
       return mapRow(
         row,
-        links.map((l) => l.target_id),
+        links.map((l) => ({ id: l.target_id, kind: l.kind })),
       );
     }
   }
@@ -709,7 +755,7 @@ export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResu
 
   // Check material equality (we ignore links since links are mutated via CaseLink)
   const norm = (r: CaseRecord) =>
-    JSON.stringify({ ...r, updatedAt: "", createdAt: "", linkedCaseIds: [] });
+    JSON.stringify({ ...r, updatedAt: "", createdAt: "", linkedCaseIds: [], linkedCases: [] });
   if (norm(current) === norm(next)) {
     const reason =
       update.status && update.status === current.status
@@ -789,11 +835,15 @@ export function promoteFindingResult(id: string, verification: PocVerification):
 
 // ── Link operations ──────────────────────────────────────────────────
 
-export function linkCasesResult(sourceId: string, targetId: string): CaseLinkResult {
+export function linkCasesResult(sourceId: string, targetId: string, kind?: string): CaseLinkResult {
   const db = getDb();
   if (sourceId === targetId) {
     throw new Error("Cannot link a case to itself");
   }
+  const resolvedKind: CaseLinkKind =
+    kind && (LINK_KIND_VALUES as readonly string[]).includes(kind)
+      ? (kind as CaseLinkKind)
+      : DEFAULT_LINK_KIND;
   const source = getCaseById(sourceId);
   const target = getCaseById(targetId);
   if (!source) throw new Error(`Case not found: ${sourceId}`);
@@ -805,19 +855,30 @@ export function linkCasesResult(sourceId: string, targetId: string): CaseLinkRes
     throw new Error(`Cannot link terminal case ${targetId} (${target.status})`);
   }
 
-  const checkStmt = db.prepare("SELECT 1 FROM case_links WHERE source_id = ? AND target_id = ?");
-  const exists = checkStmt.get(sourceId, targetId);
+  const checkStmt = db.prepare("SELECT kind FROM case_links WHERE source_id = ? AND target_id = ?");
+  const existing = checkStmt.get(sourceId, targetId) as { kind: string } | undefined;
 
-  if (exists) {
-    return { source, target, changed: false, reason: "Cases are already linked" };
+  if (existing) {
+    return {
+      source,
+      target,
+      changed: false,
+      reason: "Cases are already linked",
+      kind: existing.kind,
+    };
   }
 
-  // Atomic insert both directions into junction table
+  // Atomic insert both directions: source→target keeps the stated kind, the
+  // reverse row stores the inverse so each case lists the edge from its own
+  // perspective.
+  const inverseKind = LINK_KIND_INVERSE[resolvedKind];
   db.exec("BEGIN");
   try {
-    const linkStmt = db.prepare("INSERT INTO case_links (source_id, target_id) VALUES (?, ?)");
-    linkStmt.run(sourceId, targetId);
-    linkStmt.run(targetId, sourceId);
+    const linkStmt = db.prepare(
+      "INSERT INTO case_links (source_id, target_id, kind) VALUES (?, ?, ?)",
+    );
+    linkStmt.run(sourceId, targetId, resolvedKind);
+    linkStmt.run(targetId, sourceId, inverseKind);
 
     const now = new Date().toISOString();
     const updateTimeStmt = db.prepare("UPDATE cases SET updated_at = ? WHERE id = ?");
@@ -835,7 +896,7 @@ export function linkCasesResult(sourceId: string, targetId: string): CaseLinkRes
 
   const finalSource = getCaseById(sourceId)!;
   const finalTarget = getCaseById(targetId)!;
-  return { source: finalSource, target: finalTarget, changed: true };
+  return { source: finalSource, target: finalTarget, changed: true, kind: resolvedKind };
 }
 
 export function unlinkCasesResult(sourceId: string, targetId: string): CaseLinkResult {
@@ -851,11 +912,11 @@ export function unlinkCasesResult(sourceId: string, targetId: string): CaseLinkR
     throw new Error(`Cannot unlink terminal case ${targetId} (${target.status})`);
   }
 
-  const checkStmt = db.prepare("SELECT 1 FROM case_links WHERE source_id = ? AND target_id = ?");
-  const exists = checkStmt.get(sourceId, targetId);
+  const checkStmt = db.prepare("SELECT kind FROM case_links WHERE source_id = ? AND target_id = ?");
+  const existing = checkStmt.get(sourceId, targetId) as { kind: string } | undefined;
 
-  if (!exists) {
-    return { source, target, changed: false, reason: "Cases are not linked" };
+  if (!existing) {
+    return { source, target, changed: false, reason: "Cases are not linked", kind: "related" };
   }
 
   db.exec("BEGIN");
@@ -881,7 +942,7 @@ export function unlinkCasesResult(sourceId: string, targetId: string): CaseLinkR
 
   const finalSource = getCaseById(sourceId)!;
   const finalTarget = getCaseById(targetId)!;
-  return { source: finalSource, target: finalTarget, changed: true };
+  return { source: finalSource, target: finalTarget, changed: true, kind: existing.kind };
 }
 
 // ── Search & Queries ─────────────────────────────────────────────────
@@ -986,18 +1047,20 @@ function buildCaseWhere(options: CaseSearchOptions): {
   };
 }
 
-/** Map DB rows to CaseRecords, attaching linkedCaseIds fetched in a single batch. */
+/** Map DB rows to CaseRecords, attaching linkedCases fetched in a single batch. */
 function mapRowsWithLinks(db: DatabaseSync, rows: any[]): CaseRecord[] {
   if (rows.length === 0) return [];
   const ids = rows.map((r) => r.id);
   const placeholders = ids.map(() => "?").join(",");
   const links = db
-    .prepare(`SELECT source_id, target_id FROM case_links WHERE source_id IN (${placeholders})`)
-    .all(...ids) as { source_id: string; target_id: string }[];
-  const linkMap = new Map<string, string[]>();
+    .prepare(
+      `SELECT source_id, target_id, kind FROM case_links WHERE source_id IN (${placeholders})`,
+    )
+    .all(...ids) as { source_id: string; target_id: string; kind: string }[];
+  const linkMap = new Map<string, { id: string; kind: string }[]>();
   for (const l of links) {
     if (!linkMap.has(l.source_id)) linkMap.set(l.source_id, []);
-    linkMap.get(l.source_id)!.push(l.target_id);
+    linkMap.get(l.source_id)!.push({ id: l.target_id, kind: l.kind });
   }
   return rows.map((row) => mapRow(row, linkMap.get(row.id) ?? []));
 }
@@ -1046,6 +1109,9 @@ export function countCases(): {
 // ── Format helpers ───────────────────────────────────────────────────
 
 export function formatCase(record: CaseRecord): string {
+  const linkBits = record.linkedCases.map((l) =>
+    l.kind && l.kind !== DEFAULT_LINK_KIND ? `${l.id}:${l.kind}` : l.id,
+  );
   const bits = [
     `${record.id} [${record.status}/${record.confidence}] ${record.title}`,
     record.priority ? `priority=${record.priority}` : undefined,
@@ -1055,7 +1121,7 @@ export function formatCase(record: CaseRecord): string {
     record.endpoint ? `endpoint=${record.endpoint}` : undefined,
     record.target ? `target=${record.target}` : undefined,
     record.tags?.length ? `tags=${record.tags.join(",")}` : undefined,
-    record.linkedCaseIds.length ? `links=${record.linkedCaseIds.join(",")}` : undefined,
+    linkBits.length ? `links=${linkBits.join(",")}` : undefined,
     record.nextStep ? `next=${record.nextStep}` : undefined,
   ].filter(Boolean);
   return bits.join(" | ");
@@ -1072,15 +1138,22 @@ export function formatCaseDetail(record: CaseRecord): string {
     if (
       !val ||
       (Array.isArray(val) && !val.length) ||
-      ["id", "createdAt", "updatedAt"].includes(key)
+      ["id", "createdAt", "updatedAt", "linkedCaseIds"].includes(key)
     )
       continue;
     const label = key.charAt(0).toUpperCase() + key.slice(1).replace(/([A-Z])/g, " $1");
-    const display = Array.isArray(val)
-      ? val.join(", ")
-      : typeof val === "object"
-        ? JSON.stringify(val)
-        : val;
+    let display: string;
+    if (key === "linkedCases") {
+      display = (val as { id: string; kind: string }[])
+        .map((l) => `${l.id} (${l.kind})`)
+        .join(", ");
+    } else if (Array.isArray(val)) {
+      display = val.join(", ");
+    } else if (typeof val === "object") {
+      display = JSON.stringify(val);
+    } else {
+      display = String(val);
+    }
     lines.push(`${label.padEnd(12)} ${display}`);
   }
   return lines

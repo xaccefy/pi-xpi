@@ -143,6 +143,43 @@ describe("casefile sqlite ledger", () => {
     assert.ok(reloaded?.linkedCaseIds.includes(b.id));
   });
 
+  it("records and surfaces a typed relationship kind on links", () => {
+    const a = addCase({ title: "Root cause A" });
+    const b = addCase({ title: "Symptom B" });
+
+    // Default kind is "related" when omitted (back-compat with pre-kind links).
+    const plain = linkCasesResult(a.id, b.id);
+    assert.strictEqual(plain.changed, true);
+    assert.strictEqual(plain.kind, "related");
+    const reloadedA = readCasefile().find((c) => c.id === a.id)!;
+    assert.ok(reloadedA.linkedCases.some((l) => l.id === b.id && l.kind === "related"));
+    assert.ok(reloadedA.linkedCaseIds.includes(b.id));
+    unlinkCasesResult(a.id, b.id);
+
+    // Directional kind: source→target keeps the stated kind; the reverse row
+    // stores the inverse so each case lists the edge from its own perspective.
+    const typed = linkCasesResult(a.id, b.id, "caused-by");
+    assert.strictEqual(typed.changed, true);
+    assert.strictEqual(typed.kind, "caused-by");
+    const afterA = readCasefile().find((c) => c.id === a.id)!;
+    const afterB = readCasefile().find((c) => c.id === b.id)!;
+    assert.ok(afterA.linkedCases.some((l) => l.id === b.id && l.kind === "caused-by"));
+    assert.ok(afterB.linkedCases.some((l) => l.id === a.id && l.kind === "causes"));
+
+    // Symmetric kind maps to itself on both sides.
+    unlinkCasesResult(a.id, b.id);
+    linkCasesResult(a.id, b.id, "duplicate");
+    const dupA = readCasefile().find((c) => c.id === a.id)!;
+    const dupB = readCasefile().find((c) => c.id === b.id)!;
+    assert.ok(dupA.linkedCases.some((l) => l.id === b.id && l.kind === "duplicate"));
+    assert.ok(dupB.linkedCases.some((l) => l.id === a.id && l.kind === "duplicate"));
+
+    // Unknown kind falls back to the default rather than throwing.
+    unlinkCasesResult(a.id, b.id);
+    const fallback = linkCasesResult(a.id, b.id, "nonsense" as unknown as string);
+    assert.strictEqual(fallback.kind, "related");
+  });
+
   it("promotes hypothesis → investigating using evidence already on the case", () => {
     const record = addCase({
       title: "IDOR with prior evidence",

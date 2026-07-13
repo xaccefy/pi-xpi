@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { describe, expect, it } from "bun:test";
 
 /**
- * Fidelity test for the `PRAGMA foreign_keys = ON` fix in ledger/codeintel `getDb`.
+ * Fidelity test for the `PRAGMA foreign_keys = ON` fix in the ledger `getDb`.
  *
  * The CI test suite uses `bun:sqlite`, where FK enforcement defaults OFF — so the
  * `ON DELETE CASCADE` clauses in the schema are silently no-ops unless the pragma is

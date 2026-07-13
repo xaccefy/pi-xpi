@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -36,15 +36,9 @@ mock.module("@earendil-works/pi-tui", () => ({
   truncateToWidth: (value: string, width: number) => value.slice(0, width),
 }));
 
-mock.module("../src/poc-runner.ts", () => ({
-  runPoc: () => ({
-    path: "/mock/poc.sh",
-    exitCode: 0,
-    output: "ok",
-    ranAt: "2024-01-01T00:00:00Z",
-    sandbox: true,
-  }),
-}));
+// NOTE: Do NOT mock poc-runner.ts here — mock.module() is process-global in Bun
+// and would replace the real runPoc for every test file in the same run.
+// Instead we create a real temp PoC script in beforeEach and pass local:true.
 
 type FakePi = {
   tools: Map<string, any>;
@@ -56,6 +50,7 @@ type FakePi = {
 };
 
 let tempDir: string;
+let pocScriptPath: string;
 let casefileExtension: (pi: any) => void;
 
 function createFakePi(): FakePi {
@@ -84,11 +79,15 @@ async function executeTool(pi: FakePi, name: string, params: Record<string, unkn
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), "casefile-index-test-"));
   setCasefilePath(join(tempDir, "casefile.db"));
+  pocScriptPath = join(tempDir, "poc.sh");
+  writeFileSync(pocScriptPath, "#!/bin/sh\nprintf 'ok'", "utf8");
+  process.env.PI_POC_ROOT = tempDir;
   casefileExtension = (await import("../src/index.ts")).default;
 });
 
 afterEach(async () => {
   setCasefilePath(undefined);
+  delete process.env.PI_POC_ROOT;
   await rm(tempDir, { recursive: true, force: true });
 });
 
@@ -118,7 +117,7 @@ describe("casefile extension", () => {
     expect(addProperties.linked_case_ids).toBeUndefined();
     expect(updateProperties.linked_case_ids).toBeUndefined();
     const field = pi.tools.get("CaseSearch").parameters.properties.field;
-    const values = field.anyOf.map((f: any) => f.const);
+    const values = field.enum as string[];
     expect(values).toContain("poc");
   });
 
@@ -160,7 +159,8 @@ describe("casefile extension", () => {
 
     const promoted = await executeTool(pi, "PromoteFinding", {
       id: record.id,
-      poc_path: "/mock/poc.sh",
+      poc_path: pocScriptPath,
+      local: true,
     });
     expect(promoted.details.record.status).toBe("confirmed");
     expect(promoted.details.record.pocVerified?.exitCode).toBe(0);
@@ -254,6 +254,29 @@ describe("casefile extension", () => {
     expect(duplicateUnlink.content[0].text).toContain("Unlink unchanged");
   });
 
+  test("CaseLink records a typed relationship kind and surfaces it", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+
+    const first = await executeTool(pi, "CaseAdd", { title: "Auth bypass root" });
+    const second = await executeTool(pi, "CaseAdd", { title: "Token leak symptom" });
+
+    const linked = await executeTool(pi, "CaseLink", {
+      source_id: first.details.record.id,
+      target_id: second.details.record.id,
+      kind: "caused-by",
+    });
+    expect(linked.details.changed).toBe(true);
+    expect(linked.details.kind).toBe("caused-by");
+    expect(linked.content[0].text).toContain("[caused-by]");
+    // Inverse is written to the reverse row so the target sees "causes".
+    expect(linked.details.target.linkedCases).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: first.details.record.id, kind: "causes" }),
+      ]),
+    );
+  });
+
   test("XP mode is off by default: before_agent_start injects nothing", async () => {
     const previous = process.env.PI_XP_MODE;
     delete process.env.PI_XP_MODE;
@@ -331,7 +354,8 @@ describe("casefile extension", () => {
       });
       await executeTool(pi, "PromoteFinding", {
         id: reported.details.record.id,
-        poc_path: "/mock/poc.sh",
+        poc_path: pocScriptPath,
+        local: true,
       });
       await executeTool(pi, "CaseReport", { id: reported.details.record.id });
       await executeTool(pi, "CaseUpdate", {
@@ -440,7 +464,8 @@ describe("casefile extension", () => {
     });
     await executeTool(pi, "PromoteFinding", {
       id: storedXss.details.record.id,
-      poc_path: "/mock/poc.sh",
+      poc_path: pocScriptPath,
+      local: true,
     });
 
     const notifications: string[] = [];

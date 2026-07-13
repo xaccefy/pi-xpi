@@ -30,6 +30,7 @@ import {
   formatCases,
   getCaseById,
   getCasefilePath,
+  LINK_KIND_VALUES,
   linkCasesResult,
   PRIORITY_VALUES,
   promoteFindingResult,
@@ -46,10 +47,13 @@ import { runPoc } from "./poc-runner.ts";
 
 // ── Schemas ───────────────────────────────────────────────────────────
 
-const CaseStatusSchema = Type.Union(STATUS_VALUES.map((v) => Type.Literal(v)));
-const CaseConfidenceSchema = Type.Union(CONFIDENCE_VALUES.map((v) => Type.Literal(v)));
-const CaseSeveritySchema = Type.Union(SEVERITY_VALUES.map((v) => Type.Literal(v)));
-const CasePrioritySchema = Type.Union(PRIORITY_VALUES.map((v) => Type.Literal(v)));
+// Provider-safe string enums: Type.String({ enum }) serializes as { type: "string", enum: [...] }.
+// Do NOT use Type.Union(Type.Literal...) → anyOf/const (providers drop optional anyOf fields,
+// so status-only / severity-only updates arrive empty and silently no-op).
+const CaseStatusSchema = Type.String({ enum: [...STATUS_VALUES] });
+const CaseConfidenceSchema = Type.String({ enum: [...CONFIDENCE_VALUES] });
+const CaseSeveritySchema = Type.String({ enum: [...SEVERITY_VALUES] });
+const CasePrioritySchema = Type.String({ enum: [...PRIORITY_VALUES] });
 
 const CommonFields = {
   status: Type.Optional(CaseStatusSchema),
@@ -146,12 +150,10 @@ const SearchSchema = Type.Object(
   {
     query: Type.String({ description: "Text to search across cases" }),
     field: Type.Optional(
-      Type.Union(
-        SEARCH_FIELD_VALUES.map((v) => Type.Literal(v)),
-        {
-          description: "Restrict search to a specific field",
-        },
-      ),
+      Type.String({
+        enum: [...SEARCH_FIELD_VALUES],
+        description: "Restrict search to a specific field",
+      }),
     ),
     status: Type.Optional(CaseStatusSchema),
     confidence: Type.Optional(CaseConfidenceSchema),
@@ -177,6 +179,13 @@ const LinkSchema = Type.Object(
   {
     source_id: Type.String({ description: "First case ID" }),
     target_id: Type.String({ description: "Second case ID to link" }),
+    kind: Type.Optional(
+      Type.String({
+        enum: [...LINK_KIND_VALUES],
+        description:
+          "Relationship kind from source to target: duplicate | related | blocks | depends-on | caused-by | supersedes | mitigates | same-root-cause. Defaults to related.",
+      }),
+    ),
   },
   { additionalProperties: false },
 );
@@ -967,19 +976,28 @@ export default function casefileExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "CaseLink",
     label: "Link Cases",
-    description: "Bidirectionally link two cases. Use to build exploit chains.",
+    description:
+      "Bidirectionally link two cases. Use to build exploit chains. Optional `kind` records the relationship (duplicate | related | blocks | depends-on | caused-by | supersedes | mitigates | same-root-cause).",
     promptSnippet: "Link two cases into an exploit chain",
+    promptGuidelines: [
+      "Use CaseLink to bidirectionally link two cases. Pass `kind` to record how they relate (duplicate, blocks, caused-by, supersedes, etc.); omit it for a plain chain link (defaults to related).",
+    ],
     parameters: LinkSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const result = linkCasesResult(params.source_id as string, params.target_id as string);
+      const result = linkCasesResult(
+        params.source_id as string,
+        params.target_id as string,
+        params.kind as string | undefined,
+      );
       const { source, target } = result;
+      const kindLabel = result.kind ? ` [${result.kind}]` : "";
       return {
         content: [
           {
             type: "text",
             text: result.changed
-              ? `Linked:\n  ${formatCase(source)}\n  ↔\n  ${formatCase(target)}`
+              ? `Linked${kindLabel}:\n  ${formatCase(source)}\n  ↔\n  ${formatCase(target)}`
               : `Link unchanged: ${result.reason ?? "no material change"}\n  ${formatCase(source)}\n  ↔\n  ${formatCase(target)}`,
           },
         ],
@@ -988,16 +1006,18 @@ export default function casefileExtension(pi: ExtensionAPI) {
           target,
           changed: result.changed,
           reason: result.reason,
+          kind: result.kind,
         },
       };
     },
 
     renderCall(args, theme) {
+      const kind = args.kind ? ` [${args.kind}]` : "";
       return new Text(
         theme.fg("toolTitle", theme.bold("CaseLink ")) +
           theme.fg(
             "dim",
-            `${(args.source_id as string) ?? ""} ↔ ${(args.target_id as string) ?? ""}`,
+            `${(args.source_id as string) ?? ""} ↔ ${(args.target_id as string) ?? ""}${kind}`,
           ),
         0,
         0,
@@ -1006,11 +1026,12 @@ export default function casefileExtension(pi: ExtensionAPI) {
 
     renderResult(result, _options, theme) {
       const details = result.details as
-        | { source?: CaseRecord; target?: CaseRecord; changed?: boolean }
+        | { source?: CaseRecord; target?: CaseRecord; changed?: boolean; kind?: string }
         | undefined;
       if (!details?.source || !details?.target) {
         return new Text("Linked", 0, 0);
       }
+      const kindLabel = details.kind ? ` [${details.kind}]` : "";
       return new Text(
         theme.fg(
           details.changed === false ? "warning" : "success",
@@ -1018,7 +1039,8 @@ export default function casefileExtension(pi: ExtensionAPI) {
         ) +
           theme.fg("accent", details.source.id) +
           " ↔ " +
-          theme.fg("accent", details.target.id),
+          theme.fg("accent", details.target.id) +
+          kindLabel,
         0,
         0,
       );
@@ -1054,6 +1076,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
           target,
           changed: result.changed,
           reason: result.reason,
+          kind: result.kind,
         },
       };
     },
