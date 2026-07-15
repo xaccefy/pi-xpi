@@ -30,6 +30,7 @@
   "files": [
     "src/index.ts",
     "src/engage.ts",
+    "src/inbox.ts",
     "src/credential.ts",
     "src/store.ts",
     "src/types.ts",
