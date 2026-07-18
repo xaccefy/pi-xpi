@@ -131,4 +131,52 @@ describe("pi-lookup deepwiki", () => {
     expect(r2.content[0].text).toBe("Vue answer");
     expect(calls).toBe(1);
   });
+
+  it("sends repoName (not repo) as the MCP tool argument", async () => {
+    let capturedBody: any;
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      capturedBody = JSON.parse(init?.body as string);
+      return {
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            jsonrpc: "2.0",
+            result: { content: [{ type: "text", text: "ok" }] },
+          }),
+      } as Response;
+    }) as any;
+
+    await deepwikiTool.execute("call1", { repo: "facebook/react", question: "wire format?" });
+
+    expect(capturedBody.method).toBe("tools/call");
+    expect(capturedBody.params.name).toBe("ask_question");
+    expect(capturedBody.params.arguments.repoName).toBe("facebook/react");
+    expect(capturedBody.params.arguments.question).toBe("wire format?");
+    expect(capturedBody.params.arguments).not.toHaveProperty("repo");
+  });
+
+  it("surfaces DeepWiki schema validation errors from isError envelopes", async () => {
+    globalThis.fetch = (async (_url: string | URL | Request, _init?: RequestInit) => {
+      return {
+        ok: true,
+        text: async () =>
+          JSON.stringify({
+            jsonrpc: "2.0",
+            result: {
+              content: [
+                {
+                  type: "text",
+                  text: "1 validation error for call[ask_question]\nrepoName\n  Missing required argument",
+                },
+              ],
+              isError: true,
+            },
+          }),
+      } as Response;
+    }) as any;
+
+    await expect(
+      deepwikiTool.execute("call1", { repo: "facebook/react", question: "boom?" }),
+    ).rejects.toThrow(/validation error for call\[ask_question\]/);
+  });
 });

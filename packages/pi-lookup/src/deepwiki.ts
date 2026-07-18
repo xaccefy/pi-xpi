@@ -122,7 +122,8 @@ export const deepwikiTool = {
           jsonrpc: "2.0",
           id: 1,
           method: "tools/call",
-          params: { name: DEEPWIKI_TOOL, arguments: { repo, question } },
+          // DeepWiki's ask_question schema requires "repoName" (not "repo").
+          params: { name: DEEPWIKI_TOOL, arguments: { repoName: repo, question } },
         });
 
         const response = await fetch(DEEPWIKI_MCP_URL, {
