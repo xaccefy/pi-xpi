@@ -1,8 +1,8 @@
 import assert from "node:assert";
-import { unlinkSync } from "node:fs";
-import { homedir } from "node:os";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, it } from "node:test";
+import { after, beforeEach, describe, it } from "node:test";
 import { MockExtensionAPI } from "../../../test-utils.ts";
 import {
   __replayComputeCount,
@@ -10,6 +10,13 @@ import {
   default as registerTodo,
   TodoParamsSchema,
 } from "../index.ts";
+
+// Hermetic persistence: never touch the real ~/.pi/xtodo from tests.
+const TEST_XTODO_DIR = mkdtempSync(join(tmpdir(), "pi-xtodo-test-"));
+process.env.PI_XTODO_DIR = TEST_XTODO_DIR;
+after(() => {
+  rmSync(TEST_XTODO_DIR, { recursive: true, force: true });
+});
 
 class MockSessionManager {
   sessionId = "test-session";
@@ -203,13 +210,6 @@ describe("pi-xtodo simplified tests", () => {
 
     const listResult = await todoTool.execute("2", { action: "list" }, null, null, mockCtx);
     assert.ok(listResult.content[0].text.includes("#1 Persisted task"));
-
-    // Clean up the persisted file for this isolated session id.
-    try {
-      unlinkSync(join(homedir(), ".pi", "xtodo", "persist-test-session.json"));
-    } catch {
-      // File may not exist.
-    }
   });
 
   it("update accepts string ids (LLM tool-call coercion)", async () => {

@@ -115,8 +115,10 @@ const sessions = new Map<string, TaskState>();
 let activeRenderSession = "";
 
 // Replay cache: avoid rescanning the entire branch message history on every
-// session event when nothing has changed (keyed by session id + branch length).
-const replayCache = new Map<string, { len: number; state: TaskState }>();
+// session event when nothing has changed. Keyed by session id; validated by
+// branch length AND tail-entry identity, so a same-length branch rewrite
+// (e.g. two consecutive compacts) cannot serve a stale snapshot.
+const replayCache = new Map<string, { len: number; tail: unknown; state: TaskState }>();
 
 // Test seam: how many times replayFromBranch actually recomputed state (vs. served
 // a cache hit). Exposed via __replayComputeCount so tests can assert the cache-skip fires.
@@ -124,8 +126,12 @@ let replayComputeCount = 0;
 
 // Disk persistence: survive agent/session restarts. The branch message history
 // remains the source of truth; this is a fallback when history isn't replayed yet.
-const XTODO_DIR = join(homedir(), ".pi", "xtodo");
-/** Reject path separators / traversal so session ids cannot escape XTODO_DIR. */
+// Resolved lazily so tests can redirect via PI_XTODO_DIR.
+function xtodoDir(): string {
+  const fromEnv = process.env.PI_XTODO_DIR?.trim();
+  return fromEnv || join(homedir(), ".pi", "xtodo");
+}
+/** Reject path separators / traversal so session ids cannot escape the xtodo dir. */
 function safeSessionFileId(id: string): string {
   const cleaned = String(id ?? "")
     .replace(/[^a-zA-Z0-9._-]+/g, "_")
@@ -134,11 +140,12 @@ function safeSessionFileId(id: string): string {
   return cleaned || "default";
 }
 function persistPath(id: string): string {
-  return join(XTODO_DIR, `${safeSessionFileId(id)}.json`);
+  return join(xtodoDir(), `${safeSessionFileId(id)}.json`);
 }
 function saveSessionState(id: string, state: TaskState): void {
   try {
-    if (!existsSync(XTODO_DIR)) mkdirSync(XTODO_DIR, { recursive: true });
+    const dir = xtodoDir();
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     writeFileSync(persistPath(id), JSON.stringify(state), "utf8");
   } catch {
     // Best-effort persistence.
@@ -166,8 +173,9 @@ export function replayFromBranch(ctx: any): TaskState {
   const id = sid(ctx);
   const branch = ctx.sessionManager.getBranch();
   const len = branch.length;
+  const tail = len > 0 ? branch[len - 1] : undefined;
   const cached = replayCache.get(id);
-  if (cached && cached.len === len) {
+  if (cached && cached.len === len && cached.tail === tail) {
     return cached.state;
   }
   replayComputeCount++;
@@ -184,7 +192,7 @@ export function replayFromBranch(ctx: any): TaskState {
       };
     }
   }
-  replayCache.set(id, { len, state: result });
+  replayCache.set(id, { len, tail, state: result });
   return result;
 }
 
@@ -719,18 +727,20 @@ export default function (pi: ExtensionAPI) {
     parameters: TodoParamsSchema,
 
     // Coerce common LLM shapes before schema validation (string ids, etc.).
+    // Uses the same strict rules as the reducer's coerceId, so an input is
+    // either accepted or rejected identically on both paths (no "1e2" → 100).
     prepareArguments: (args: unknown) => {
       const a = { ...((args ?? {}) as Record<string, unknown>) };
       if (a.id !== undefined && a.id !== null && typeof a.id !== "number") {
-        const n = Number(a.id);
-        if (Number.isInteger(n) && n > 0) a.id = n;
+        const n = coerceId(a.id);
+        if (n !== undefined) a.id = n;
       }
       for (const key of ["blockedBy", "addBlockedBy", "removeBlockedBy"] as const) {
         if (!Array.isArray(a[key])) continue;
         a[key] = (a[key] as unknown[]).map((v) => {
           if (typeof v === "number") return v;
-          const n = Number(v);
-          return Number.isInteger(n) ? n : v;
+          const n = coerceId(v);
+          return n !== undefined ? n : v;
         });
       }
       return a;
@@ -890,7 +900,11 @@ export default function (pi: ExtensionAPI) {
     let isForeground = false;
     try {
       const id = sid(ctx);
-      sessions.set(id, resolveStateForRefresh(ctx));
+      const state = resolveStateForRefresh(ctx);
+      sessions.set(id, state);
+      // Keep disk converged with the replayed/live state — otherwise a restart
+      // restores an older disk copy while the branch shows something newer.
+      saveSessionState(id, state);
       isForeground = id === activeRenderSession;
     } catch (e) {
       if (!/stale after session replacement/.test(String(e))) throw e;
@@ -913,7 +927,11 @@ export default function (pi: ExtensionAPI) {
         const restored = restoreSessionState(id);
         const state = restored ?? freshState();
         sessions.set(id, state);
-        replayCache.set(id, { len: branch.length, state });
+        replayCache.set(id, {
+          len: branch.length,
+          tail: branch.length > 0 ? branch[branch.length - 1] : undefined,
+          state,
+        });
       }
     } catch (e) {
       if (!/stale after session replacement/.test(String(e))) throw e;

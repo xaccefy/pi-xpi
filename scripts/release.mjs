@@ -9,6 +9,9 @@ const BUMP_TYPES = new Set(["major", "minor", "patch"]);
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 
 if (!RELEASE_TARGET || (!BUMP_TYPES.has(RELEASE_TARGET) && !SEMVER_RE.test(RELEASE_TARGET))) {
+  console.error(
+    `error: invalid release target "${RELEASE_TARGET ?? ""}" — expected major|minor|patch or an x.y.z version`,
+  );
   process.exit(1);
 }
 
@@ -21,6 +24,7 @@ function run(cmd, options = {}) {
     });
   } catch (_e) {
     if (!options.ignoreError) {
+      console.error(`error: command failed: ${cmd}`);
       process.exit(1);
     }
     return null;
@@ -79,6 +83,9 @@ function bumpOrSetVersion(target) {
     if (
       target.localeCompare(currentVersion, undefined, { numeric: true, sensitivity: "base" }) <= 0
     ) {
+      console.error(
+        `error: target version ${target} is not greater than current ${currentVersion}`,
+      );
       process.exit(1);
     }
     newVersion = target;
@@ -121,16 +128,9 @@ function getChangelogs() {
 }
 
 function updateChangelogsForRelease(version) {
-  const date = new Date().toISOString().split("T")[0];
-  const changelogs = getChangelogs();
-  for (const changelog of changelogs) {
-    const content = readFileSync(changelog, "utf-8");
-    if (!content.includes("## [Unreleased]")) {
-      continue;
-    }
-    const updated = content.replace("## [Unreleased]", `## [${version}] - ${date}`);
-    writeFileSync(changelog, updated);
-  }
+  // Shared with .github/workflows/release.yml so local and CI releases stamp
+  // changelogs identically.
+  run(`node scripts/stamp-changelogs.mjs ${version}`, { silent: true });
 }
 
 function addUnreleasedSection() {
@@ -145,6 +145,7 @@ function addUnreleasedSection() {
 
 const status = run("git status --porcelain", { silent: true });
 if (status?.trim()) {
+  console.error("error: working tree is dirty — commit or stash changes before releasing");
   process.exit(1);
 }
 run("npm test");

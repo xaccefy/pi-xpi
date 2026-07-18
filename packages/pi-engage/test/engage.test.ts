@@ -1,12 +1,21 @@
 import assert from "node:assert";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { MockExtensionAPI } from "../../../test-utils.ts";
 import { buildToolArgs, Engage, headersToFlags } from "../src/engage.ts";
 import { DisposableInbox } from "../src/inbox.ts";
 import registerEngage from "../src/index.ts";
 import type { AuthSession } from "../src/store.ts";
-import { clearSessions, getSession, listSessions } from "../src/store.ts";
+import { clearSessions, getSession, listSessions, saveSession } from "../src/store.ts";
 import type { FetchImpl } from "../src/types.ts";
+
+// Hermetic persistence: never touch the real ~/.pi/xpi-engage from tests —
+// clearSessions() would delete actual stored sessions.
+const TEST_ENGAGE_DIR = mkdtempSync(join(tmpdir(), "pi-engage-test-"));
+process.env.PI_ENGAGE_DIR = TEST_ENGAGE_DIR;
+process.on("exit", () => rmSync(TEST_ENGAGE_DIR, { recursive: true, force: true }));
 
 function fakeFetch(
   status = 200,
@@ -216,6 +225,43 @@ describe("Engage class (pdtm bridge)", () => {
     assert.ok(visited[0].includes("shop.example.com"));
   });
 
+  it("spider resolves relative links against the page they appear on", async () => {
+    // Regression: links were resolved against the SEED url, so "page" found on
+    // /dir/ became /page instead of /dir/page.
+    const pages: Record<string, string> = {
+      "https://shop.example.com/": '<a href="/dir/">dir</a>',
+      "https://shop.example.com/dir/": '<a href="page">page</a>',
+      "https://shop.example.com/dir/page": "leaf",
+    };
+    const fetchImpl = (async (url: string | URL) => {
+      const u = String(url);
+      return {
+        status: pages[u] === undefined ? 404 : 200,
+        headers: new Headers({ "content-type": "text/html" }),
+        text: async () => pages[u] ?? "not found",
+      } as unknown as Response;
+    }) as FetchImpl;
+    const e = new Engage({ fetchImpl });
+    e.addSession(cookieSession({ cookie: "x=1" }));
+    const r = await e.spider({ url: "https://shop.example.com/", sessionId: "s1", depth: 2 });
+    assert.strictEqual(r.isError, undefined);
+    const visited = (r.details as { visited: string[] }).visited;
+    assert.ok(
+      visited.includes("https://shop.example.com/dir/page"),
+      `expected /dir/page in ${JSON.stringify(visited)}`,
+    );
+    assert.ok(
+      !visited.includes("https://shop.example.com/page"),
+      "must not resolve against the seed URL",
+    );
+  });
+
+  it("scan errors when the named session does not exist", async () => {
+    const e = new Engage({ fetchImpl: fakeFetch() });
+    const r = await e.scan({ url: "https://shop.example.com/", sessionId: "ghost" });
+    assert.strictEqual(r.isError, true);
+  });
+
   it("scan runs a passive header check", async () => {
     const e = new Engage({ execImpl: fakeExec(), fetchImpl: fakeFetch(200, "<html></html>") });
     e.addSession(cookieSession({ cookie: "x=1" }));
@@ -228,6 +274,41 @@ describe("Engage class (pdtm bridge)", () => {
       "x-frame-options",
       "x-content-type-options",
     ]);
+  });
+});
+
+describe("store persistence", () => {
+  afterEach(() => clearSessions());
+
+  it("writes session files with 0600 perms (credentials are not world-readable)", () => {
+    saveSession(cookieSession({ id: "perm-test" }));
+    const mode = statSync(join(TEST_ENGAGE_DIR, "perm-test.json")).mode & 0o777;
+    assert.strictEqual(mode, 0o600);
+  });
+
+  it("signup combines ALL Set-Cookie pairs into one Cookie header", async () => {
+    // Regression: only the first Set-Cookie was captured, losing the real
+    // session cookie when a tracking cookie came first.
+    const fetchImpl = (async () =>
+      ({
+        ok: true,
+        status: 200,
+        headers: {
+          getSetCookie: () => ["track=1; Path=/", "sess=abc; Path=/; HttpOnly"],
+          get: (_k: string) => null,
+        },
+        text: async () => "{}",
+      }) as unknown as Response) as FetchImpl;
+    const e = new Engage({ fetchImpl });
+    const r = await e.signup({
+      signupUrl: "https://shop.example.com/register",
+      verifyStrategy: "none",
+      target: "shop.example.com",
+    });
+    assert.strictEqual(r.isError, undefined);
+    const sessionId = (r.details as { sessionId: string }).sessionId;
+    const s = getSession(sessionId);
+    assert.strictEqual(s?.cookie, "track=1; sess=abc");
   });
 });
 

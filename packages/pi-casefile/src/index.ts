@@ -15,6 +15,7 @@ import { Type } from "@sinclair/typebox";
 
 import {
   addCaseResult,
+  assertPromotable,
   type CaseConfidence,
   type CaseInput,
   type CasePriority,
@@ -818,6 +819,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
     parameters: PromoteSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
+      // Validate promotability BEFORE running the PoC — a sandboxed run can take
+      // 30s (plus first-time image pull), so fail cheap when the case can't
+      // advance anyway (missing, wrong status, missing required fields).
+      assertPromotable(params.id as string);
       const run = runPoc(params.poc_path as string, params.local !== true);
 
       // Fail closed without throwing: non-zero PoC must leave the case investigating.

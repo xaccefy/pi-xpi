@@ -7,6 +7,7 @@
  */
 
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -48,9 +49,14 @@ function resolveEngageDir(): string {
   return join(homedir(), ".pi", "xpi-engage");
 }
 
-const ENGAGE_DIR = resolveEngageDir();
+// Resolved lazily on every call so tests can redirect via PI_ENGAGE_DIR — a
+// module-level constant baked the path in at import time and made tests touch
+// the real ~/.pi/xpi-engage (clearSessions wiped actual sessions).
+function engageDir(): string {
+  return resolveEngageDir();
+}
 
-/** Reject path separators / traversal so session ids cannot escape ENGAGE_DIR. */
+/** Reject path separators / traversal so session ids cannot escape the engage dir. */
 export function safeId(id: string): string {
   const cleaned = String(id ?? "")
     .replace(/[^a-zA-Z0-9._-]+/g, "_")
@@ -60,16 +66,30 @@ export function safeId(id: string): string {
 }
 
 function sessionPath(id: string): string {
-  return join(ENGAGE_DIR, `${safeId(id)}.json`);
+  return join(engageDir(), `${safeId(id)}.json`);
 }
 
 export function ensureDir(): void {
-  if (!existsSync(ENGAGE_DIR)) mkdirSync(ENGAGE_DIR, { recursive: true });
+  const dir = engageDir();
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
+  // Harden pre-existing dirs created before perms were enforced.
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    /* best-effort */
+  }
 }
 
 export function saveSession(session: AuthSession): void {
   ensureDir();
-  writeFileSync(sessionPath(session.id), JSON.stringify(session, null, 2), "utf8");
+  const p = sessionPath(session.id);
+  // Sessions hold cookies / client secrets / tokens — never world-readable.
+  writeFileSync(p, JSON.stringify(session, null, 2), { encoding: "utf8", mode: 0o600 });
+  try {
+    chmodSync(p, 0o600); // mode only applies on creation; harden rewrites too
+  } catch {
+    /* best-effort */
+  }
 }
 
 export function getSession(id: string): AuthSession | undefined {
@@ -83,12 +103,13 @@ export function getSession(id: string): AuthSession | undefined {
 }
 
 export function listSessions(): AuthSession[] {
-  if (!existsSync(ENGAGE_DIR)) return [];
-  return readdirSync(ENGAGE_DIR)
+  const dir = engageDir();
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
     .filter((f) => f.endsWith(".json"))
     .map((f) => {
       try {
-        return JSON.parse(readFileSync(join(ENGAGE_DIR, f), "utf8")) as AuthSession;
+        return JSON.parse(readFileSync(join(dir, f), "utf8")) as AuthSession;
       } catch {
         return undefined;
       }
@@ -105,11 +126,12 @@ export function deleteSession(id: string): boolean {
 }
 
 export function clearSessions(): number {
-  if (!existsSync(ENGAGE_DIR)) return 0;
+  const dir = engageDir();
+  if (!existsSync(dir)) return 0;
   let n = 0;
-  for (const f of readdirSync(ENGAGE_DIR)) {
+  for (const f of readdirSync(dir)) {
     if (f.endsWith(".json")) {
-      unlinkSync(join(ENGAGE_DIR, f));
+      unlinkSync(join(dir, f));
       n++;
     }
   }

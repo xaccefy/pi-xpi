@@ -311,7 +311,6 @@ export class Engage {
       status: res.status,
       responseHeaders: Object.fromEntries(res.headers),
       snippet: text.slice(0, 2000),
-      authHeaders: auth.headers,
       curl,
     });
   }
@@ -343,7 +342,9 @@ export class Engage {
         });
         const html = await res.text();
         count++;
-        const links = extractLinks(html, base);
+        // Resolve relative links against the page they were found on, not the
+        // seed URL — otherwise nested pages produce wrong absolute URLs.
+        const links = extractLinks(html, new URL(u));
         for (const l of links) {
           try {
             const abs = new URL(l, base);
@@ -546,7 +547,12 @@ export class Engage {
     opts: { id: string; label: string; target?: string; caseId?: string },
   ): AuthSession {
     const sc = (res.headers as { getSetCookie?: () => string[] }).getSetCookie?.() ?? [];
-    const cookie = sc[0]?.split(";")[0] ?? res.headers.get("set-cookie")?.split(";")[0];
+    // Combine ALL Set-Cookie pairs into one Cookie header. Taking only the first
+    // cookie breaks apps that set a tracking cookie before the session cookie.
+    const cookie =
+      sc.length > 0
+        ? sc.map((c) => c.split(";")[0]).join("; ")
+        : res.headers.get("set-cookie")?.split(";")[0];
     let tok: string | undefined;
     try {
       const j = JSON.parse(body) as Record<string, unknown>;
@@ -635,6 +641,7 @@ export class Engage {
     if (!input.url) return err("scan requires url");
     const sid = input.sessionId ?? this.lastSessionId;
     const s = sid ? store.getSession(sid) : undefined;
+    if (sid && !s) return err(`session ${sid} not found`);
     const headers = s ? (await resolveSessionRequest(s, this.fetchImpl)).headers : {};
     const res = await this.fetchImpl(input.url, {
       headers,

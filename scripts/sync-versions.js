@@ -26,6 +26,9 @@ versionMap[rootPkg.name] = rootPkg.version;
 
 const versions = new Set(Object.values(versionMap));
 if (versions.size > 1) {
+  console.error(
+    `error: version mismatch across workspace packages: ${JSON.stringify(versionMap, null, 2)}`,
+  );
   process.exit(1);
 }
 

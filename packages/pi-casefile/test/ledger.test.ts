@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 
 import {
   addCaseResult,
+  assertPromotable,
   linkCasesResult,
   promoteFindingResult,
   readCasefile,
@@ -78,6 +79,32 @@ describe("casefile sqlite ledger", () => {
     assert.strictEqual(duplicate.record.id, first.record.id);
 
     assert.strictEqual(readCasefile().length, 1);
+  });
+
+  it("assertPromotable gates cheaply before any PoC run", () => {
+    const record = addCase({
+      title: "XSS candidate",
+      status: "hypothesis",
+      evidence: "Reflected input",
+    });
+
+    // Wrong status
+    assert.throws(() => assertPromotable(record.id), /requires an investigating case/);
+    // Missing case
+    assert.throws(() => assertPromotable("case_missing00"), /Case not found/);
+
+    // Investigating but missing severity/impact
+    updateCaseResult(record.id, { status: "investigating" });
+    assert.throws(() => assertPromotable(record.id), /CONFIRMED requires/);
+
+    // Fully gated
+    updateCaseResult(record.id, {
+      severity: "medium",
+      impact: "Session theft",
+      poc: "alert(1) in search box",
+    });
+    const ok = assertPromotable(record.id);
+    assert.strictEqual(ok.id, record.id);
   });
 
   it("updates by replacing in sqlite and returns unchanged status", () => {

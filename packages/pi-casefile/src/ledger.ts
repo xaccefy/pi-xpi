@@ -785,8 +785,13 @@ type PocVerification = {
   sandbox: boolean;
 };
 
-export function promoteFindingResult(id: string, verification: PocVerification): CaseUpdateResult {
-  const db = getDb();
+/**
+ * Gate for promotion to confirmed: case must exist, be investigating, and have
+ * poc/evidence/impact/severity. Returns the record when promotable, throws
+ * otherwise. Exported so PromoteFinding can validate BEFORE paying for a
+ * (potentially slow) sandboxed PoC run.
+ */
+export function assertPromotable(id: string): CaseRecord {
   const current = getCaseById(id);
   if (!current) {
     throw new Error(`Case not found: ${id}`);
@@ -806,6 +811,12 @@ export function promoteFindingResult(id: string, verification: PocVerification):
   if (!current.severity) {
     throw new Error("CONFIRMED requires severity; set severity on the case first");
   }
+  return current;
+}
+
+export function promoteFindingResult(id: string, verification: PocVerification): CaseUpdateResult {
+  const db = getDb();
+  const current = assertPromotable(id);
   if (verification.exitCode !== 0) {
     throw new Error(
       `PoC verification failed (exit ${verification.exitCode}); cannot promote to confirmed`,

@@ -55,6 +55,9 @@ jobs:
       - name: Version bump (${{ inputs.bump }})
         run: bun run version:${{ inputs.bump }}
 
+      - name: Stamp changelogs
+        run: node scripts/stamp-changelogs.mjs "$(node -p "require('./package.json').version")"
+
       - name: Configure npm auth
         run: |
           echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > "$RUNNER_TEMP/.npmrc"
@@ -78,11 +81,14 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           VERSION="$(node -p "require('./package.json').version")"
           git add package.json packages/*/package.json
+          # CHANGELOG.md files may not exist in every package yet — add what exists.
+          find . -maxdepth 2 -name CHANGELOG.md -not -path "./node_modules/*" -print0 | xargs -0 -r git add --
           if git diff --cached --quiet; then
             echo "No version file changes to commit"
           else
             git commit -m "chore: release v${VERSION}"
           fi
           git tag "v${VERSION}" || true
-          git push origin HEAD
+          # checkout leaves us on a detached HEAD — name the dst ref explicitly.
+          git push origin HEAD:main
           git push origin "v${VERSION}"

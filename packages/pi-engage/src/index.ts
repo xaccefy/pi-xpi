@@ -160,6 +160,9 @@ export const EngageParamsSchema = Type.Object({
         "Verification: auto (response token, then disposable inbox) | response (token in signup body) | inbox (temp-mail poll) | none (skip)",
     }),
   ),
+  verifyTimeoutMs: Type.Optional(
+    Type.Number({ description: "Max time to wait for a verification email (ms, default 90000)" }),
+  ),
   // login fields (prove a created account exists by logging in)
   loginUrl: Type.Optional(
     Type.String({
