@@ -1,6 +1,6 @@
 {
   "name": "@xaccefy/pi-xpi",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "XPI — offensive security tools for Pi Agent. Casefile tracking, web search, library docs, exploit technique search, and todo tracking.",
   "keywords": [
     "pi-package",
