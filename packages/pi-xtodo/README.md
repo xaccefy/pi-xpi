@@ -40,9 +40,17 @@ pending ↔ in_progress → completed → deleted
 - If that’s empty, use the disk file `~/.pi/xtodo/<safe-session-id>.json`.
 - Session ids are cleaned so they can’t escape the folder.
 
+## Display
+
+- Tool results render as a one-line summary (glyph + first line / task count).
+  Expand the tool row (`app.tools.expand` keybinding) to see full lists and details.
+  Errors render as `✗ <message>`.
+
 ## Command
 
-- `/todos` — grouped summary (interactive mode)
+- `/todos` — overlay with the full list, grouped active → completed → deleted
+  (`esc`/`q`/`enter` closes). Falls back to a notification when overlays are
+  unavailable.
 
 ## Development
 

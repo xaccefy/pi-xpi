@@ -589,6 +589,119 @@ describe("pi-xtodo", () => {
     assert.ok(!g.content[0].text.includes("blockedBy"), "no blockedBy rendered");
   });
 
+  // ------------- UX / rendering -------------
+
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: ANSI escape stripper
+  const stripAnsi = (s: string) => s.replace(/\x1b\[[0-9;]*m/g, "");
+  // biome-ignore lint/suspicious/noExplicitAny: minimal theme stand-in
+  const mockTheme: any = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
+
+  it("renderResult shows single-line results in full", async () => {
+    const t = pi.tools[0];
+    const c = await t.execute("1", { action: "create", subject: "Solo" }, null, null, mockCtx);
+    const out = stripAnsi(t.renderResult(c, {}, mockTheme).render(120).join("\n"));
+    assert.ok(out.includes("+ Created #1: Solo (pending)"), out);
+  });
+
+  it("renderResult collapses multi-line lists with an expand hint", async () => {
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "Alpha" }, null, null, mockCtx);
+    await t.execute("2", { action: "create", subject: "Beta" }, null, null, mockCtx);
+    const l = await t.execute("3", { action: "list" }, null, null, mockCtx);
+
+    const collapsed = stripAnsi(
+      t.renderResult(l, { expanded: false }, mockTheme).render(120).join("\n"),
+    );
+    assert.ok(collapsed.includes("☰ 2 tasks"), collapsed);
+    assert.ok(collapsed.includes("expand"), collapsed);
+    assert.ok(!collapsed.includes("Beta"), collapsed);
+
+    const expanded = stripAnsi(
+      t.renderResult(l, { expanded: true }, mockTheme).render(120).join("\n"),
+    );
+    assert.ok(expanded.includes("#1 Alpha"), expanded);
+    assert.ok(expanded.includes("#2 Beta"), expanded);
+  });
+
+  it("renderResult keeps get summary on first line, details on expand", async () => {
+    const t = pi.tools[0];
+    await t.execute(
+      "1",
+      { action: "create", subject: "Detailed", description: "deep dive" },
+      null,
+      null,
+      mockCtx,
+    );
+    const g = await t.execute("2", { action: "get", id: 1 }, null, null, mockCtx);
+
+    const collapsed = stripAnsi(
+      t.renderResult(g, { expanded: false }, mockTheme).render(120).join("\n"),
+    );
+    assert.ok(collapsed.includes("› #1 [pending] Detailed"), collapsed);
+    assert.ok(!collapsed.includes("deep dive"), collapsed);
+
+    const expanded = stripAnsi(
+      t.renderResult(g, { expanded: true }, mockTheme).render(120).join("\n"),
+    );
+    assert.ok(expanded.includes("description: deep dive"), expanded);
+  });
+
+  it("renderResult highlights errors", async () => {
+    const t = pi.tools[0];
+    const r = await t.execute("1", { action: "get", id: 99 }, null, null, mockCtx);
+    const out = stripAnsi(t.renderResult(r, {}, mockTheme).render(120).join("\n"));
+    assert.ok(out.includes("✗"), out);
+    assert.ok(out.includes("#99 not found"), out);
+  });
+
+  function mockUi() {
+    const captured: any = {};
+    const ui = {
+      custom: async (factory: any, options: any) => {
+        captured.options = options;
+        const comp = factory(null, mockTheme, null, () => {
+          captured.closed = true;
+        });
+        captured.comp = comp;
+        captured.body = comp.render(80).map(stripAnsi).join("\n");
+        return null;
+      },
+      notify: (msg: string) => {
+        captured.notified = msg;
+      },
+    };
+    return { ui, captured };
+  }
+
+  it("/todos opens an overlay listing tasks and closes on esc", async () => {
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "Overlay task" }, null, null, mockCtx);
+    const { ui, captured } = mockUi();
+    await pi.commands.todos.handler("", { sessionManager, ui });
+    assert.strictEqual(captured.options?.overlay, true, "opens as overlay");
+    assert.ok(captured.body.includes("Overlay task"), captured.body);
+    assert.ok(captured.body.includes("1 active"), captured.body);
+    captured.comp.handleInput("\x1b");
+    assert.ok(captured.closed, "esc closes overlay");
+  });
+
+  it("/todos shows an empty state instead of a blank toast", async () => {
+    const { ui, captured } = mockUi();
+    await pi.commands.todos.handler("", { sessionManager, ui });
+    assert.ok(captured.body.includes("No tasks"), captured.body);
+  });
+
+  it("/todos falls back to notify when overlays are unavailable", async () => {
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "Fallback task" }, null, null, mockCtx);
+    const { ui, captured } = mockUi();
+    ui.custom = () => {
+      throw new Error("no ui");
+    };
+    await pi.commands.todos.handler("", { sessionManager, ui });
+    assert.ok(captured.notified?.includes("Fallback task"), captured.notified);
+  });
+
   it("removes duplicate ids in blockedBy", async () => {
     const t = pi.tools[0];
     await t.execute("1", { action: "create", subject: "Target" }, null, null, mockCtx);

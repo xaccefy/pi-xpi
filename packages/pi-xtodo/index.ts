@@ -13,8 +13,8 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { DynamicBorder, type ExtensionAPI, keyText } from "@earendil-works/pi-coding-agent";
+import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 
 // ---------------------------------------------------------------------------
@@ -410,24 +410,92 @@ function applyMutation(
 }
 
 // ---------------------------------------------------------------------------
+// Display
+// ---------------------------------------------------------------------------
+const STATUS_GLYPH: Record<TaskStatus, string> = {
+  pending: "○",
+  in_progress: "◐",
+  completed: "●",
+  deleted: "⊘",
+};
+const ACTION_GLYPH: Record<TaskAction, string> = {
+  create: "+",
+  update: "→",
+  delete: "×",
+  get: "›",
+  list: "☰",
+  clear: "∅",
+};
+
+// biome-ignore lint/suspicious/noExplicitAny: theme is provided by the host
+function taskLine(t: Task, theme: any): string {
+  let line = `${theme.fg("accent", STATUS_GLYPH[t.status])} ${theme.fg("dim", `#${t.id}`)} ${t.subject}`;
+  if (t.status === "in_progress" && t.activeForm) line += theme.fg("muted", ` (${t.activeForm})`);
+  if (t.blockedBy?.length)
+    line += theme.fg("dim", ` ⛓ ${t.blockedBy.map((i) => `#${i}`).join(",")}`);
+  return line;
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: ctx is provided by the host
+async function showTodosOverlay(ctx: any, tasks: Task[]): Promise<void> {
+  const active = tasks.filter((t) => t.status !== "completed" && t.status !== "deleted");
+  const completed = tasks.filter((t) => t.status === "completed");
+  const deleted = tasks.filter((t) => t.status === "deleted");
+  const ordered = [...active, ...completed, ...deleted];
+  try {
+    await ctx.ui.custom(
+      // biome-ignore lint/suspicious/noExplicitAny: host-provided values
+      (_tui: any, theme: any, _kb: any, done: (v: null) => void) => {
+        const container = new Container();
+        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+        container.addChild(
+          new Text(
+            theme.fg("accent", theme.bold("Todo")) +
+              theme.fg("dim", ` — ${active.length} active · ${completed.length} completed`),
+            1,
+            0,
+          ),
+        );
+        if (ordered.length === 0) {
+          container.addChild(new Text(theme.fg("dim", "No tasks"), 1, 0));
+        } else {
+          for (const t of ordered) container.addChild(new Text(taskLine(t, theme), 1, 0));
+        }
+        container.addChild(new Text(theme.fg("dim", "esc/q/enter to close"), 1, 0));
+        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+        return {
+          render: (w: number) => container.render(w),
+          invalidate: () => container.invalidate(),
+          handleInput: (data: string) => {
+            if (data === "\x1b" || data === "q" || data === "\r" || data === "\n") done(null);
+          },
+        };
+      },
+      {
+        overlay: true,
+        overlayOptions: {
+          width: "60%",
+          minWidth: 40,
+          maxHeight: "80%",
+          anchor: "top-center",
+          margin: { top: 2 },
+        },
+      },
+    );
+  } catch {
+    // No interactive UI (or overlays unsupported): fall back to a notification.
+    const lines = ordered.map((t) => `${STATUS_GLYPH[t.status]} #${t.id} ${t.subject}`).join("\n");
+    ctx.ui?.notify?.(
+      `Todo (${active.length} active · ${completed.length} completed):\n${lines || "No tasks"}`,
+      "info",
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Tool Registration
 // ---------------------------------------------------------------------------
 export default function registerTodo(pi: ExtensionAPI) {
-  const STATUS_GLYPH: Record<TaskStatus, string> = {
-    pending: "○",
-    in_progress: "◐",
-    completed: "●",
-    deleted: "⊘",
-  };
-  const ACTION_GLYPH: Record<TaskAction, string> = {
-    create: "+",
-    update: "→",
-    delete: "×",
-    get: "›",
-    list: "☰",
-    clear: "∅",
-  };
-
   pi.registerTool({
     name: TOOL_NAME,
     label: TOOL_LABEL,
@@ -454,29 +522,38 @@ export default function registerTodo(pi: ExtensionAPI) {
         isError: !!result.error,
       };
     },
-    renderResult: (result: any, _options: any, theme: any) => {
+    renderResult: (result: any, options: any, theme: any) => {
       const d = result.details as TaskDetails | undefined;
-      const glyph = d && !d.error ? ACTION_GLYPH[d.action] : "✗";
-      const preview = result.content?.[0]?.text ?? "";
-      const subject = preview.length > 80 ? preview.slice(0, 80) + "…" : preview;
-      return new Text(`${theme.fg("toolTitle", glyph)} ${subject}`, 0, 0);
+      const text: string = result.content?.[0]?.text ?? "";
+      if (d?.error) {
+        return new Text(`${theme.fg("error", "✗")} ${theme.fg("error", text)}`, 0, 0);
+      }
+      const glyph = d ? ACTION_GLYPH[d.action] : "•";
+      const lines = text.split("\n");
+      if (lines.length === 1 || options?.expanded) {
+        return new Text(`${theme.fg("toolTitle", glyph)} ${text}`, 0, 0);
+      }
+      const summary = d?.action === "list" ? `${lines.length} tasks` : lines[0];
+      const key = keyText("app.tools.expand");
+      const hint = key
+        ? `${theme.fg("dim", key)}${theme.fg("muted", " to expand")}`
+        : theme.fg("dim", "expand for full output");
+      return new Text(
+        `${theme.fg("toolTitle", glyph)} ${summary} (+${lines.length - 1} lines, ${hint})`,
+        0,
+        0,
+      );
     },
   });
 
   pi.registerCommand(COMMAND_NAME, {
-    description: "Show todo list",
+    description: "Show todo list overlay",
     handler: async (_args, ctx) => {
       const sessionId = sid(ctx);
       const state = getSessionState(sessionId);
       const stored = restoreState(sessionId);
       const t = stored && stored.tasks.length > 0 ? stored : state;
-      const active = t.tasks.filter((x) => x.status !== "deleted" && x.status !== "completed");
-      const done = t.tasks.filter((x) => x.status === "completed");
-      const lines = active
-        .map((x) => `  ${STATUS_GLYPH[x.status]} #${x.id} ${x.subject}`)
-        .join("\n");
-      const doneLine = done.length ? `\n${done.length} completed.` : "";
-      ctx.ui.notify(`Todo (${active.length} active${doneLine}):\n${lines}`, "info");
+      await showTodosOverlay(ctx, t.tasks);
     },
   });
 
