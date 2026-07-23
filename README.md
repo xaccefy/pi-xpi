@@ -34,7 +34,6 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 
 | Tool | Use for |
 |------|---------|
-| auth / /auth | Hold & use login sessions for targets (cookie, OAuth client-credentials, mTLS); **engage signup/login** to make a temp account on its own + prove it |
 | ExploitSearch | Attack techniques, primitives, bypasses (`PREVIEW_IS_API_KEY`) |
 | web_search | CVEs, advisories, documentation |
 | web_fetch | Page content; SPA pages re-rendered via Chromium when the shell is thin |
@@ -52,12 +51,10 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 ## Quick start
 
 ```
-/ops <bugbounty|ctf|pentest> <target>   # start an engagement
-/pipeline <audit|harness|patch> <target>   # VDH/VVS discovery→validate→patch
 /xp on                                      # enable casefile cyber workflow in context
 ```
 
-Engagements and pipelines restate the workflow in the prompt body, so they work with XP mode off. Use `/xp on` when you want the full attacker discipline injected every turn.
+Skills (`skills/web-pentest`, `skills/pipeline`) auto-load into agent context. No slash commands needed for methodology — just tell the agent what to hunt. Run `/xp on` for the full attacker discipline with casefile tracking.
 
 ## Code intelligence (codebase-memory-mcp)
 
@@ -72,7 +69,6 @@ XPI uses [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) 
 | Package | npm |
 |---------|-----|
 | Umbrella | `@xaccefy/pi-xpi` |
-| Auth sessions | `@xaccefy/pi-engage` |
 | Case ledger | `@xaccefy/pi-casefile` |
 | Lookup | `@xaccefy/pi-lookup` |
 | Exploit search | `@xaccefy/pi-exploitsearch` |
@@ -84,14 +80,16 @@ See each package’s `README.md` under `packages/*/`.
 
 ```
 pi-xpi/
-├── prompts/                 # /ops, /pipeline
-├── agents/                  # auditor, exploit-dev, patch-writer, harness
+├── agents/                  # auditor, tracer, exploit, harness
 ├── packages/
 │   ├── pi-casefile
 │   ├── pi-exploitsearch
 │   ├── pi-lookup
-│   ├── pi-engage
 │   └── pi-xtodo
+├── schemas/                 # stage-finding, stage-trace, stage-validation, stage-report
+├── scripts/                 # bump-version, release
+├── skills/                  # web-pentest, pipeline (auto-loaded)
+├── install.sh
 └── package.json
 ```
 

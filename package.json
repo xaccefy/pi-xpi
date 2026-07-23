@@ -1,7 +1,7 @@
 {
   "name": "@xaccefy/pi-xpi",
   "version": "0.5.4",
-  "description": "XPI — offensive security tools for Pi Agent. Casefile tracking, web search, library docs, exploit technique search, todo tracking, and authenticated-session management.",
+  "description": "XPI — offensive security tools for Pi Agent. Casefile tracking, web search, library docs, exploit technique search, and todo tracking.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -31,15 +31,16 @@
     "registry": "https://registry.npmjs.org/"
   },
   "files": [
-    "prompts/",
     "agents/",
+    "skills/",
+    "schemas/",
     "install.sh",
     "README.md",
     "LICENSE"
   ],
   "pi": {
-    "prompts": [
-      "./prompts"
+    "skills": [
+      "./skills"
     ]
   },
   "dependencies": {},
@@ -52,7 +53,6 @@
     "typescript": "^6.0.3"
   },
   "peerDependencies": {
-    "@xaccefy/pi-engage": "*",
     "@xaccefy/pi-casefile": "*",
     "@xaccefy/pi-exploitsearch": "*",
     "@xaccefy/pi-lookup": "*",
@@ -71,9 +71,9 @@
     "lint:fix": "biome check . --write",
     "format": "biome format . --write",
     "typecheck": "tsc --noEmit --project tsconfig.json",
-    "version:patch": "node scripts/bump-version.js patch && node scripts/sync-versions.js",
-    "version:minor": "node scripts/bump-version.js minor && node scripts/sync-versions.js",
-    "version:major": "node scripts/bump-version.js major && node scripts/sync-versions.js",
+    "version:patch": "node scripts/bump-version.js patch",
+    "version:minor": "node scripts/bump-version.js minor",
+    "version:major": "node scripts/bump-version.js major",
     "publish:all": "npm publish -ws --access public && npm publish --access public",
     "publish:dry": "npm publish -ws --access public --dry-run",
     "release:patch": "node scripts/release.mjs patch",

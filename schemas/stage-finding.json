@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Stage Finding",
+  "description": "A vulnerability finding produced by the auditor/hunter stage. Must pass validation before advancing to exploit.",
+  "type": "object",
+  "required": ["vuln_class", "file", "line", "sink", "entry_point", "confidence", "evidence"],
+  "properties": {
+    "vuln_class": {
+      "type": "string",
+      "description": "Vulnerability class/type",
+      "enum": [
+        "injection",
+        "xss",
+        "idor",
+        "bola",
+        "path-traversal",
+        "ssrf",
+        "command-injection",
+        "deserialization",
+        "auth-bypass",
+        "privilege-escalation",
+        "business-logic",
+        "race-condition",
+        "xxe",
+        "ssti",
+        "open-redirect",
+        "information-disclosure",
+        "crypto-weakness",
+        "other"
+      ]
+    },
+    "file": { "type": "string", "description": "Source file path relative to repo root" },
+    "line": { "type": "integer", "description": "Line number of the sink", "minimum": 1 },
+    "sink": { "type": "string", "description": "The dangerous function or operation" },
+    "entry_point": {
+      "type": "string",
+      "description": "How attacker input reaches this code path"
+    },
+    "confidence": {
+      "type": "string",
+      "enum": ["low", "medium", "high"],
+      "description": "How sure the auditor is this is exploitable"
+    },
+    "evidence": {
+      "type": "string",
+      "description": "Structural call path and reasoning, entry → sink. Include relevant code snippets."
+    },
+    "attacker_model": {
+      "type": "string",
+      "description": "Who the attacker is (unauth internet, low-priv user, etc.)"
+    },
+    "subsystem": {
+      "type": "string",
+      "description": "Which subsystem of the target this affects"
+    }
+  },
+  "additionalProperties": false
+}

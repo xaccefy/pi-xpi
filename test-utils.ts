@@ -16,6 +16,10 @@ export class MockExtensionAPI {
     this.commands[name] = spec;
   }
 
+  registerSlashCommand(spec: any) {
+    this.commands[spec.name] = spec;
+  }
+
   // biome-ignore lint/suspicious/noExplicitAny: generic tools array
   on(event: string, handler: (...args: any[]) => any) {
     if (!this.events[event]) this.events[event] = [];

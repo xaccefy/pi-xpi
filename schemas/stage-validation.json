@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Stage Validation",
+  "description": "Result of adversarial validation from exploit agent. Proves or disproves a finding with a working PoC, then records the patch.",
+  "type": "object",
+  "required": ["finding_id", "status", "technique_used", "detection_method"],
+  "properties": {
+    "finding_id": { "type": "string", "description": "Case ID from the casefile ledger" },
+    "status": {
+      "type": "string",
+      "enum": ["confirmed", "killed", "reported"],
+      "description": "Validation status: confirmed (PoC passed), killed (failed), or reported (patched)"
+    },
+    "technique_used": {
+      "type": "string",
+      "description": "The specific technique/payload used in the PoC"
+    },
+    "detection_method": {
+      "type": "string",
+      "description": "How success was detected (timing, error message, response content, OOB callback, etc.)"
+    },
+    "poc_path": {
+      "type": "string",
+      "description": "Path to the PoC script on disk (required when confirmed)"
+    },
+    "run_log": {
+      "type": "string",
+      "description": "Summary of the PoC output including exit code (required when confirmed)"
+    },
+    "evidence_extracted": {
+      "type": "string",
+      "description": "Data extracted or state changed that proves the finding"
+    },
+    "kill_reason": {
+      "type": "string",
+      "enum": [
+        "unreachable",
+        "framework_protection",
+        "input_validation_blocks",
+        "requires_privilege_attacker_lacks",
+        "poc_failed_3x",
+        "no_real_impact",
+        "intended_behavior",
+        "duplicate"
+      ],
+      "description": "Reason the finding was killed (required when killed)"
+    },
+    "refinement_attempts": {
+      "type": "integer",
+      "description": "Number of refinement attempts before success or kill",
+      "minimum": 1,
+      "maximum": 3
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "confirmed" } } },
+      "then": { "required": ["poc_path", "run_log", "evidence_extracted"] }
+    },
+    {
+      "if": { "properties": { "status": { "const": "killed" } } },
+      "then": { "required": ["kill_reason"] }
+    }
+  ]
+}

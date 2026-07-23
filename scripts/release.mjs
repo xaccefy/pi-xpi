@@ -113,7 +113,6 @@ function bumpOrSetVersion(target) {
     }
   }
 
-  run("node scripts/sync-versions.js");
   return newVersion;
 }
 
@@ -130,7 +129,7 @@ function getChangelogs() {
 function updateChangelogsForRelease(version) {
   // Shared with .github/workflows/release.yml so local and CI releases stamp
   // changelogs identically.
-  run(`node scripts/stamp-changelogs.mjs ${version}`, { silent: true });
+  // stamp-changelogs removed — no CHANGELOG.md files exist in the repo
 }
 
 function addUnreleasedSection() {

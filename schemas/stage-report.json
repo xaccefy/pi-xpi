@@ -1,0 +1,96 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Stage Report",
+  "description": "Final pipeline report after all stages complete. Summarizes findings, chains, patches, and coverage.",
+  "type": "object",
+  "required": ["target", "pipeline_status", "findings", "coverage", "summary"],
+  "properties": {
+    "target": {
+      "type": "string",
+      "description": "Target that was tested (repo, URL, or asset)"
+    },
+    "pipeline_status": {
+      "type": "string",
+      "enum": ["complete", "partial", "aborted"],
+      "description": "Overall pipeline outcome"
+    },
+    "total_tokens": {
+      "type": "integer",
+      "description": "Total tokens (input + output) consumed across all stages"
+    },
+    "findings": {
+      "type": "array",
+      "description": "All findings that survived validation",
+      "items": {
+        "type": "object",
+        "required": ["id", "vuln_class", "file", "severity", "status"],
+        "properties": {
+          "id": { "type": "string", "description": "Case ID" },
+          "vuln_class": { "type": "string", "description": "Vulnerability classification" },
+          "file": { "type": "string", "description": "Affected source file" },
+          "severity": { "type": "string", "enum": ["info", "low", "medium", "high", "critical"] },
+          "status": { "type": "string", "enum": ["confirmed", "reported"] },
+          "poc_path": { "type": "string", "description": "Path to PoC script" },
+          "chain_with": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "IDs of findings this chains with"
+          }
+        }
+      }
+    },
+    "chains": {
+      "type": "array",
+      "description": "Multi-step exploit chains combining multiple findings",
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string" },
+          "steps": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Finding IDs in chain order"
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "critical"]
+          },
+          "blocked_by_controls": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Controls that would block this chain in production"
+          }
+        }
+      }
+    },
+    "coverage": {
+      "type": "object",
+      "description": "Per-class coverage summary, required so caller knows which classes were genuinely clean vs skipped",
+      "patternProperties": {
+        "^[a-z-]+$": {
+          "type": "string",
+          "enum": ["COVERED", "SKIPPED", "NOT_FOUND"]
+        }
+      }
+    },
+    "summary": {
+      "type": "string",
+      "description": "One-paragraph executive summary of findings and impact"
+    },
+    "patches_applied": {
+      "type": "array",
+      "description": "Patches that were verified (optional, only when pipeline includes fix stage)",
+      "items": {
+        "type": "object",
+        "properties": {
+          "finding_id": { "type": "string" },
+          "diff_summary": { "type": "string" },
+          "re_attack_result": {
+            "type": "string",
+            "description": "Result of fresh auditor verifying the fix"
+          }
+        }
+      }
+    }
+  }
+}

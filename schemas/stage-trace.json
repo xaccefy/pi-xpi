@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Stage Trace",
+  "description": "Result of a reachability trace from the tracer agent. Must pass before a finding can be promoted to confirmed.",
+  "type": "object",
+  "required": ["trace_result", "entry_point", "call_chain", "defenses_checked", "attacker_model"],
+  "properties": {
+    "trace_result": {
+      "type": "string",
+      "enum": ["REACHABLE", "UNREACHABLE"],
+      "description": "Whether attacker-controlled input reaches the sink"
+    },
+    "entry_point": {
+      "type": "string",
+      "description": "The external entry point where attacker input enters"
+    },
+    "call_chain": {
+      "type": "array",
+      "description": "The function call path from entry point to sink",
+      "items": {
+        "type": "string",
+        "description": "One step in the chain: file:function → next:function"
+      },
+      "minItems": 1
+    },
+    "defenses_checked": {
+      "type": "array",
+      "description": "Every defense examined on the path and whether it blocked the attacker",
+      "items": {
+        "type": "object",
+        "required": ["defense", "location", "verdict"],
+        "properties": {
+          "defense": { "type": "string", "description": "The defense mechanism" },
+          "location": { "type": "string", "description": "Where it was found (file:line)" },
+          "verdict": {
+            "type": "string",
+            "enum": ["bypassed", "blocked", "not-present"],
+            "description": "Whether the defense stops the attacker"
+          }
+        }
+      }
+    },
+    "attacker_model": {
+      "type": "string",
+      "description": "Who can trigger this path (unauthenticated, low-priv user, etc.)"
+    },
+    "impact_if_reachable": {
+      "type": "string",
+      "description": "What an attacker gains by reaching this sink (only meaningful when REACHABLE)"
+    },
+    "unreachable_reason": {
+      "type": "string",
+      "description": "Why the sink is unreachable (required when UNREACHABLE)"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "trace_result": { "const": "REACHABLE" } } },
+      "then": { "required": ["impact_if_reachable"] }
+    },
+    {
+      "if": { "properties": { "trace_result": { "const": "UNREACHABLE" } } },
+      "then": { "required": ["unreachable_reason"] }
+    }
+  ]
+}

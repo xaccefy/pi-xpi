@@ -55,8 +55,6 @@ jobs:
       - name: Version bump (${{ inputs.bump }})
         run: bun run version:${{ inputs.bump }}
 
-      - name: Stamp changelogs
-        run: node scripts/stamp-changelogs.mjs "$(node -p "require('./package.json').version")"
 
       - name: Configure npm auth
         run: |

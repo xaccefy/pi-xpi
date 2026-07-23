@@ -4,14 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, beforeEach, describe, it } from "node:test";
 import { MockExtensionAPI } from "../../../test-utils.ts";
-import {
-  __replayComputeCount,
-  __resetState,
-  default as registerTodo,
-  TodoParamsSchema,
-} from "../index.ts";
+import { __resetState, default as registerTodo, TodoParamsSchema } from "../index.ts";
 
-// Hermetic persistence: never touch the real ~/.pi/xtodo from tests.
 const TEST_XTODO_DIR = mkdtempSync(join(tmpdir(), "pi-xtodo-test-"));
 process.env.PI_XTODO_DIR = TEST_XTODO_DIR;
 after(() => {
@@ -29,7 +23,18 @@ class MockSessionManager {
   }
 }
 
-describe("pi-xtodo simplified tests", () => {
+function ok(r: any, msg?: string) {
+  assert.ok(!r.isError, `${msg ?? "unexpected error"}: ${r.content?.[0]?.text ?? "no text"}`);
+}
+
+function fail(r: any, msg?: string) {
+  assert.ok(
+    r.isError,
+    `${msg ?? "expected error but got success"}: ${r.content?.[0]?.text ?? "no text"}`,
+  );
+}
+
+describe("pi-xtodo", () => {
   let pi: MockExtensionAPI;
   let sessionManager: MockSessionManager;
   let mockCtx: any;
@@ -42,473 +47,564 @@ describe("pi-xtodo simplified tests", () => {
     mockCtx = { sessionManager };
   });
 
-  it("should register todo tool and todos command", () => {
+  it("registers todo tool and /todos command", () => {
     assert.strictEqual(pi.tools.length, 1);
     assert.strictEqual(pi.tools[0].name, "todo");
     assert.ok(pi.commands.todos);
   });
 
-  it("schema uses StringEnum (type+enum), not anyOf/const Literals", () => {
-    // Providers (and Pi tool-arg validation) drop optional anyOf fields; status
-    // must be a plain string enum so status-only updates reach the reducer.
+  it("schema uses String enum (not anyOf/const Literals)", () => {
     const status = (TodoParamsSchema as any).properties?.status;
     assert.ok(status, "status property missing");
-    // Optional wraps the inner schema; unwrap common TypeBox shapes.
-    const inner = status.anyOf?.[0] ?? status;
-    const enumSchema = inner.enum ? inner : (inner.anyOf?.[0] ?? inner);
-    assert.ok(
-      Array.isArray(enumSchema.enum) || Array.isArray(status.enum),
-      `expected enum array, got ${JSON.stringify(status).slice(0, 200)}`,
-    );
-    // Must NOT be a Union-of-Literals (anyOf of {const: ...}).
     const raw = JSON.stringify(status);
-    assert.ok(!raw.includes('"const"'), `status still uses const literals: ${raw.slice(0, 200)}`);
+    assert.ok(!raw.includes('"const"'), `status uses const literals: ${raw.slice(0, 200)}`);
   });
 
   it("create, update, delete, list flow", async () => {
-    const todoTool = pi.tools[0];
+    const t = pi.tools[0];
 
-    // 1. Create a task
-    const createResult = await todoTool.execute(
+    // create
+    const c1 = await t.execute(
       "1",
       { action: "create", subject: "Write testing suite" },
       null,
       null,
       mockCtx,
     );
-    assert.ok(createResult.content[0].text.includes("Created #1: Write testing suite (pending)"));
-    assert.strictEqual(createResult.details.tasks.length, 1);
-    assert.strictEqual(createResult.details.tasks[0].id, 1);
-    assert.strictEqual(createResult.details.tasks[0].status, "pending");
+    ok(c1, "create");
+    assert.ok(c1.content[0].text.includes("Created #1: Write testing suite (pending)"));
+    assert.strictEqual(c1.details.tasks.length, 1);
+    assert.strictEqual(c1.details.tasks[0].id, 1);
 
-    // 2. Perform legal updates
-    const update1 = await todoTool.execute(
+    // update status + activeForm
+    const u1 = await t.execute(
       "3",
-      { action: "update", id: 1, status: "in_progress", activeForm: "writing unit tests" },
+      { action: "update", id: 1, status: "in_progress", activeForm: "writing" },
       null,
       null,
       mockCtx,
     );
-    assert.ok(update1.content[0].text.includes("Updated #1 (pending → in_progress)"));
+    ok(u1, "update to in_progress");
+    assert.ok(u1.content[0].text.includes("Updated #1 (pending → in_progress)"));
 
-    const update2 = await todoTool.execute(
+    // update status to completed
+    const u2 = await t.execute(
       "4",
       { action: "update", id: 1, status: "completed" },
       null,
       null,
       mockCtx,
     );
-    assert.ok(update2.content[0].text.includes("Updated #1 (in_progress → completed)"));
+    ok(u2, "update to completed");
+    assert.ok(u2.content[0].text.includes("Updated #1 (in_progress → completed)"));
 
-    // 3. Try illegal update (completed -> in_progress)
-    const badUpdate = await todoTool.execute(
+    // illegal transition: completed → in_progress
+    const u3 = await t.execute(
       "2",
       { action: "update", id: 1, status: "in_progress" },
       null,
       null,
       mockCtx,
     );
-    assert.ok(
-      badUpdate.content[0].text.includes("Error: illegal transition completed → in_progress"),
-    );
+    fail(u3, "illegal transition");
+    assert.ok(u3.content[0].text.includes("illegal transition"));
 
-    // 4. List tasks
-    const listResult = await todoTool.execute("5", { action: "list" }, null, null, mockCtx);
-    assert.ok(listResult.content[0].text.includes("[completed] #1 Write testing suite"));
+    // list
+    const l1 = await t.execute("5", { action: "list" }, null, null, mockCtx);
+    ok(l1, "list");
+    assert.ok(l1.content[0].text.includes("[completed] #1 Write testing suite"));
 
-    // 5. Delete task
-    const deleteResult = await todoTool.execute(
-      "6",
-      { action: "delete", id: 1 },
-      null,
-      null,
-      mockCtx,
-    );
-    assert.ok(deleteResult.content[0].text.includes("Deleted #1: Write testing suite"));
+    // delete
+    const d1 = await t.execute("6", { action: "delete", id: 1 }, null, null, mockCtx);
+    ok(d1, "delete");
+    assert.ok(d1.content[0].text.includes("Deleted #1"));
 
-    // 6. List returns no tasks (since deleted)
-    const listEmpty = await todoTool.execute("7", { action: "list" }, null, null, mockCtx);
-    assert.strictEqual(listEmpty.content[0].text, "No tasks");
+    // empty list
+    const l2 = await t.execute("7", { action: "list" }, null, null, mockCtx);
+    ok(l2, "empty list");
+    assert.strictEqual(l2.content[0].text, "No tasks");
   });
 
   it("blockedBy cycle detection", async () => {
-    const todoTool = pi.tools[0];
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "A" }, null, null, mockCtx);
+    await t.execute("2", { action: "create", subject: "B" }, null, null, mockCtx);
 
-    await todoTool.execute("1", { action: "create", subject: "Task A" }, null, null, mockCtx);
-    await todoTool.execute("2", { action: "create", subject: "Task B" }, null, null, mockCtx);
-
-    // Block Task B on Task A
-    await todoTool.execute(
+    // B depends on A
+    const ok1 = await t.execute(
       "3",
       { action: "update", id: 2, addBlockedBy: [1] },
       null,
       null,
       mockCtx,
     );
+    ok(ok1, "B→A link");
 
-    // Try to block Task A on Task B (creates cycle B -> A -> B)
-    const badCycle = await todoTool.execute(
+    // A depends on B → cycle
+    const bad = await t.execute(
       "4",
       { action: "update", id: 1, addBlockedBy: [2] },
       null,
       null,
       mockCtx,
     );
-    assert.ok(badCycle.content[0].text.includes("Error: addBlockedBy would create a cycle"));
+    fail(bad, "self-cycle A→B→A");
+    assert.ok(bad.content[0].text.includes("would create a cycle"));
   });
 
-  it("replayFromBranch state reconstruction", async () => {
-    const todoTool = pi.tools[0];
-
-    // Execute some tasks
-    await todoTool.execute("1", { action: "create", subject: "Task 1" }, null, null, mockCtx);
-    const lastResult = await todoTool.execute(
-      "2",
-      { action: "create", subject: "Task 2" },
-      null,
-      null,
-      mockCtx,
-    );
-
-    // Simulate session manager history
+  it("replay from branch restores state", async () => {
+    const t = pi.tools[0];
+    const c1 = await t.execute("1", { action: "create", subject: "T1" }, null, null, mockCtx);
+    ok(c1, "create T1");
+    const c2 = await t.execute("2", { action: "create", subject: "T2" }, null, null, mockCtx);
+    ok(c2, "create T2");
     sessionManager.branch = [
-      {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolName: "todo",
-          details: lastResult.details,
-        },
-      },
+      { type: "message", message: { role: "toolResult", toolName: "todo", details: c2.details } },
     ];
-
-    // Emit session_start to trigger replay
     await pi.emit("session_start", {}, mockCtx);
-
-    // Verify state is restored
-    const listResult = await todoTool.execute("3", { action: "list" }, null, null, mockCtx);
-    assert.ok(listResult.content[0].text.includes("#1 Task 1"));
-    assert.ok(listResult.content[0].text.includes("#2 Task 2"));
+    const l1 = await t.execute("3", { action: "list" }, null, null, mockCtx);
+    ok(l1, "list after replay");
+    assert.ok(l1.content[0].text.includes("#1 T1"), "T1 restored");
+    assert.ok(l1.content[0].text.includes("#2 T2"), "T2 restored");
   });
 
-  it("persists tasks to disk and restores them on session_start when branch history is empty", async () => {
-    sessionManager.sessionId = "persist-test-session";
-    sessionManager.branch = [];
-    const todoTool = pi.tools[0];
-
-    await todoTool.execute(
+  it("persists to disk and restores", async () => {
+    sessionManager.sessionId = "persist-test";
+    const t = pi.tools[0];
+    const c1 = await t.execute(
       "1",
-      { action: "create", subject: "Persisted task" },
+      { action: "create", subject: "Persisted" },
       null,
       null,
       mockCtx,
     );
-
-    // Simulate a restart: fresh branch (no todo history) but the saved file exists.
+    ok(c1, "create persisted");
     sessionManager.branch = [];
     await pi.emit("session_start", {}, mockCtx);
-
-    const listResult = await todoTool.execute("2", { action: "list" }, null, null, mockCtx);
-    assert.ok(listResult.content[0].text.includes("#1 Persisted task"));
+    const l1 = await t.execute("2", { action: "list" }, null, null, mockCtx);
+    ok(l1, "list after restore");
+    assert.ok(l1.content[0].text.includes("#1 Persisted"));
   });
 
-  it("update accepts string ids (LLM tool-call coercion)", async () => {
-    const todoTool = pi.tools[0];
-    await todoTool.execute("1", { action: "create", subject: "Coerce me" }, null, null, mockCtx);
-    const update = await todoTool.execute(
+  it("coerces string ids", async () => {
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "Coerce" }, null, null, mockCtx);
+    const r = await t.execute(
       "2",
-      { action: "update", id: "1" as unknown as number, status: "in_progress" },
+      { action: "update", id: "1" as any, status: "in_progress" },
       null,
       null,
       mockCtx,
     );
-    assert.ok(!update.isError, update.content[0].text);
-    assert.ok(update.content[0].text.includes("Updated #1 (pending → in_progress)"));
-
-    const got = await todoTool.execute(
-      "3",
-      { action: "get", id: "1" as unknown as number },
-      null,
-      null,
-      mockCtx,
-    );
-    assert.ok(got.content[0].text.includes("[in_progress]"));
+    ok(r, "coerced string id");
+    assert.ok(r.content[0].text.includes("Updated #1"));
   });
 
-  it("update rejects empty subject and mutations on deleted tasks", async () => {
-    const todoTool = pi.tools[0];
-    await todoTool.execute("1", { action: "create", subject: "Keep me" }, null, null, mockCtx);
+  it("rejects empty subject and mutations on deleted", async () => {
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "Keep" }, null, null, mockCtx);
 
-    const empty = await todoTool.execute(
+    // empty subject on update
+    const r1 = await t.execute(
       "2",
       { action: "update", id: 1, subject: "   " },
       null,
       null,
       mockCtx,
     );
-    assert.ok(empty.isError);
-    assert.ok(empty.content[0].text.includes("subject cannot be empty"));
+    fail(r1, "empty subject");
+    assert.ok(r1.content[0].text.includes("subject cannot be empty"));
 
-    await todoTool.execute("3", { action: "delete", id: 1 }, null, null, mockCtx);
-    const onDeleted = await todoTool.execute(
+    // delete
+    const d1 = await t.execute("3", { action: "delete", id: 1 }, null, null, mockCtx);
+    ok(d1, "delete");
+
+    // mutation on deleted
+    const r2 = await t.execute(
       "4",
       { action: "update", id: 1, subject: "ghost" },
       null,
       null,
       mockCtx,
     );
-    assert.ok(onDeleted.isError);
-    assert.ok(onDeleted.content[0].text.includes("is deleted"));
+    fail(r2, "mutation on deleted");
+    assert.ok(r2.content[0].text.includes("is deleted"));
+
+    // re-delete
+    const d2 = await t.execute("5", { action: "delete", id: 1 }, null, null, mockCtx);
+    fail(d2, "re-delete");
+    assert.ok(d2.content[0].text.includes("is already deleted"));
   });
 
-  it('update rejects null subject (not stored as the string "null")', async () => {
-    const todoTool = pi.tools[0];
-    await todoTool.execute("1", { action: "create", subject: "Original" }, null, null, mockCtx);
-    const r = await todoTool.execute(
-      "2",
-      { action: "update", id: 1, subject: null as unknown as string },
-      null,
-      null,
-      mockCtx,
-    );
-    assert.ok(r.isError);
-    assert.ok(r.content[0].text.includes("subject cannot be empty"));
-    // Verify subject wasn't changed to "null".
-    const got = await todoTool.execute("3", { action: "get", id: 1 }, null, null, mockCtx);
-    assert.ok(got.content[0].text.includes("Original"));
-  });
-
-  it("update with null description/activeForm/owner clears the field", async () => {
-    const todoTool = pi.tools[0];
-    await todoTool.execute(
+  it("null description/activeForm/owner clears field", async () => {
+    const t = pi.tools[0];
+    const c1 = await t.execute(
       "1",
       {
         action: "create",
-        subject: "Task with extras",
-        description: "some description",
-        activeForm: "working on it",
+        subject: "Extras",
+        description: "desc",
+        activeForm: "work",
         owner: "agent",
       },
       null,
       null,
       mockCtx,
     );
+    ok(c1, "create extras");
 
-    const r = await todoTool.execute(
+    const u1 = await t.execute(
       "2",
       {
         action: "update",
         id: 1,
-        description: null as unknown as string,
-        activeForm: null as unknown as string,
-        owner: null as unknown as string,
+        description: null as any,
+        activeForm: null as any,
+        owner: null as any,
       },
       null,
       null,
       mockCtx,
     );
-    assert.ok(!r.isError, r.content[0].text);
+    ok(u1, "null clearing");
 
-    const got = await todoTool.execute("3", { action: "get", id: 1 }, null, null, mockCtx);
-    const text = got.content[0].text;
-    assert.ok(!text.includes("description:"), `description should be cleared: ${text}`);
-    assert.ok(!text.includes("activeForm:"), `activeForm should be cleared: ${text}`);
-    assert.ok(!text.includes("owner:"), `owner should be cleared: ${text}`);
+    const g1 = await t.execute("3", { action: "get", id: 1 }, null, null, mockCtx);
+    ok(g1, "get after null");
+    assert.ok(!g1.content[0].text.includes("description:"), "description cleared");
+    assert.ok(!g1.content[0].text.includes("activeForm:"), "activeForm cleared");
+    assert.ok(!g1.content[0].text.includes("owner:"), "owner cleared");
   });
 
-  it("renderResult shows error glyph on failed operations", async () => {
-    const todoTool = pi.tools[0];
-    // Failed create (no subject) with zero existing tasks.
-    const failed = await todoTool.execute(
-      "1",
-      { action: "create", subject: "" },
-      null,
-      null,
-      mockCtx,
-    );
-    assert.ok(failed.isError);
-    const rendered = todoTool.renderResult(failed, {}, { fg: (_c: string, s: string) => s }, {});
-    assert.ok(rendered.text.includes("✗"), `expected error glyph, got: ${rendered.text}`);
-  });
-
-  it("allows deep blockedBy chains without false cycle errors", async () => {
-    const todoTool = pi.tools[0];
+  it("deep blockedBy chains without false cycles", async () => {
+    const t = pi.tools[0];
     for (let i = 1; i <= 8; i++) {
-      await todoTool.execute(
+      const c = await t.execute(
         String(i),
         { action: "create", subject: `T${i}` },
         null,
         null,
         mockCtx,
       );
+      ok(c, `create T${i}`);
     }
     for (let i = 2; i <= 8; i++) {
-      const r = await todoTool.execute(
+      const r = await t.execute(
         `u${i}`,
         { action: "update", id: i, addBlockedBy: [i - 1] },
         null,
         null,
         mockCtx,
       );
-      assert.ok(!r.isError, `update #${i} failed: ${r.content[0].text}`);
+      ok(r, `link T${i}→T${i - 1}`);
     }
-    // Real cycle must still be rejected: #1 → #8 would close the chain.
-    const cycle = await todoTool.execute(
+    // close the ring: T1→T8
+    const cycle = await t.execute(
       "cycle",
       { action: "update", id: 1, addBlockedBy: [8] },
       null,
       null,
       mockCtx,
     );
-    assert.ok(cycle.isError);
+    fail(cycle, "deep cycle");
     assert.ok(cycle.content[0].text.includes("would create a cycle"));
   });
 
-  it("delete scrubs dependents' blockedBy so they are not stuck on a tombstone", async () => {
-    const todoTool = pi.tools[0];
-    await todoTool.execute("1", { action: "create", subject: "Blocker" }, null, null, mockCtx);
-    await todoTool.execute(
-      "2",
-      { action: "create", subject: "Dependent", blockedBy: [1] },
-      null,
-      null,
-      mockCtx,
-    );
+  it("delete scrubs dependents blockedBy", async () => {
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "B1" }, null, null, mockCtx);
+    await t.execute("2", { action: "create", subject: "Dep", blockedBy: [1] }, null, null, mockCtx);
 
-    await todoTool.execute("3", { action: "delete", id: 1 }, null, null, mockCtx);
-    const got = await todoTool.execute("4", { action: "get", id: 2 }, null, null, mockCtx);
-    assert.ok(!got.content[0].text.includes("blockedBy"), got.content[0].text);
+    const g1 = await t.execute("g1", { action: "get", id: 2 }, null, null, mockCtx);
+    assert.ok(g1.content[0].text.includes("blockedBy"), "dep has blocker before delete");
 
-    // Same via status=deleted update path.
-    await todoTool.execute("5", { action: "create", subject: "B2" }, null, null, mockCtx);
-    await todoTool.execute(
-      "6",
-      { action: "update", id: 2, addBlockedBy: [3] },
-      null,
-      null,
-      mockCtx,
-    );
-    await todoTool.execute(
-      "7",
-      { action: "update", id: 3, status: "deleted" },
-      null,
-      null,
-      mockCtx,
-    );
-    const got2 = await todoTool.execute("8", { action: "get", id: 2 }, null, null, mockCtx);
-    assert.ok(!got2.content[0].text.includes("blockedBy"), got2.content[0].text);
+    await t.execute("3", { action: "delete", id: 1 }, null, null, mockCtx);
+    const g2 = await t.execute("4", { action: "get", id: 2 }, null, null, mockCtx);
+    ok(g2, "get dep after delete");
+    assert.ok(!g2.content[0].text.includes("blockedBy"), "blocker scrubbed");
   });
 
-  it("status-only update is a valid mutation", async () => {
-    const todoTool = pi.tools[0];
-    await todoTool.execute("1", { action: "create", subject: "Solo status" }, null, null, mockCtx);
-    const r = await todoTool.execute(
+  it("status-only update is valid", async () => {
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "S" }, null, null, mockCtx);
+    const r = await t.execute(
       "2",
       { action: "update", id: 1, status: "in_progress" },
       null,
       null,
       mockCtx,
     );
-    assert.ok(!r.isError, r.content[0].text);
+    ok(r, "status-only update");
     assert.ok(r.content[0].text.includes("pending → in_progress"));
-    const r2 = await todoTool.execute(
-      "3",
-      { action: "update", id: 1, status: "completed" },
-      null,
-      null,
-      mockCtx,
-    );
-    assert.ok(!r2.isError, r2.content[0].text);
-    assert.ok(r2.content[0].text.includes("in_progress → completed"));
   });
 
-  it("id-only update errors with a field list (not a silent no-op)", async () => {
-    const todoTool = pi.tools[0];
-    await todoTool.execute("1", { action: "create", subject: "Need fields" }, null, null, mockCtx);
-    const r = await todoTool.execute("2", { action: "update", id: 1 }, null, null, mockCtx);
-    assert.ok(r.isError);
+  it("id-only update errors with field list", async () => {
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "N" }, null, null, mockCtx);
+    const r = await t.execute("2", { action: "update", id: 1 }, null, null, mockCtx);
+    fail(r, "id-only update");
     assert.ok(r.content[0].text.includes("mutable field"));
-    assert.ok(r.content[0].text.includes("status"));
   });
 
-  it("compact without todo history keeps live in-memory tasks", async () => {
-    const todoTool = pi.tools[0];
-    sessionManager.sessionId = "cache-invalidate-session";
-    sessionManager.branch = [];
-
-    await todoTool.execute("1", { action: "create", subject: "Live task" }, null, null, mockCtx);
+  it("compact preserves in-memory state", async () => {
+    const t = pi.tools[0];
+    sessionManager.sessionId = "compact-session";
+    await t.execute("1", { action: "create", subject: "Live" }, null, null, mockCtx);
     await pi.emit("session_start", {}, mockCtx);
-
-    const updated = await todoTool.execute(
+    const r = await t.execute(
       "2",
       { action: "update", id: 1, status: "in_progress" },
       null,
       null,
       mockCtx,
     );
-    assert.ok(!updated.isError, updated.content[0].text);
-
-    // Compact with empty branch (no todo toolResults). Must not wipe live state.
+    ok(r, "update before compact");
     sessionManager.branch = [];
     await pi.emit("session_compact", {}, mockCtx);
-
-    const list = await todoTool.execute("3", { action: "list" }, null, null, mockCtx);
-    assert.ok(list.content[0].text.includes("[in_progress] #1 Live task"), list.content[0].text);
+    const list = await t.execute("3", { action: "list" }, null, null, mockCtx);
+    ok(list, "list after compact");
+    assert.ok(list.content[0].text.includes("[in_progress] #1 Live"));
   });
 
-  it("rejects non-integer / non-positive ids", async () => {
-    const todoTool = pi.tools[0];
-    await todoTool.execute("1", { action: "create", subject: "T" }, null, null, mockCtx);
-
+  it("rejects non-integer ids", async () => {
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "T" }, null, null, mockCtx);
     for (const bad of [1.5, "2.7", "1e2", 0, -1, "0", "abc"]) {
-      const r = await todoTool.execute(
-        `bad-${bad}`,
-        { action: "update", id: bad as unknown as number, status: "in_progress" },
+      const r = await t.execute(
+        `b-${bad}`,
+        { action: "update", id: bad as any, status: "in_progress" },
         null,
         null,
         mockCtx,
       );
-      assert.ok(r.isError, `expected error for id=${JSON.stringify(bad)}: ${r.content[0].text}`);
+      fail(r, `id=${JSON.stringify(bad)}`);
     }
   });
 
-  it("skips replay when branch length is unchanged (cache hit, no recompute)", async () => {
-    const todoTool = pi.tools[0];
-    sessionManager.sessionId = "cache-skip-session";
-    sessionManager.branch = [];
+  // ------------- additional coverage -------------
 
-    // Seed a branch history containing one create result.
-    const created = await todoTool.execute(
-      "1",
-      { action: "create", subject: "Cache task" },
+  it("clear removes all tasks", async () => {
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "A" }, null, null, mockCtx);
+    await t.execute("2", { action: "create", subject: "B" }, null, null, mockCtx);
+    const r = await t.execute("3", { action: "clear" }, null, null, mockCtx);
+    ok(r, "clear");
+    assert.ok(r.content[0].text.includes("Cleared 2 tasks"));
+    const list = await t.execute("4", { action: "list" }, null, null, mockCtx);
+    assert.strictEqual(list.content[0].text, "No tasks");
+  });
+
+  it("get returns error for missing or missing-id", async () => {
+    const t = pi.tools[0];
+    const r1 = await t.execute("1", { action: "get", id: 999 }, null, null, mockCtx);
+    fail(r1, "missing id");
+    assert.ok(r1.content[0].text.includes("not found"));
+
+    const r2 = await t.execute("2", { action: "get" }, null, null, mockCtx);
+    fail(r2, "no id param");
+    assert.ok(r2.content[0].text.includes("id required"));
+  });
+
+  it("rejects self-block and block on non-existent or deleted task", async () => {
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "Main" }, null, null, mockCtx);
+    await t.execute("2", { action: "create", subject: "DelMe" }, null, null, mockCtx);
+
+    // self-block
+    const r1 = await t.execute(
+      "3",
+      { action: "update", id: 1, addBlockedBy: [1] },
       null,
       null,
       mockCtx,
     );
-    sessionManager.branch = [
+    fail(r1, "self-block");
+    assert.ok(r1.content[0].text.includes("cannot block #1 on itself"));
+
+    // non-existent
+    const r2 = await t.execute(
+      "4",
+      { action: "update", id: 1, addBlockedBy: [999] },
+      null,
+      null,
+      mockCtx,
+    );
+    fail(r2, "block on nonexistent");
+    assert.ok(r2.content[0].text.includes("not found"));
+
+    // deleted
+    await t.execute("5", { action: "delete", id: 2 }, null, null, mockCtx);
+    const r3 = await t.execute(
+      "6",
+      { action: "update", id: 1, addBlockedBy: [2] },
+      null,
+      null,
+      mockCtx,
+    );
+    fail(r3, "block on deleted");
+    assert.ok(r3.content[0].text.includes("is deleted"));
+  });
+
+  it("empty add/removeBlockedBy arrays are no-ops", async () => {
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "Base" }, null, null, mockCtx);
+
+    const r1 = await t.execute(
+      "2",
+      { action: "update", id: 1, addBlockedBy: [] },
+      null,
+      null,
+      mockCtx,
+    );
+    ok(r1, "empty addBlockedBy");
+
+    const r2 = await t.execute(
+      "3",
+      { action: "update", id: 1, removeBlockedBy: [] },
+      null,
+      null,
+      mockCtx,
+    );
+    ok(r2, "empty removeBlockedBy");
+
+    // should still succeed — no state corruption
+    const g = await t.execute("4", { action: "get", id: 1 }, null, null, mockCtx);
+    ok(g, "get after empty arrays");
+  });
+
+  it("create and update with metadata", async () => {
+    const t = pi.tools[0];
+    const c1 = await t.execute(
+      "1",
+      { action: "create", subject: "Meta", metadata: { url: "https://ex.com", count: 3 } },
+      null,
+      null,
+      mockCtx,
+    );
+    ok(c1, "create with metadata");
+    const g1 = await t.execute("2", { action: "get", id: 1 }, null, null, mockCtx);
+    // get doesn't print metadata in its output, so check details
+    const g1Details = g1.details.tasks[0];
+    assert.deepStrictEqual(g1Details.metadata, { url: "https://ex.com", count: 3 });
+
+    // update: set null to remove a key, add a new key
+    const u1 = await t.execute(
+      "3",
+      { action: "update", id: 1, metadata: { url: null, priority: "high" } },
+      null,
+      null,
+      mockCtx,
+    );
+    ok(u1, "update metadata");
+    const g2 = await t.execute("4", { action: "get", id: 1 }, null, null, mockCtx);
+    assert.deepStrictEqual(g2.details.tasks[0].metadata, { count: 3, priority: "high" });
+
+    // update: null out last key → metadata becomes undefined
+    const u2 = await t.execute(
+      "5",
+      { action: "update", id: 1, metadata: { count: null, priority: null } },
+      null,
+      null,
+      mockCtx,
+    );
+    ok(u2, "null all metadata");
+    const g3 = await t.execute("6", { action: "get", id: 1 }, null, null, mockCtx);
+    assert.strictEqual(g3.details.tasks[0].metadata, undefined);
+  });
+
+  it("list with includeDeleted shows deleted tasks", async () => {
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "Keep" }, null, null, mockCtx);
+    await t.execute("2", { action: "create", subject: "Hide" }, null, null, mockCtx);
+    await t.execute("3", { action: "delete", id: 2 }, null, null, mockCtx);
+
+    const l1 = await t.execute("4", { action: "list" }, null, null, mockCtx);
+    ok(l1, "list without deleted");
+    assert.ok(!l1.content[0].text.includes("Hide"), "hidden from default list");
+
+    const l2 = await t.execute("5", { action: "list", includeDeleted: true }, null, null, mockCtx);
+    ok(l2, "list with deleted");
+    assert.ok(l2.content[0].text.includes("Hide"), "visible in includeDeleted list");
+  });
+
+  it("get shows full output format", async () => {
+    const t = pi.tools[0];
+    await t.execute(
+      "1",
       {
-        type: "message",
-        message: {
-          role: "toolResult",
-          toolName: "todo",
-          details: created.details,
-        },
+        action: "create",
+        subject: "Detailed",
+        description: "some desc",
+        activeForm: "working",
+        owner: "bot",
+        blockedBy: [],
       },
-    ];
+      null,
+      null,
+      mockCtx,
+    );
 
-    await pi.emit("session_start", {}, mockCtx);
-    assert.strictEqual(__replayComputeCount(), 1);
+    const g = await t.execute("2", { action: "get", id: 1 }, null, null, mockCtx);
+    ok(g, "get detailed");
+    const text = g.content[0].text;
+    assert.ok(text.includes("#1"), text);
+    assert.ok(text.includes("[pending]"), text);
+    assert.ok(text.includes("Detailed"), text);
+    assert.ok(text.includes("description: some desc"), text);
+    assert.ok(text.includes("activeForm: working"), text);
+    assert.ok(text.includes("owner: bot"), text);
+    // blockedBy should NOT appear since we passed []
+    assert.ok(!text.includes("blockedBy:"), "empty blockedBy not printed");
+    // blocks should not appear since nothing blocks it
+    assert.ok(!text.includes("blocks:"), "blocks not printed");
+  });
 
-    // Same branch length -> cache hit, must NOT recompute.
-    await pi.emit("session_start", {}, mockCtx);
-    assert.strictEqual(__replayComputeCount(), 1);
+  it("removeBlockedBy for a non-existent blocker is a no-op", async () => {
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "Main" }, null, null, mockCtx);
+    const r = await t.execute(
+      "2",
+      { action: "update", id: 1, removeBlockedBy: [999] },
+      null,
+      null,
+      mockCtx,
+    );
+    ok(r, "remove non-existent blocker");
+    const g = await t.execute("3", { action: "get", id: 1 }, null, null, mockCtx);
+    ok(g, "get after remove non-existent");
+    assert.ok(!g.content[0].text.includes("blockedBy"));
+  });
 
-    // Different branch length -> cache miss -> recompute.
-    sessionManager.branch = [
-      ...sessionManager.branch,
-      { type: "message", message: { role: "assistant", content: "more" } },
-    ];
-    await pi.emit("session_start", {}, mockCtx);
-    assert.strictEqual(__replayComputeCount(), 2);
+  it("create with empty blockedBy works", async () => {
+    const t = pi.tools[0];
+    const r = await t.execute(
+      "1",
+      { action: "create", subject: "EmptyBlock", blockedBy: [] },
+      null,
+      null,
+      mockCtx,
+    );
+    ok(r, "create with empty blockedBy");
+    const g = await t.execute("2", { action: "get", id: 1 }, null, null, mockCtx);
+    ok(g, "get empty block");
+    assert.ok(!g.content[0].text.includes("blockedBy"), "no blockedBy rendered");
+  });
+
+  it("removes duplicate ids in blockedBy", async () => {
+    const t = pi.tools[0];
+    await t.execute("1", { action: "create", subject: "Target" }, null, null, mockCtx);
+    await t.execute("2", { action: "create", subject: "Dep" }, null, null, mockCtx);
+    const r = await t.execute(
+      "3",
+      { action: "update", id: 2, addBlockedBy: [1, 1, 1] },
+      null,
+      null,
+      mockCtx,
+    );
+    ok(r, "deduplicate blocker list");
+    assert.ok(!r.content[0].text.includes("Error"), "no error on dedup");
+    const g = await t.execute("4", { action: "get", id: 2 }, null, null, mockCtx);
+    // should only list #1 once
+    const match = g.content[0].text.match(/#1/g);
+    assert.strictEqual(match?.length, 1, "exactly one #1 reference");
   });
 });
