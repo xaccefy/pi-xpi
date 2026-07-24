@@ -14,7 +14,7 @@ import {
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { DynamicBorder, type ExtensionAPI, keyText } from "@earendil-works/pi-coding-agent";
-import { Container, Text } from "@earendil-works/pi-tui";
+import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 
 // ---------------------------------------------------------------------------
@@ -493,6 +493,157 @@ async function showTodosOverlay(ctx: any, tasks: Task[]): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Persistent widget (above editor)
+// ---------------------------------------------------------------------------
+const WIDGET_KEY = "pi-xtodo";
+/** Max rendered lines before overflow-collapse kicks in. */
+const MAX_WIDGET_LINES = 12;
+
+// biome-ignore lint/suspicious/noExplicitAny: host-provided ExtensionUIContext
+let widgetUi: any;
+// biome-ignore lint/suspicious/noExplicitAny: host-provided TUI
+let widgetTui: any;
+let widgetRegistered = false;
+let widgetSessionId = "";
+
+function widgetTasks(): Task[] {
+  return (sessions.get(widgetSessionId)?.tasks ?? []).filter((t) => t.status !== "deleted");
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: theme is provided by the host
+function widgetStatusGlyph(status: TaskStatus, theme: any): string {
+  switch (status) {
+    case "pending":
+      return theme.fg("dim", "○");
+    case "in_progress":
+      return theme.fg("warning", "◐");
+    case "completed":
+      return theme.fg("success", "✓");
+    case "deleted":
+      return theme.fg("error", "✗");
+  }
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: theme is provided by the host
+function formatWidgetTask(t: Task, theme: any, showId: boolean): string {
+  const glyph = widgetStatusGlyph(t.status, theme);
+  const done = t.status === "completed" || t.status === "deleted";
+  let subject = theme.fg(done ? "dim" : "text", t.subject);
+  if (done) subject = theme.strikethrough(subject);
+  let line = `${glyph}`;
+  if (showId) line += ` ${theme.fg("accent", `#${t.id}`)}`;
+  line += ` ${subject}`;
+  if (t.status === "in_progress" && t.activeForm)
+    line += ` ${theme.fg("dim", `(${t.activeForm})`)}`;
+  if (t.blockedBy?.length)
+    line += ` ${theme.fg("dim", `⛓ ${t.blockedBy.map((i) => `#${i}`).join(",")}`)}`;
+  return line;
+}
+
+/** Build rendered rows. Reads live state at render time via widgetTasks(). */
+// biome-ignore lint/suspicious/noExplicitAny: theme is provided by the host
+function renderWidgetLines(theme: any, width: number): string[] {
+  const all = widgetTasks();
+  if (all.length === 0) return [];
+  const truncate = (line: string): string => truncateToWidth(line, width);
+  const completedCount = all.filter((t) => t.status === "completed").length;
+  const hasActive = all.some((t) => t.status === "in_progress" || t.status === "pending");
+  // Show per-row ids only when a blockedBy reference needs resolving.
+  const showIds = all.some((t) => t.blockedBy?.length);
+  const headingColor = hasActive ? "accent" : "dim";
+  const heading = truncate(
+    theme.fg(headingColor, hasActive ? "●" : "○") +
+      " " +
+      theme.fg(headingColor, `Todos (${completedCount}/${all.length})`),
+  );
+  const lines: string[] = [heading];
+  const maxBody = MAX_WIDGET_LINES - 1; // heading takes 1 row
+
+  const row = (t: Task, last: boolean): string =>
+    truncate(`${theme.fg("dim", last ? "└─" : "├─")} ${formatWidgetTask(t, theme, showIds)}`);
+
+  // Happy path: everything fits in natural order.
+  if (all.length <= maxBody) {
+    for (let i = 0; i < all.length; i++) lines.push(row(all[i], i === all.length - 1));
+    return lines;
+  }
+
+  // Overflow: reserve 1 line for the summary, drop completed first (kept in
+  // natural order), then truncate the non-completed tail if still overflowing.
+  const budget = maxBody - 1;
+  const nonCompleted = all.filter((t) => t.status !== "completed");
+  let visible: Task[];
+  let truncatedTail = 0;
+  if (nonCompleted.length <= budget) {
+    const kept = new Set<Task>(nonCompleted);
+    for (const t of all) {
+      if (kept.size >= budget) break;
+      if (t.status === "completed") kept.add(t);
+    }
+    visible = all.filter((t) => kept.has(t));
+  } else {
+    visible = nonCompleted.slice(0, budget);
+    truncatedTail = nonCompleted.length - budget;
+  }
+  for (const t of visible) lines.push(row(t, false));
+  const hiddenCompleted = completedCount - visible.filter((t) => t.status === "completed").length;
+  const parts: string[] = [];
+  if (hiddenCompleted > 0) parts.push(`${hiddenCompleted} completed`);
+  if (truncatedTail > 0) parts.push(`${truncatedTail} pending`);
+  const hidden = hiddenCompleted + truncatedTail;
+  lines.push(
+    truncate(
+      `${theme.fg("dim", "└─")} ${theme.fg("dim", `+${hidden} more${parts.length ? ` (${parts.join(", ")})` : ""}`)}`,
+    ),
+  );
+  return lines;
+}
+
+/**
+ * Idempotent widget refresh. Safe to call from the tool execute and every
+ * session event. Registers the factory once, then requestRender() afterwards;
+ * unregisters when no visible tasks remain.
+ */
+// biome-ignore lint/suspicious/noExplicitAny: ctx is provided by the host
+function refreshWidget(ctx: any, sessionId?: string): void {
+  if (sessionId !== undefined) widgetSessionId = sessionId;
+  if (!ctx?.hasUI || !ctx.ui) return;
+  if (ctx.ui !== widgetUi) {
+    // Fresh UI context (reload/new session) — re-register under it.
+    widgetUi = ctx.ui;
+    widgetRegistered = false;
+    widgetTui = undefined;
+  }
+
+  if (widgetTasks().length === 0) {
+    if (widgetRegistered) {
+      widgetUi.setWidget(WIDGET_KEY, undefined);
+      widgetRegistered = false;
+      widgetTui = undefined;
+    }
+    return;
+  }
+
+  if (!widgetRegistered) {
+    // biome-ignore lint/suspicious/noExplicitAny: host-provided values
+    widgetUi.setWidget(WIDGET_KEY, (tui: any, theme: any) => {
+      widgetTui = tui;
+      return {
+        render: (w: number) => renderWidgetLines(theme, w),
+        invalidate: () => {
+          // Theme changed — force re-registration under a fresh factory.
+          widgetRegistered = false;
+          widgetTui = undefined;
+        },
+      };
+    });
+    widgetRegistered = true;
+  } else {
+    widgetTui?.requestRender?.();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Tool Registration
 // ---------------------------------------------------------------------------
 export default function registerTodo(pi: ExtensionAPI) {
@@ -509,6 +660,7 @@ export default function registerTodo(pi: ExtensionAPI) {
       if (!result.error) {
         setSessionState(sessionId, result.state);
         saveState(sessionId, result.state);
+        refreshWidget(ctx, sessionId);
       }
       return {
         content: [{ type: "text", text: result.text }],
@@ -558,28 +710,59 @@ export default function registerTodo(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    const sessionId = sid(ctx);
     let state = replayFromBranch(ctx);
     if (state.nextId === 1) {
-      const stored = restoreState(sid(ctx));
+      const stored = restoreState(sessionId);
       if (stored) state = stored;
     }
-    setSessionState(sid(ctx), state);
+    setSessionState(sessionId, state);
+    refreshWidget(ctx, sessionId);
   });
 
   pi.on("session_compact", async (_event, ctx) => {
     const sessionId = sid(ctx);
     const state = sessions.get(sessionId);
-    if (!state) return;
+    if (state) {
+      const replayed = replayFromBranch(ctx);
+      if (replayed.nextId > 1) {
+        setSessionState(sessionId, replayed);
+      }
+    }
+    refreshWidget(ctx, sessionId);
+  });
+
+  pi.on("session_tree", async (_event, ctx) => {
+    const sessionId = sid(ctx);
     const replayed = replayFromBranch(ctx);
     if (replayed.nextId > 1) {
       setSessionState(sessionId, replayed);
     }
+    refreshWidget(ctx, sessionId);
+  });
+
+  pi.on("session_shutdown", async () => {
+    if (widgetRegistered && widgetUi) {
+      try {
+        widgetUi.setWidget(WIDGET_KEY, undefined);
+      } catch {
+        // UI already gone
+      }
+    }
+    widgetUi = undefined;
+    widgetTui = undefined;
+    widgetRegistered = false;
+    widgetSessionId = "";
   });
 }
 
 // Test helpers
 export function __resetState(): void {
   sessions.clear();
+  widgetUi = undefined;
+  widgetTui = undefined;
+  widgetRegistered = false;
+  widgetSessionId = "";
   try {
     for (const f of readdirSync(xtodoDir())) {
       if (f.endsWith(".json")) unlinkSync(join(xtodoDir(), f));

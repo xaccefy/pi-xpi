@@ -702,6 +702,90 @@ describe("pi-xtodo", () => {
     assert.ok(captured.notified?.includes("Fallback task"), captured.notified);
   });
 
+  // --- Persistent widget ---
+
+  const widgetTheme: any = {
+    fg: (_c: string, s: string) => s,
+    bold: (s: string) => s,
+    strikethrough: (s: string) => s,
+  };
+
+  function mockWidgetCtx() {
+    const captured: any = { widgets: new Map(), renders: 0 };
+    const tui = {
+      requestRender: () => {
+        captured.renders++;
+      },
+    };
+    const ui = {
+      setWidget: (key: string, content: any) => {
+        if (content === undefined) captured.widgets.delete(key);
+        else captured.widgets.set(key, content);
+      },
+    };
+    const ctx: any = { sessionManager, hasUI: true, ui };
+    return { ctx, captured, tui };
+  }
+
+  it("widget registers above editor on create and renders tasks", async () => {
+    const t = pi.tools[0];
+    const { ctx, captured, tui } = mockWidgetCtx();
+    await t.execute("1", { action: "create", subject: "Widget task" }, null, null, ctx);
+    const factory = captured.widgets.get("pi-xtodo");
+    assert.ok(factory, "widget registered after create");
+    const comp = factory(tui, widgetTheme);
+    const lines = comp.render(80).map(stripAnsi);
+    assert.ok(
+      lines.some((l: string) => l.includes("Widget task")),
+      lines.join("\n"),
+    );
+    assert.ok(
+      lines.some((l: string) => l.includes("Todos (0/1)")),
+      lines.join("\n"),
+    );
+
+    // Second mutation re-renders instead of re-registering.
+    await t.execute("2", { action: "create", subject: "Second" }, null, null, ctx);
+    assert.strictEqual(captured.renders, 1, "requestRender on update");
+    const lines2 = factory(tui, widgetTheme).render(80).map(stripAnsi);
+    assert.ok(
+      lines2.some((l: string) => l.includes("Second")),
+      lines2.join("\n"),
+    );
+  });
+
+  it("widget hides when the last task is cleared", async () => {
+    const t = pi.tools[0];
+    const { ctx, captured } = mockWidgetCtx();
+    await t.execute("1", { action: "create", subject: "Gone soon" }, null, null, ctx);
+    assert.ok(captured.widgets.has("pi-xtodo"), "registered");
+    await t.execute("2", { action: "clear" }, null, null, ctx);
+    assert.ok(!captured.widgets.has("pi-xtodo"), "unregistered when empty");
+  });
+
+  it("widget shows restored tasks on session_start", async () => {
+    const t = pi.tools[0];
+    const { ctx } = mockWidgetCtx();
+    await t.execute("1", { action: "create", subject: "Persisted" }, null, null, ctx);
+    // Simulate a fresh session: new UI binding, state restored from disk.
+    const fresh = mockWidgetCtx();
+    await pi.emit("session_start", {}, fresh.ctx);
+    const factory = fresh.captured.widgets.get("pi-xtodo");
+    assert.ok(factory, "widget registered on session_start");
+    const lines = factory(fresh.tui, widgetTheme).render(80).map(stripAnsi);
+    assert.ok(
+      lines.some((l: string) => l.includes("Persisted")),
+      lines.join("\n"),
+    );
+  });
+
+  it("widget stays hidden without UI", async () => {
+    const t = pi.tools[0];
+    // mockCtx has no hasUI/ui — must not throw.
+    const r = await t.execute("1", { action: "create", subject: "No UI" }, null, null, mockCtx);
+    ok(r, "execute works without UI");
+  });
+
   it("removes duplicate ids in blockedBy", async () => {
     const t = pi.tools[0];
     await t.execute("1", { action: "create", subject: "Target" }, null, null, mockCtx);

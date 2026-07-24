@@ -1,6 +1,6 @@
 # pi-xtodo
 
-Task list for step-by-step agent work: `blockedBy` links (a DAG), TUI overlay, replay from history or save to disk.
+Task list for step-by-step agent work: `blockedBy` links (a DAG), persistent widget above the editor, TUI overlay, replay from history or save to disk.
 
 ## Install
 
@@ -42,6 +42,10 @@ pending ↔ in_progress → completed → deleted
 
 ## Display
 
+- A persistent widget above the editor shows the live list (`Todos (done/total)`
+  header, tree rows, overflow collapses completed first). It auto-hides when no
+  visible tasks remain and refreshes on every `todo` mutation, `session_start`,
+  compact, and tree events.
 - Tool results render as a one-line summary (glyph + first line / task count).
   Expand the tool row (`app.tools.expand` keybinding) to see full lists and details.
   Errors render as `✗ <message>`.
