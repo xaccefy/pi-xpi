@@ -34,11 +34,17 @@ This finds:
 Document what you find — it feeds your attack strategy.
 
 ### Step 2: Map the surface (code or live)
+
+**Tool selection — critical:**
+- **Code search** → use the `grep` and `find` **tools** (fff in override mode — frecency-ranked, typo-tolerant). NEVER run `bash("rg ...")` or `bash("grep ...")` for code search — that bypasses fff and is slower.
+- **Live probing** → use `bash` for CLI tools only: `curl`, `httpx`, `ffuf`, `nmap`. These are fire-and-forget CLIs, not code search.
+- **File reading** → use the `read` tool, not `bash("cat ...")`.
+
 **If source code is available:**
 - Enumerate input vectors: `grep` for route/handler registrations (`@app.route`, `router.`, `app.get`, `@RequestMapping`, etc.)
 - Trace from entry points toward sensitive sinks: `grep` for sink patterns (`exec(`, `eval(`, `system(`, `child_process`, `popen`, `unserialize`, `innerHTML`, `dangerouslySetInnerHTML`, etc.)
 - `read` the matching files to confirm the call chain and understand defenses
-- fff (in override mode) makes `grep`/`find` frecency-ranked and typo-tolerant across large repos — no separate index step needed
+- fff (in override mode) makes the `grep`/`find` tools frecency-ranked and typo-tolerant across large repos — no separate index step needed
 
 **If live target (no source):**
 - Use the web-pentest skill's recon section for tech fingerprinting
@@ -105,10 +111,9 @@ VERDICT: INCOMPLETE  # COVERED only if no UNCHECKED entry points remain; NOT_FOU
 - Use exploit_search to find alternative techniques if standard ones fail.
 - `NOT_FOUND` requires an empty UNCHECKED list. Any unchecked entry point → `INCOMPLETE`, not `NOT_FOUND`.
 - Document what was tried — don't just say "not found" without evidence of effort.
-
 ## Rules
 - One attack class per run. Do not hunt for anything outside your assigned class.
 - No PoC writing — that's exploit's job. Report findings; validation comes later.
 - If the web-pentest skill's techniques consistently fail for your class+target combo, use exploit_search to find alternatives before giving up.
 - When in doubt about a finding's exploitability, set confidence=low and document why. The tracer will validate reachability.
-- All tools available to you (`grep`/`find`/`read` for source analysis, `bash` for live probing). Use both when both are available.
+- All tools available to you (`grep`/`find`/`read` for source analysis, `bash` for live probing). Use both when both are available. **Never use `bash` for code search** — `bash("rg ...")` or `bash("grep ...")` bypasses fff and is slower than the `grep` tool. Reserve `bash` for CLI tools (curl, httpx, ffuf) and script execution.
