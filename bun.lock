@@ -4,6 +4,12 @@
   "workspaces": {
     "": {
       "name": "pi-xpi",
+      "dependencies": {
+        "@sinclair/typebox": "^0.32.34",
+        "@xaccefy/pi-casefile": "*",
+        "@xaccefy/pi-webxp": "*",
+        "@xaccefy/pi-xtodo": "*",
+      },
       "devDependencies": {
         "@biomejs/biome": "^2.5.2",
         "@earendil-works/pi-ai": "^0.80.3",
@@ -16,15 +22,16 @@
         "@earendil-works/pi-ai": "*",
         "@earendil-works/pi-coding-agent": "*",
         "@earendil-works/pi-tui": "*",
-        "@xaccefy/pi-casefile": "*",
-        "@xaccefy/pi-exploitsearch": "*",
-        "@xaccefy/pi-lookup": "*",
-        "@xaccefy/pi-xtodo": "*",
       },
+      "optionalPeers": [
+        "@earendil-works/pi-ai",
+        "@earendil-works/pi-coding-agent",
+        "@earendil-works/pi-tui",
+      ],
     },
     "packages/pi-casefile": {
       "name": "@xaccefy/pi-casefile",
-      "version": "0.5.4",
+      "version": "0.5.7",
       "dependencies": {
         "@sinclair/typebox": "^0.32.34",
       },
@@ -38,27 +45,20 @@
         "@earendil-works/pi-tui": "*",
       },
     },
-    "packages/pi-exploitsearch": {
-      "name": "@xaccefy/pi-exploitsearch",
-      "version": "0.5.4",
-      "dependencies": {
-        "@sinclair/typebox": "^0.32.34",
-      },
+    "packages/pi-shared": {
+      "name": "@xaccefy/pi-shared",
+      "version": "0.5.7",
       "devDependencies": {
         "@types/bun": "^1.3.14",
         "typescript": "^6.0.3",
       },
-      "peerDependencies": {
-        "@earendil-works/pi-ai": "*",
-        "@earendil-works/pi-coding-agent": "*",
-        "@earendil-works/pi-tui": "*",
-      },
     },
-    "packages/pi-lookup": {
-      "name": "@xaccefy/pi-lookup",
-      "version": "0.5.4",
+    "packages/pi-webxp": {
+      "name": "@xaccefy/pi-webxp",
+      "version": "0.5.7",
       "dependencies": {
         "@sinclair/typebox": "^0.32.34",
+        "@xaccefy/pi-shared": "*",
         "open-websearch": "^2.1.11",
       },
       "devDependencies": {
@@ -73,7 +73,7 @@
     },
     "packages/pi-xtodo": {
       "name": "@xaccefy/pi-xtodo",
-      "version": "0.5.4",
+      "version": "0.5.7",
       "dependencies": {
         "@sinclair/typebox": "^0.32.34",
       },
@@ -265,9 +265,9 @@
 
     "@xaccefy/pi-casefile": ["@xaccefy/pi-casefile@workspace:packages/pi-casefile"],
 
-    "@xaccefy/pi-exploitsearch": ["@xaccefy/pi-exploitsearch@workspace:packages/pi-exploitsearch"],
+    "@xaccefy/pi-shared": ["@xaccefy/pi-shared@workspace:packages/pi-shared"],
 
-    "@xaccefy/pi-lookup": ["@xaccefy/pi-lookup@workspace:packages/pi-lookup"],
+    "@xaccefy/pi-webxp": ["@xaccefy/pi-webxp@workspace:packages/pi-webxp"],
 
     "@xaccefy/pi-xtodo": ["@xaccefy/pi-xtodo@workspace:packages/pi-xtodo"],
 

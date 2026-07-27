@@ -1,7 +1,9 @@
 /**
- * Bounded TTL + singleflight cache for long-lived agent sessions.
+ * Bounded TTL + LRU cache with singleflight coalescing.
+ *
+ * Shared across XPI packages so a bug fix lands once. Kept dependency-free
+ * (no typebox, no host types) so any extension can import it.
  */
-
 export class TtlLruCache<T> {
   private readonly map = new Map<string, { expires: number; value: T }>();
   private readonly inflight = new Map<string, Promise<T>>();
@@ -18,7 +20,7 @@ export class TtlLruCache<T> {
       this.map.delete(key);
       return undefined;
     }
-    // LRU touch
+    // LRU touch: re-insert at the tail so eviction order reflects recency.
     this.map.delete(key);
     this.map.set(key, hit);
     return hit.value;
@@ -61,6 +63,7 @@ export class TtlLruCache<T> {
   }
 }
 
+/** Sleep that rejects when the parent signal aborts. No-op safe when undefined. */
 export function abortableSleep(ms: number, parentSignal?: AbortSignal): Promise<void> {
   if (parentSignal?.aborted) {
     return Promise.reject(parentSignal.reason ?? new Error("aborted"));
@@ -76,8 +79,4 @@ export function abortableSleep(ms: number, parentSignal?: AbortSignal): Promise<
     };
     parentSignal?.addEventListener("abort", onAbort, { once: true });
   });
-}
-
-export function isTransientHttpStatus(status: number): boolean {
-  return status === 408 || status === 429 || status >= 500;
 }

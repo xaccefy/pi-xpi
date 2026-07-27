@@ -27,11 +27,8 @@ jobs:
         run: bun install --frozen-lockfile
 
       # Biome CI mode: non-interactive, fails on diagnostics at the chosen level.
-      # Currently a soft gate (continue-on-error) because 3 pre-existing lint errors
-      # exist in the codebase; promote to a required gate after they are fixed.
       - name: Lint (Biome)
         run: bunx @biomejs/biome ci . --diagnostic-level=error
-        continue-on-error: true
 
       - name: Typecheck
         run: bun run typecheck

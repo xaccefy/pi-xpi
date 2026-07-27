@@ -101,8 +101,18 @@ export type CaseRecord = {
   tags?: string[];
   /** Explicit assumptions or unknowns to avoid overstating exploitability. */
   assumptions?: string[];
+  /** Agent's documented attempt to disprove the finding (required before CONFIRMED). */
+  disconfirmation?: string;
   /** Verification of an on-disk PoC run (set only by promoteFindingResult). */
   pocVerified?: {
+    path: string;
+    exitCode: number;
+    ranAt: string;
+    output?: string;
+    sandbox: boolean;
+  };
+  /** Verification of a disconfirmation run (set only by promoteFindingResult). */
+  disconfirmationVerified?: {
     path: string;
     exitCode: number;
     ranAt: string;
@@ -140,11 +150,14 @@ export type CaseInput = {
   blockers?: string[];
   tags?: string[];
   assumptions?: string[];
+  /** Agent's documented attempt to disprove the finding (required before CONFIRMED). */
+  disconfirmation?: string;
 };
 
 type NormalizedCaseInput = Partial<CaseInput> & {
   linkedCaseIds?: string[];
   pocVerified?: CaseRecord["pocVerified"];
+  disconfirmationVerified?: CaseRecord["disconfirmationVerified"];
   reportedAt?: string;
   reportPath?: string;
 };
@@ -285,6 +298,8 @@ function getDb(): DatabaseSync {
       tags_json TEXT, -- JSON string array
       assumptions_json TEXT, -- JSON string array
       poc_verified_json TEXT, -- JSON object
+      disconfirmation TEXT,
+      disconfirmation_verified_json TEXT, -- JSON object
       reported_at TEXT,
       report_path TEXT,
       created_at TEXT NOT NULL,
@@ -307,6 +322,15 @@ function getDb(): DatabaseSync {
   const linkCols = db.prepare("PRAGMA table_info(case_links)").all() as { name: string }[];
   if (!linkCols.some((c) => c.name === "kind")) {
     db.exec("ALTER TABLE case_links ADD COLUMN kind TEXT NOT NULL DEFAULT 'related'");
+  }
+
+  // Idempotent migration for new columns on existing databases
+  const caseCols = db.prepare("PRAGMA table_info(cases)").all() as { name: string }[];
+  if (!caseCols.some((c) => c.name === "disconfirmation")) {
+    db.exec("ALTER TABLE cases ADD COLUMN disconfirmation TEXT");
+  }
+  if (!caseCols.some((c) => c.name === "disconfirmation_verified_json")) {
+    db.exec("ALTER TABLE cases ADD COLUMN disconfirmation_verified_json TEXT");
   }
 
   // Indexes
@@ -361,7 +385,9 @@ function mapRow(row: any, linkedCases: { id: string; kind: string }[] = []): Cas
     blockers: safeParseArray(row.blockers_json),
     tags: safeParseArray(row.tags_json),
     assumptions: safeParseArray(row.assumptions_json),
+    disconfirmation: row.disconfirmation || undefined,
     pocVerified: safeParseObject(row.poc_verified_json),
+    disconfirmationVerified: safeParseObject(row.disconfirmation_verified_json),
     reportedAt: row.reported_at || undefined,
     reportPath: row.report_path || undefined,
     linkedCases,
@@ -393,6 +419,19 @@ export function readCasefile(): CaseRecord[] {
   return rows.map((row: any) => mapRow(row, linkMap.get(row.id) ?? []));
 }
 
+/**
+ * Read only non-terminal cases (hypothesis, investigating, confirmed, blocked).
+ * Used for per-prompt context injection so we never load killed/reported rows
+ * (which grow without bound over a long engagement) into memory each turn.
+ */
+export function readActiveCases(): CaseRecord[] {
+  const db = getDb();
+  const rows = db
+    .prepare("SELECT * FROM cases WHERE status NOT IN ('killed', 'reported')")
+    .all() as any[];
+  return mapRowsWithLinks(db, rows);
+}
+
 export function getCaseById(id: string): CaseRecord | undefined {
   const db = getDb();
   const stmt = db.prepare("SELECT * FROM cases WHERE id = ?");
@@ -416,9 +455,13 @@ function validateCase(record: CaseRecord): void {
   // CONFIRMED when it has evidence, a PoC, demonstrated impact, and a severity.
   if (
     record.status === "confirmed" &&
-    (!record.evidence || !record.poc || !record.impact || !record.severity)
+    (!record.evidence ||
+      !record.poc ||
+      !record.impact ||
+      !record.severity ||
+      !record.disconfirmation)
   ) {
-    throw new Error("Confirmed cases require evidence, poc, impact, and severity");
+    throw new Error("Confirmed cases require evidence, poc, impact, severity, and disconfirmation");
   }
   if (record.status === "blocked" && (record.blockers ?? []).length === 0) {
     throw new Error("Blocked cases require at least one blocker");
@@ -553,6 +596,11 @@ function buildRecord(input: NormalizedCaseInput, existing?: CaseRecord): CaseRec
     tags: normalizeList(input.tags ?? existing?.tags),
     assumptions: normalizeList(input.assumptions ?? existing?.assumptions),
     pocVerified: input.pocVerified ?? existing?.pocVerified,
+    disconfirmation:
+      input.disconfirmation !== undefined
+        ? normalizeText(input.disconfirmation)
+        : existing?.disconfirmation,
+    disconfirmationVerified: input.disconfirmationVerified ?? existing?.disconfirmationVerified,
     reportedAt: input.reportedAt ?? existing?.reportedAt,
     reportPath: input.reportPath ?? existing?.reportPath,
     linkedCases: existing?.linkedCases ?? [],
@@ -574,12 +622,19 @@ function findDuplicateCaseInDb(
   const endpoint = normalizeMatchText(candidate.endpoint);
   const bugClass = normalizeMatchText(candidate.bugClass);
 
-  // Query non-killed cases, then match normalized title/scope in JS.
+  // Pre-filter by normalized title in SQL so we don't load the whole ledger into
+  // JS just to find a duplicate. normalizeMatchText lowercases + collapses
+  // whitespace, so we match against lower(title) with the same normalization.
+  // The full title/target/endpoint/bugClass match still runs in JS below to catch
+  // whitespace/case differences the SQL LIKE can't express exactly.
+  const sqlTitle = `%${title}%`;
   const rows = excludeId
     ? (db
-        .prepare("SELECT * FROM cases WHERE status != 'killed' AND id != ?")
-        .all(excludeId) as any[])
-    : (db.prepare("SELECT * FROM cases WHERE status != 'killed'").all() as any[]);
+        .prepare("SELECT * FROM cases WHERE status != 'killed' AND id != ? AND lower(title) LIKE ?")
+        .all(excludeId, sqlTitle) as any[])
+    : (db
+        .prepare("SELECT * FROM cases WHERE status != 'killed' AND lower(title) LIKE ?")
+        .all(sqlTitle) as any[]);
 
   for (const row of rows) {
     if (
@@ -610,11 +665,13 @@ function upsertCase(db: DatabaseSync, record: CaseRecord) {
       id, title, status, confidence, severity, priority, target, endpoint, bugClass,
       summary, evidence, impact, nextStep, poc, remediation,
       references_json, blockers_json, tags_json, assumptions_json, poc_verified_json,
+      disconfirmation, disconfirmation_verified_json,
       reported_at, report_path, created_at, updated_at
     ) VALUES (
       ?, ?, ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?, ?,
+      ?, ?,
       ?, ?, ?, ?
     )
     ON CONFLICT(id) DO UPDATE SET
@@ -637,6 +694,8 @@ function upsertCase(db: DatabaseSync, record: CaseRecord) {
       tags_json = excluded.tags_json,
       assumptions_json = excluded.assumptions_json,
       poc_verified_json = excluded.poc_verified_json,
+      disconfirmation = excluded.disconfirmation,
+      disconfirmation_verified_json = excluded.disconfirmation_verified_json,
       reported_at = excluded.reported_at,
       report_path = excluded.report_path,
       created_at = excluded.created_at,
@@ -664,6 +723,8 @@ function upsertCase(db: DatabaseSync, record: CaseRecord) {
     JSON.stringify(record.tags),
     JSON.stringify(record.assumptions),
     record.pocVerified ? JSON.stringify(record.pocVerified) : null,
+    record.disconfirmation || null,
+    record.disconfirmationVerified ? JSON.stringify(record.disconfirmationVerified) : null,
     record.reportedAt || null,
     record.reportPath || null,
     record.createdAt,
@@ -719,6 +780,7 @@ export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResu
     "nextStep",
     "poc",
     "remediation",
+    "disconfirmation",
   ] as const;
   const optionalPatch: Record<string, unknown> = {};
   for (const field of optionalFields) {
@@ -746,16 +808,38 @@ export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResu
     validateTransition(current.status, next.status, update, current);
   }
 
-  // Demoting off confirmed invalidates prior PoC verification — re-promote required.
+  // Demoting off confirmed invalidates prior PoC + disconfirmation verification —
+  // re-promote required. Both verification artifacts must be re-earned together.
   if (current.status === "confirmed" && next.status === "investigating") {
-    next = { ...next, pocVerified: undefined };
+    next = { ...next, pocVerified: undefined, disconfirmationVerified: undefined };
   }
 
   validateCase(next);
 
-  // Check material equality (we ignore links since links are mutated via CaseLink)
+  // Check material equality (we ignore links since links are mutated via CaseLink).
+  // Keys are sorted before stringify because mapRow (DB read) and buildRecord
+  // (write) emit CaseRecord keys in different orders — a plain JSON.stringify({...r})
+  // would report false "changed" on no-op updates whenever a field is undefined on
+  // one side and absent on the other. Sorting makes the comparison order-independent.
+  // Do NOT simplify back to JSON.stringify({...r}) — it reintroduces the bug.
   const norm = (r: CaseRecord) =>
-    JSON.stringify({ ...r, updatedAt: "", createdAt: "", linkedCaseIds: [], linkedCases: [] });
+    JSON.stringify(
+      Object.keys(r)
+        .sort()
+        .reduce<Record<string, unknown>>((acc, k) => {
+          if (
+            k === "updatedAt" ||
+            k === "createdAt" ||
+            k === "linkedCaseIds" ||
+            k === "linkedCases"
+          ) {
+            acc[k] = "";
+          } else {
+            acc[k] = (r as Record<string, unknown>)[k];
+          }
+          return acc;
+        }, {}),
+    );
   if (norm(current) === norm(next)) {
     const reason =
       update.status && update.status === current.status
@@ -777,7 +861,7 @@ export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResu
   return { record: next, changed: true };
 }
 
-type PocVerification = {
+export type PocVerification = {
   path: string;
   exitCode: number;
   ranAt: string;
@@ -811,10 +895,24 @@ export function assertPromotable(id: string): CaseRecord {
   if (!current.severity) {
     throw new Error("CONFIRMED requires severity; set severity on the case first");
   }
+  if (!current.target) {
+    throw new Error(
+      "CONFIRMED requires target (what host/repo/scope this affects); set target on the case first",
+    );
+  }
+  if (!current.disconfirmation) {
+    throw new Error(
+      "CONFIRMED requires disconfirmation (your attempt to disprove the finding); set disconfirmation on the case first",
+    );
+  }
   return current;
 }
 
-export function promoteFindingResult(id: string, verification: PocVerification): CaseUpdateResult {
+export function promoteFindingResult(
+  id: string,
+  verification: PocVerification,
+  disconfirmationVerification?: PocVerification,
+): CaseUpdateResult {
   const db = getDb();
   const current = assertPromotable(id);
   if (verification.exitCode !== 0) {
@@ -830,14 +928,16 @@ export function promoteFindingResult(id: string, verification: PocVerification):
     `- **Sandbox:** ${verification.sandbox ? "yes" : "no"}\n` +
     `#### Execution Output\n\`\`\`\n${verification.output ?? ""}\n\`\`\``;
 
-  const next = buildRecord(
-    {
-      status: "confirmed",
-      pocVerified: verification,
-      evidence: newEvidence,
-    },
-    current,
-  );
+  const update: NormalizedCaseInput = {
+    status: "confirmed",
+    pocVerified: verification,
+    evidence: newEvidence,
+  };
+  if (disconfirmationVerification) {
+    update.disconfirmationVerified = disconfirmationVerification;
+  }
+
+  const next = buildRecord(update, current);
   validateCase(next);
 
   upsertCase(db, next);
@@ -1226,6 +1326,13 @@ export function writeCaseReport(id: string): { path: string; record: CaseRecord 
           `### PoC Run Verification\n- **Timestamp:** ${current.pocVerified.ranAt}\n- **Path:** \`${current.pocVerified.path}\`\n- **Sandbox:** ${current.pocVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.pocVerified.exitCode}\n\n#### Output\n\`\`\`\n${current.pocVerified.output ?? ""}\n\`\`\``,
         )
       : undefined,
+    mdSection("Disconfirmation Attempt", current.disconfirmation),
+    current.disconfirmationVerified
+      ? mdSection(
+          "Disconfirmation Verification Log",
+          `### Disconfirmation Run Verification\n- **Timestamp:** ${current.disconfirmationVerified.ranAt}\n- **Path:** \`${current.disconfirmationVerified.path}\`\n- **Sandbox:** ${current.disconfirmationVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.disconfirmationVerified.exitCode} (non-zero = finding survived the attempt to disprove)\n\n#### Output\n\`\`\`\n${current.disconfirmationVerified.output ?? ""}\n\`\`\``,
+        )
+      : undefined,
     mdSection("Impact", current.impact),
     mdSection("Remediation", current.remediation),
     mdSection("Assumptions and Uncertainty", assumptions),
@@ -1243,6 +1350,11 @@ export function writeCaseReport(id: string): { path: string; record: CaseRecord 
     updatedAt: new Date().toISOString(),
   };
 
+  // Enforce the same field invariants as every other write path. writeCaseReport
+  // never changes status (confirmed stays confirmed; the caller flips to reported
+  // via CaseUpdate, which runs validateTransition), but it does set reportPath —
+  // validateCase ensures the resulting record is internally consistent.
+  validateCase(next);
   upsertCase(db, next);
   return { path: reportPath, record: next };
 }

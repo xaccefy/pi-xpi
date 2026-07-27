@@ -17,9 +17,13 @@ fi
 echo "Installing XPI extension dependencies..."
 
 # Install required pi extensions
-for pkg in pi-codex-goal pi-mcp-adapter pi-subagents codebase-memory-mcp; do
+for pkg in pi-codex-goal pi-mcp-adapter pi-subagents @ff-labs/pi-fff; do
   $PI_BIN install "npm:$pkg" 2>/dev/null || echo "  $pkg install skipped"
 done
+
+# fff (file search) in override mode transparently upgrades pi's built-in
+# grep/find/multi_grep with frecency-ranked, typo-tolerant search.
+export PI_FFF_MODE=override
 
 # Copy agent definitions so pi-subagents discovers them
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,7 +31,7 @@ mkdir -p ~/.pi/agent/agents
 cp -f "$SCRIPT_DIR"/agents/*.md ~/.pi/agent/agents/ 2>/dev/null || true
 
 echo ""
-echo "ExploitSearch requires a preview.is API key."
+echo "exploit_search requires a preview.is API key."
 echo "Get one at https://preview.is and add to your shell profile:"
 echo '  export PREVIEW_IS_API_KEY="rk_yourkeyhere"'
 echo ""

@@ -35,6 +35,7 @@ import {
   linkCasesResult,
   PRIORITY_VALUES,
   promoteFindingResult,
+  readActiveCases,
   readCasefile,
   SEARCH_FIELD_VALUES,
   SEVERITY_VALUES,
@@ -44,7 +45,7 @@ import {
   updateCaseResult,
   writeCaseReport,
 } from "./ledger.ts";
-import { runPoc } from "./poc-runner.ts";
+import { type PocRun, runPoc } from "./poc-runner.ts";
 import { STATIC_CYBER_WORKFLOW } from "./workflow.ts";
 
 // ── Schemas ───────────────────────────────────────────────────────────
@@ -110,6 +111,12 @@ const PromoteSchema = Type.Object(
     poc_path: Type.String({
       description: "Absolute path to the PoC script on disk",
     }),
+    disconfirmation_path: Type.Optional(
+      Type.String({
+        description:
+          "Absolute path to a disconfirmation script that tries to disprove the finding; must exit non-zero (failure to disprove)",
+      }),
+    ),
     local: Type.Optional(Type.Boolean({ description: "Run locally instead of in Docker sandbox" })),
   },
   { additionalProperties: false },
@@ -405,7 +412,8 @@ function buildCaseListContext(records: CaseRecord[]): string {
 /** Always includes cyber workflow; attaches case list when active cases exist. */
 function buildAgentInjection(active: CaseRecord[]): string {
   const caseList = buildCaseListContext(active);
-  return caseList ? `${caseList}\n\n${STATIC_CYBER_WORKFLOW}` : STATIC_CYBER_WORKFLOW;
+  // Workflow FIRST for prominence, then case list as reference data.
+  return caseList ? `${STATIC_CYBER_WORKFLOW}\n\n${caseList}` : STATIC_CYBER_WORKFLOW;
 }
 
 // ── XP (offensive / exploit) mode toggle ─────────────────────────────
@@ -623,13 +631,14 @@ export default function casefileExtension(pi: ExtensionAPI) {
     name: "PromoteFinding",
     label: "Promote Finding",
     description:
-      "Run an on-disk PoC script (Docker sandbox or local) and, on exit 0, promote an investigating case to confirmed.",
+      "Run an on-disk PoC script (Docker sandbox or local) and, on exit 0, promote an investigating case to confirmed. Optionally run a disconfirmation script that must exit non-0 (finding survived the attempt to disprove).",
     promptSnippet: "Run a PoC and promote an investigating case to confirmed",
     promptGuidelines: [
       "Use PromoteFinding when an investigating case has a concrete PoC script on disk and you are ready to prove it.",
-      "The case must already have status='investigating' and non-empty poc, evidence, impact, and severity fields.",
+      "The case must already have status='investigating' and non-empty poc, evidence, impact, severity, target, and disconfirmation fields.",
       "By default, the PoC runs in `docker run --rm --network none`. Use local:true to run on the host (e.g. for network-dependent bugs).",
       "Only exit code 0 promotes the case to confirmed.",
+      "Optionally provide disconfirmation_path to a script that tries to disprove the finding. If the disconfirmation script exits 0, the finding is considered disproven and promotion is blocked.",
       "Do not use CaseUpdate to set status='confirmed' directly — it is rejected. Always use PromoteFinding.",
     ],
     parameters: PromoteSchema,
@@ -656,13 +665,46 @@ export default function casefileExtension(pi: ExtensionAPI) {
         };
       }
 
-      const result = promoteFindingResult(params.id as string, {
-        path: run.path,
-        exitCode: run.exitCode,
-        ranAt: run.ranAt,
-        output: run.output,
-        sandbox: run.sandbox,
-      });
+      // Run disconfirmation script if provided — must exit NON-0 (finding survived the attempt to disprove).
+      let disconfirmationRun: PocRun | undefined;
+      if (params.disconfirmation_path) {
+        disconfirmationRun = runPoc(params.disconfirmation_path as string, params.local !== true);
+        if (disconfirmationRun.exitCode === 0) {
+          const record = getCaseById(params.id as string);
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `Disconfirmation script exited 0 (finding was disproven). ` +
+                  `Case remains investigating.\nOutput:\n${disconfirmationRun.output}`,
+              },
+            ],
+            isError: true,
+            details: { record, run, disconfirmationRun },
+          };
+        }
+      }
+
+      const result = promoteFindingResult(
+        params.id as string,
+        {
+          path: run.path,
+          exitCode: run.exitCode,
+          ranAt: run.ranAt,
+          output: run.output,
+          sandbox: run.sandbox,
+        },
+        disconfirmationRun
+          ? {
+              path: disconfirmationRun.path,
+              exitCode: disconfirmationRun.exitCode,
+              ranAt: disconfirmationRun.ranAt,
+              output: disconfirmationRun.output,
+              sandbox: disconfirmationRun.sandbox,
+            }
+          : undefined,
+      );
       const record = result.record;
       return {
         content: [
@@ -969,7 +1011,8 @@ export default function casefileExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "CaseReport",
     label: "Write Case Report",
-    description: "Generate a markdown report from a case under the project report directory.",
+    description:
+      "Generate a markdown report from a confirmed or reported case under the project report directory. Hypothesis/investigating/blocked/killed cases are rejected — promote to confirmed first.",
     promptSnippet: "Generate a bounty-style markdown report from a case",
     promptGuidelines: [
       "Use CaseReport only for confirmed or already reported cases. Keep hypotheses and investigating cases in the ledger until proof is captured.",
@@ -1057,30 +1100,29 @@ export default function casefileExtension(pi: ExtensionAPI) {
     }
   });
 
-  // ── Event: Inject context into system prompt ──
+  // ── Event: Inject cyber workflow into system prompt ──
   // XP (offensive) mode is OFF by default so normal dev work stays quiet.
-  // Only when enabled do we inject the cyber workflow (and case list) each
-  // prompt. This keeps the agent focused during everyday development while
-  // still allowing the full attacker discipline to be switched on for
-  // offensive/audit/bounty sessions.
+  // Only when enabled do we inject the cyber workflow (and case list) into
+  // the system prompt each turn. Injecting into event.systemPrompt (not as a
+  // conversation message) makes the attacker mindset immediate and avoids
+  // session bloat from repeated message entries.
 
-  pi.on("before_agent_start", async () => {
+  pi.on("before_agent_start", async (event) => {
     if (readXpMode() === "off") return;
 
     let active: CaseRecord[] = [];
     try {
-      const records = readCasefile();
-      active = records.filter((r) => r.status !== "killed" && r.status !== "reported");
+      active = readActiveCases();
     } catch {
       // No database yet — still inject workflow.
     }
 
+    const injection = buildAgentInjection(active);
+
+    // Inject workflow FIRST (before skills) so the attacker mindset is
+    // prominent, not buried at the end of a long system prompt.
     return {
-      message: {
-        customType: "casefile_summary",
-        content: buildAgentInjection(active),
-        display: false,
-      },
+      systemPrompt: `${injection}\n\n${event.systemPrompt ?? ""}`,
     };
   });
 

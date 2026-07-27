@@ -95,4 +95,28 @@ describe("poc-runner", () => {
     const result = runPoc(shPoc, true);
     expect(result.exitCode).not.toBe(0);
   });
+
+  it("passes extra template flags as separate args and keeps a space-containing path intact", () => {
+    // A custom language with a multi-arg run template (interpreter + flag + file).
+    // Previously the space-in-path branch collapsed everything after the interpreter
+    // into one arg, breaking the flag. The fix splits the static template first.
+    process.env.PI_POC_DEFAULT_LANGUAGE = "nodeflag";
+    process.env.PI_POC_LANGUAGES = JSON.stringify({
+      // --no-warnings is a valueless flag; the path is the file to run.
+      nodeflag: { image: "node:22-slim", run: "node --no-warnings {{file}}" },
+    });
+
+    // PoC path with a space — must stay a single arg.
+    const dir = mkdtempSync(join(tempDir, "with space-"));
+    const poc = join(dir, "poc.txt");
+    writeFileSync(poc, "process.stdout.write(process.argv.join('|'))", "utf8");
+
+    const result = runPoc(poc, false);
+    expect(result.exitCode).toBe(0);
+    // The path must arrive intact as a single arg (not split on its space).
+    // Node strips --no-warnings from argv, so we assert on the path itself:
+    // if the fix regressed, the path would be truncated at the space.
+    expect(result.output).toContain(poc);
+    expect(result.output).not.toContain("Cannot find module");
+  });
 });

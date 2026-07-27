@@ -421,15 +421,20 @@ function runLocal(pocPath: string, language: PocLanguage): PocRun {
     throw new Error("Language config has no run command");
   }
 
-  // The run template is `<interpreter> <file>`. Preserve multi-arg run commands for
-  // normal paths, but keep a space-containing PoC path as a single argument (no shell
-  // is used, so args are passed verbatim).
-  const command = renderCommand(language.run, pocPath, false);
-  const trimmed = command.trim();
-  const firstSpace = trimmed.indexOf(" ");
-  const interpreter = firstSpace === -1 ? trimmed : trimmed.slice(0, firstSpace);
-  const rest = firstSpace === -1 ? "" : trimmed.slice(firstSpace + 1);
-  const args = pocPath.includes(" ") ? (rest ? [rest] : []) : rest ? rest.split(" ") : [];
+  // The run template is `<interpreter> [flags...] {{file}}`. Split the static
+  // template on whitespace FIRST (the template is trusted config, not user input),
+  // then render placeholders within each token. Passing the tokens to spawnSync
+  // with NO shell keeps a space-containing PoC path as one arg and keeps extra
+  // flags (e.g. `node --experimental-vm-modules {{file}}`) as separate args.
+  // Splitting after rendering would re-split a space-containing path.
+  const tokens = language.run.trim().split(/\s+/).filter(Boolean);
+  const interpreter = tokens.shift() ?? language.run.trim();
+  const args = tokens.map((tok) =>
+    tok
+      .replace(/{{file}}/g, pocPath)
+      .replace(/{{bin}}/g, join(dirname(pocPath), "poc"))
+      .replace(/{{class}}/g, basename(pocPath).replace(/\.[^.]+$/i, "")),
+  );
 
   const result = spawnSync(interpreter, args, {
     encoding: "utf8",

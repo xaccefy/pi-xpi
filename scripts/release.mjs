@@ -116,32 +116,6 @@ function bumpOrSetVersion(target) {
   return newVersion;
 }
 
-function getChangelogs() {
-  const packagesDir = "packages";
-  const packages = readdirSync(packagesDir);
-  const changelogs = packages
-    .map((pkg) => join(packagesDir, pkg, "CHANGELOG.md"))
-    .filter((path) => existsSync(path));
-  if (existsSync("CHANGELOG.md")) changelogs.push("CHANGELOG.md");
-  return changelogs;
-}
-
-function updateChangelogsForRelease(version) {
-  // Shared with .github/workflows/release.yml so local and CI releases stamp
-  // changelogs identically.
-  // stamp-changelogs removed — no CHANGELOG.md files exist in the repo
-}
-
-function addUnreleasedSection() {
-  const changelogs = getChangelogs();
-  const unreleasedSection = "## [Unreleased]\n\n";
-  for (const changelog of changelogs) {
-    const content = readFileSync(changelog, "utf-8");
-    const updated = content.replace(/^(## \[)/m, `${unreleasedSection}$1`);
-    writeFileSync(changelog, updated);
-  }
-}
-
 const status = run("git status --porcelain", { silent: true });
 if (status?.trim()) {
   console.error("error: working tree is dirty — commit or stash changes before releasing");
@@ -150,12 +124,8 @@ if (status?.trim()) {
 run("npm test");
 
 const version = bumpOrSetVersion(RELEASE_TARGET);
-updateChangelogsForRelease(version);
 stageChangedFiles();
 commitIfStaged(`Release v${version}`);
 run(`git tag v${version}`);
-addUnreleasedSection();
-stageChangedFiles();
-commitIfStaged("Add [Unreleased] section for next cycle");
 run("git push origin main");
 run(`git push origin v${version}`);

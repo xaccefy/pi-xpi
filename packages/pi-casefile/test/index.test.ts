@@ -154,6 +154,7 @@ describe("casefile extension", () => {
       poc: "Fetch /download?id=42 with a different session",
       impact: "Unauthorized access to other users' files",
       evidence: "download?id=42 returns another user's file",
+      disconfirmation: "Attempted to access own file without session token; blocked.",
     });
     expect(updated.details.changed).toBe(true);
 
@@ -303,13 +304,13 @@ describe("casefile extension", () => {
 
       const handler = pi.events.get("before_agent_start")?.[0];
       expect(handler).toBeFunction();
-      const result = await handler();
+      const event = { systemPrompt: "existing prompt" };
+      const result = await handler(event);
 
-      expect(result.message.customType).toBe("casefile_summary");
-      expect(result.message.display).toBe(false);
-      expect(result.message.content).toContain("# Cyber Workflow");
-      expect(result.message.content).toContain("Evidence-First Doctrine");
-      expect(result.message.content).not.toContain("<casefile_context>");
+      expect(result.systemPrompt).toContain("existing prompt");
+      expect(result.systemPrompt).toContain("# Cyber Workflow");
+      expect(result.systemPrompt).toContain("Evidence-First Doctrine");
+      expect(result.systemPrompt).not.toContain("<casefile_context>");
     } finally {
       if (previous === undefined) delete process.env.PI_XP_MODE;
       else process.env.PI_XP_MODE = previous;
@@ -350,6 +351,8 @@ describe("casefile extension", () => {
         poc: "Reproduced before patch",
         impact: "Was exploitable",
         severity: "high",
+        target: "example-app",
+        disconfirmation: "Confirmed patch blocks the path; pre-patch version still vulnerable.",
         remediation: "Patch shipped",
       });
       await executeTool(pi, "PromoteFinding", {
@@ -367,17 +370,16 @@ describe("casefile extension", () => {
       const handler = pi.events.get("before_agent_start")?.[0];
       expect(handler).toBeFunction();
 
-      const result = await handler();
-      expect(result.message.customType).toBe("casefile_summary");
-      expect(result.message.display).toBe(false);
-      expect(result.message.content).toContain("Active security cases: 1 total");
-      expect(result.message.content).toContain("Active ‹payload› lead");
-      expect(result.message.content).toContain("Test ‹payload› safely");
-      expect(result.message.content).not.toContain("This should not be injected");
-      expect(result.message.content).not.toContain("Killed duplicate");
-      expect(result.message.content).not.toContain("Already reported");
+      const event = { systemPrompt: "" };
+      const result = await handler(event);
+      expect(result.systemPrompt).toContain("Active security cases: 1 total");
+      expect(result.systemPrompt).toContain("Active ‹payload› lead");
+      expect(result.systemPrompt).toContain("Test ‹payload› safely");
+      expect(result.systemPrompt).not.toContain("This should not be injected");
+      expect(result.systemPrompt).not.toContain("Killed duplicate");
+      expect(result.systemPrompt).not.toContain("Already reported");
       // Workflow still rides along with the case list.
-      expect(result.message.content).toContain("# Cyber Workflow");
+      expect(result.systemPrompt).toContain("# Cyber Workflow");
     } finally {
       if (previous === undefined) delete process.env.PI_XP_MODE;
       else process.env.PI_XP_MODE = previous;
@@ -408,10 +410,11 @@ describe("casefile extension", () => {
       });
 
       const handler = pi.events.get("before_agent_start")?.[0];
-      const result = await handler();
+      const event = { systemPrompt: "" };
+      const result = await handler(event);
 
-      expect(result.message.content).toContain("Hypothesis lead");
-      expect(result.message.content).toContain("Blocked lead");
+      expect(result.systemPrompt).toContain("Hypothesis lead");
+      expect(result.systemPrompt).toContain("Blocked lead");
     } finally {
       if (previous === undefined) delete process.env.PI_XP_MODE;
       else process.env.PI_XP_MODE = previous;
@@ -438,8 +441,9 @@ describe("casefile extension", () => {
 
       await pi.commands.get("xp").handler("on", ctx);
       expect(notifications.some((n) => n.includes("ON"))).toBe(true);
-      const onResult = await handler();
-      expect(onResult.message.content).toContain("# Cyber Workflow");
+      const event = { systemPrompt: "" };
+      const onResult = await handler(event);
+      expect(onResult.systemPrompt).toContain("# Cyber Workflow");
 
       await pi.commands.get("xp").handler("off", ctx);
       expect(await handler()).toBeUndefined();
@@ -461,6 +465,9 @@ describe("casefile extension", () => {
       poc: "Render a note containing <img src=x onerror=alert(1)> and observe execution",
       impact: "Script execution in victim browser",
       severity: "high",
+      target: "example-app",
+      disconfirmation:
+        "Attempted to render note without script content; no execution occurred. Only script-tagged content triggers.",
     });
     await executeTool(pi, "PromoteFinding", {
       id: storedXss.details.record.id,

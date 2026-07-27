@@ -19,7 +19,7 @@ Your only task: trace from the identified entry point to the sink, and determine
 ## Method
 
 1. **Open the sink file.** Read the vulnerable function at the cited line. Understand what it does and what parameters it takes.
-2. **Walk the call chain backward.** For each function containing the sink, find its callers via `grep` or `search_graph`. Read the calling context. Does the parameter flow from an external entry point (HTTP handler, message consumer, CLI command, file reader)?
+2. **Walk the call chain backward.** For each function containing the sink, find its callers via `grep` (fff makes this frecency-ranked and typo-tolerant). Read the calling context. Does the parameter flow from an external entry point (HTTP handler, message consumer, CLI command, file reader)?
 3. **Check every defense on the path.** For each function in the chain:
    - Input validation / sanitization / allow-listing
    - Authentication or authorization checks

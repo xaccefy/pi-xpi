@@ -8,15 +8,29 @@ description: Full pipeline orchestration skill for vulnerability discovery. Teac
 ## Stage Machine
 
 ```
-RECON → HUNT → VALIDATE → GAPFIL(loop) → TRACE → CHAIN → REPORT
-  ↑________________________|                    |
-  └────── FEEDBACK ────────┘                    |
-         (traces into new hunts)                |
-                                                ↓
-                                          FIX (optional)
+RECON → HUNT → GAPFIL(loop) → TRACE → VALIDATE → CHAIN → REPORT
+  ↑___________________|                    |
+  └────── FEEDBACK ────┘                    |
+         (traces into new hunts)            |
+                                            ↓
+                                      FIX (optional)
 ```
 
+Finish coverage (hunt + gapfill) before spending trace budget. Trace only the hypotheses that survived a complete hunt, then validate the reachable ones.
+
 Each stage produces a structured output. The next stage validates it before starting. If validation fails, the stage retries with repair guidance.
+
+## Prerequisites — check before starting a run
+
+The pipeline assumes the target is **in scope** and the agent has the tools to probe it. Before dispatching the first auditor, verify:
+
+1. **Scope is defined.** Record the in-scope hosts/paths in the pipeline-run case `target` + `assumptions`. Every probe must hit a host in scope. If scope is ambiguous, ask the user — do not guess.
+2. **Auth is available (if needed).** If the target requires auth, the user must supply credentials/tokens. Store them in env vars (`TARGET_COOKIE`, `TARGET_TOKEN`). The pipeline cannot create accounts.
+3. **CLI tools are present.** Recon and probing rely on `curl`, `httpx`, `ffuf`, `nuclei`, `subfinder`, `nmap`, `jq` — all driven via `bash`. If a tool is missing, the auditor falls back to `curl` + `grep` (slower). Check with `bash("command -v httpx ffuf nuclei")` at run start and record what's available.
+4. **OOB channel for blind classes.** Blind SQLi / blind SSRF / blind command injection can only be confirmed via an out-of-band callback. If no listener is running (`interactsh-client` or a `nc` listener), blind classes will be **un-confirmable** — record them as `INCOMPLETE` with `nextStep: "blocked: no OOB listener"`, don't kill them.
+5. **Rate limits are set.** Hard cap: ≤10 threads, ≤50 req/min. Stop on 429/403. The pipeline must not DoS the target.
+
+If any prerequisite is missing, record it in the pipeline-run case and either ask the user or scope the run to what's possible.
 
 ## Stage Config
 
@@ -85,12 +99,14 @@ Spawn multiple auditor agents concurrently, one per attack class:
     task: "Hunt for <class> vulnerabilities in <target/subsystem>. ..."})
 ```
 
-Coverage rule: check at least 3 entry points per class. After all auditors return, aggregate coverage:
+Coverage rule: check at least 3 entry points per class. After all auditors return, aggregate coverage. Coverage is per-entry-point, not a single tri-state — a class is only `NOT_FOUND` when every entry point identified in recon was actually examined:
 ```
-COVERED:   classes that produced ≥1 hypothesis
-SKIPPED:   classes not applicable (no surface)
-NOT_FOUND: classes checked but produced zero hypotheses
+COVERED:    class examined across all identified entry points (≥1 hypothesis OR each entry point ruled out with reason)
+INCOMPLETE: class examined partially — some entry points never checked (stays in gapfill)
+SKIPPED:    class not applicable (no surface, documented why)
+NOT_FOUND:  class examined across ALL entry points and produced zero hypotheses (only when no entry point is unchecked)
 ```
+A class with any unchecked entry point is `INCOMPLETE`, never `NOT_FOUND`. `INCOMPLETE` classes stay in the gapfill loop until every entry point is checked or explicitly ruled out.
 
 ### TRACE: One agent per finding
 
@@ -110,18 +126,19 @@ For each reachable finding:
   Run through PromoteFinding.
 ```
 
-### GAPFIL: Re-queue NOT_FOUND classes
+### GAPFIL: Re-queue INCOMPLETE classes (targeted at the gap)
 
 ```
-If any attack classes have "NOT_FOUND" coverage:
-  For each such class:
-    subagent({agent: "auditor",
-      task: "Hunt for <class> in <target>. The previous hunt found nothing.
-               Try different entry points, different techniques.
-               Use ExploitSearch for this specific class."})
+For each attack class with "INCOMPLETE" coverage:
+  Read the class's checked/unchecked entry-point list from the pipeline-run case.
+  subagent({agent: "auditor",
+    task: "Hunt for <class> in <target>. Previous hunts found nothing.
+             These entry points are ALREADY CHECKED — do not re-tread them: <checked list>.
+             These entry points are UNCHECKED — examine each one: <unchecked list>.
+             Use exploit_search for this specific class."})
 ```
 
-Max 2 gapfill iterations.
+The loop terminates when every class is COVERED, SKIPPED, or NOT_FOUND (i.e. zero `INCOMPLETE` remain), or after 2 iterations as a safety cap. Do NOT freeze a class as `NOT_FOUND` while unchecked entry points remain — if the cap hits with `INCOMPLETE` classes, report them as `INCOMPLETE` in coverage, not `NOT_FOUND`.
 
 ### FEEDBACK: Convert traces into new hunt tasks
 
@@ -135,19 +152,19 @@ that wasn't previously audited):
 
 Coverage is the pipeline's self-check. It answers: "what did we actually test vs what did we skip or miss?"
 
-After the hunt + gapfill stages, emit a coverage summary in the pipeline-run case:
+After the hunt + gapfill stages, emit a coverage summary in the pipeline-run case. Each class line must list the entry points checked so gapfill can target the gaps:
 
 ```
 assumptions: [
-  "COVERED: sqli, xss, idor, auth-bypass",
+  "COVERED: sqli — checked /api/users, /api/search, /api/export (3 entry points)",
+  "COVERED: xss — checked /search, /profile, /comments; all reflected output encoded",
   "SKIPPED: ssrf (no outbound HTTP in target)",
-  "NOT_FOUND: deserialization (all deserialization calls are pre-auth whitelisted)",
-  "COVERED: path-traversal, command-injection (second gapfill iteration)",
-  "NOT_FOUND: race-condition (all state mutations use serial transactions)"
+  "NOT_FOUND: deserialization — checked /import, /webhook, /restore; all deserialization calls are pre-auth whitelisted",
+  "INCOMPLETE: race-condition — checked /transfer; UNCHECKED: /withdraw, /refund"
 ]
 ```
 
-This feeds the gapfill loop. NOT_FOUND classes with surface potential get re-queued.
+This feeds the gapfill loop. `INCOMPLETE` classes get re-queued with their unchecked list. `NOT_FOUND` is only valid when no entry point is unchecked.
 
 ## Dedup
 

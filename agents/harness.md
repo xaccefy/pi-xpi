@@ -47,15 +47,15 @@ Identify relevant attack classes for the target. **Spawn multiple `auditor` agen
 
 Review candidates from each. `CaseAdd(title: "<short title>", status: hypothesis, ...)` per plausible finding. **Validate each auditor's output against `schemas/stage-finding.json`** — reject findings missing required fields (vuln_class, file, line, sink, entry_point, confidence, evidence).
 
-**Coverage tracking:** After the first wave, collect COVERED / SKIPPED / NOT_FOUND per class. Log in the pipeline-run case.
+**Coverage tracking:** After the first wave, collect per-class coverage with CHECKED/UNCHECKED entry-point lists (see auditor Step 6). A class is `NOT_FOUND` only when its UNCHECKED list is empty. Log in the pipeline-run case.
 
-## 2. GAPFIL LOOP (re-queue under-covered areas)
-Check NOT_FOUND classes:
-- Attack classes identified in recon but zero findings? Re-hunt with different entry points.
-- Subsystems mentioned in recon but not audited? Spawn auditor scoped there.
-- Use `ExploitSearch(query="<class> <tech> techniques")` to find variants the first pass missed.
+## 2. GAPFIL LOOP (re-queue INCOMPLETE classes, targeted at the gap)
+Check coverage per class. Only `INCOMPLETE` classes (entry points left unchecked) get re-queued — never `NOT_FOUND` (those are fully checked) or `COVERED`.
+- Read each class's CHECKED/UNCHECKED entry-point list from the pipeline-run case.
+- Re-queue the auditor scoped to the UNCHECKED entry points only, passing the CHECKED list so it does not re-tread ground.
+- Use `exploit_search(query="<class> <tech> techniques")` to find variants the first pass missed.
 
-Max 2 gapfill iterations. Log each iteration's additional coverage.
+Terminate when zero `INCOMPLETE` classes remain, or after 2 iterations (safety cap). If the cap hits with `INCOMPLETE` classes, report them as `INCOMPLETE` in coverage — do not freeze them as `NOT_FOUND`.
 
 ## 3. REACHABILITY TRACE (gate before validation)
 For each hypothesis, before running exploit, **prove the sink is reachable by attacker input**:
@@ -84,7 +84,7 @@ Validate exploit output against `schemas/stage-validation.json`:
 - If confirmed: poc_path, run_log, evidence_extracted
 - If killed: kill_reason
 
-If the PoC fails, use `subagent({action: "steer", id, message})` to refine once; after 3 failures total, `CaseUpdate(id, { status: "killed", kill_reason: "poc_failed_3x" })` and move on.
+If the PoC fails, use `subagent({action: "steer", id, message})` to refine once; after 3 failures total, `CaseUpdate(id, { status: "killed", nextStep: "killed: poc_failed_3x — <what was tried>" })` and move on.
 
 `CaseLink` findings that build on each other (e.g. info leak enables IDOR).
 
@@ -116,33 +116,16 @@ For each confirmed finding, spawn `subagent({agent: "exploit", task: "Phase 2: P
 
 Then `CaseUpdate(id, { status: "reported", remediation: <summary> })`.
 
-## 8. TOKEN TRACKING
-After each subagent returns, record token usage in the pipeline-run case:
-
-```
-CaseUpdate(<pipeline-case-id>, {
-  nextStep: "stage: <stage> complete — findings: <n>, tokens: <input> in / <output> out"
-})
-```
-
-Token budgets (cumulative input+output — if exceeded, consider the agent stuck):
-- HUNT: ~50K per class
-- TRACE: ~20K per finding
-- VALIDATE (exploit): ~30K per finding
-- CHAIN: ~20K total
-- PATCH: ~40K per finding
-
-## 9. REPORT
+## 8. REPORT
 Produce a final report conforming to `schemas/stage-report.json`:
 - All findings with status, severity, PoC paths
-- Coverage per class (COVERED / SKIPPED / NOT_FOUND)
+- Coverage per class (COVERED / SKIPPED / NOT_FOUND / INCOMPLETE) with entry-point lists
 - Exploit chains from chain agent
 - Patches applied
-- Total tokens consumed
 
 ## Non-negotiables
 - No finding advances without passing its stage schema. If the output is malformed, send it back.
 - No finding is validated without a reachability trace showing REACHABLE.
 - A finding is only `confirmed` with evidence + poc + impact + severity and a PoC that exited 0.
 - A patch isn't safe until a fresh tracer confirms the sink is no longer reachable.
-- Coverage must be tracked per class. NOT_FOUND classes get re-queued in gapfill.
+- Coverage must be tracked per class with entry-point lists. Only `INCOMPLETE` classes re-queue in gapfill; `NOT_FOUND` requires an empty UNCHECKED list.

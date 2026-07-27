@@ -65,12 +65,14 @@ CaseAdd(
 )
 ```
 
+Chains are derived from already-confirmed findings, so they stay `hypothesis` — they are analysis artifacts, not separately-PoCed vulnerabilities. Do not attempt to promote them through `PromoteFinding`; the chain's severity is justified by its step findings' proofs, recorded in `summary`.
+
 Then link each step to the chain:
 ```
 CaseLink(step-case-id, chain-case-id, kind: "depends-on")
 ```
 
-For findings that are part of a chain, upgrade their priority in the pipeline report.
+Return the chain case IDs and severities in your output. The harness folds them into the final report — you do not write the report yourself.
 
 ### 5. Handle degraded state
 

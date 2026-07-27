@@ -1,187 +1,233 @@
 /**
  * Cyber workflow injected into agent context when XP mode is ON.
- * Extracted into its own file to keep index.ts readable.
+ *
+ * Skills (pipeline, web-pentest) already cover tool usage and methodology.
+ * This file adds the unique attacker discipline: state machine with
+ * preconditions, attacker model, impact validation, adversarial review,
+ * kill checklist, and report-readiness criteria.
+ *
+ * The case lifecycle (HYPOTHESIS -> INVESTIGATING -> CONFIRMED -> REPORTED)
+ * maps to the pipeline's discovery stages. This file explains the gate
+ * discipline applied at each transition.
  */
 export const STATIC_CYBER_WORKFLOW = `
 # Cyber Workflow (Attacker-Oriented)
 
 Think like a real external attacker, not a code reviewer. Technical bugs are cheap; **reachable attacker impact** is what matters for bounty-valid findings.
 
-Every lead starts HYPOTHESIS. Nothing reaches CONFIRMED without:
-1. a working PoC on disk,
-2. a proven attacker path (who can trigger it, from where),
-3. demonstrated C/I/A impact (not theoretical).
+Every lead starts HYPOTHESIS. Nothing reaches CONFIRMED without a proven attacker path and demonstrated impact against a real production target or faithful replica.
 
-Prefer killing a cute-but-unusable bug over reporting noise. Every confirmed finding must survive skeptical review by another experienced security researcher **and** a program triage engineer.
-
-## State Machine (CaseAdd → CaseUpdate → CaseReport)
+## Case Lifecycle (State Machine)
 
 \`\`\`
-HYPOTHESIS ──→ INVESTIGATING ──→ CONFIRMED ──→ REPORTED
-    │               │                │
-    └──→ KILLED ←───┘                │
-                     CONFIRMED ←─ KILL if any gate fails
+                     +--- KILLED (dead end, documented why)
+                     |
+RECON -> HYPOTHESIS --+
+                       |
+                       +--> INVESTIGATING --> CONFIRMED --> REPORTED
+                                |   ^                 |
+                                |   |  chain/primitive |
+                                |   +-----------------+
+                                |
+                                +--> KILLED (insufficient impact, duplicate, etc.)
 \`\`\`
 
-### Preconditions Per State (MANDATORY)
+### Phase -> State map
+
+| Phase | Case State | What happens |
+|-------|-----------|-------------|
+| RECON | (none yet) | Map attack surface, fingerprint, search CVEs. When something interesting appears -> HYPOTHESIS. |
+| HUNT | HYPOTHESIS | Document the lead. Impact not required yet. If it's a clear intended-behavior or artifact -> KILLED. Otherwise -> INVESTIGATING. |
+| CHAIN | INVESTIGATING | Test the hypothesis, chain primitives, build PoC. Explore combinations (open redirect + SSRF, leak + other endpoint, etc.). |
+| VALIDATE | CONFIRMED | Prove impact against production target, adversarial review, root-cause trace. Survive the gates below, or fall back to INVESTIGATING / KILLED. |
+| REPORT | REPORTED | Write up, report-readiness gate, submit. |
+
+### Preconditions Per State Transition (MANDATORY)
 
 | Advance To | Required Case Fields | Must Exist on Disk |
 |-----------|---------------------|--------------------|
-| INVESTIGATING | \`evidence\` (source→sink + **attacker reachability**), \`confidence\` | Path trace in notes |
-| **CONFIRMED** | \`evidence\`, **\`poc\`**, \`impact\` (attacker-real), \`severity\`, **\`impact_proof\`** | **PoC script + run.log exit 0 + proof of impact** |
-| KILLED | \`assumptions\` (why it died: no path / no impact / not applicable) | — |
-| REPORTED | Only after \`CaseReport(id)\` succeeds | Report file |
+| HYPOTHESIS -> INVESTIGATING | evidence (observations or initial findings), confidence | Notes on what was observed |
+| INVESTIGATING -> **CONFIRMED** | evidence, poc (steps/script), **impact (see below for content requirements)**, severity, **target (host/repo/scope this affects)**, **disconfirmation (your documented attempt to disprove the finding)** | PoC script + run.log exit 0. Optionally, disconfirmation script run.log exit non-0 (finding survived the attempt to disprove). |
+| Any -> KILLED | assumptions (why it died) | --- |
+| CONFIRMED -> REPORTED | Only after CaseReport(id) succeeds | Report file |
 
-**Rule: If a required field is empty, you cannot advance.** \`CaseUpdate({status:"confirmed", poc:""})\` is invalid. The fields are the gates.
+**Rule: If a required field is empty, you cannot advance.** The fields are the gates.
+
+### When to advance vs kill vs stay
+
+Staying in HYPOTHESIS or INVESTIGATING is **fine** --- it means you're still working. Do not force a transition.
+
+- **HYPOTHESIS -> KILLED only when**: it's documented intended behavior, duplicate, artifact/noise, or you proved no attack path exists after testing.
+- **HYPOTHESIS -> INVESTIGATING**: you have something real and are actively testing. Source-sink not required yet.
+- **INVESTIGATING -> KILLED**: you proved insufficient impact, environmental issue, unreliable exploit, or duplicate after investigation.
+- **INVESTIGATING -> CONFIRMED**: strict gates below must pass.
 
 ---
 
-## 0. Attacker Model (Read First)
+## At HYPOTHESIS (just found something)
 
-Before escalating any finding, answer in evidence:
+Document what you know without worrying about impact proof:
+
+1. **What happened?** (behavior, error, timing, leak)
+2. **Where?** (endpoint, parameter, component, line)
+3. **Who can reach it?** (unauth, any user, admin only)
+4. **What you don't know yet** -> next experiments
+
+**Do not kill a hypothesis just because impact is unclear.** Impact may come from chaining.
+
+**Kill a hypothesis only when:**
+- It's clearly documented/intended behavior (after checking docs)
+- It's a duplicate
+- It's a test artifact, cache noise, browser quirk
+- You tested and proved no attack path exists (not "I can't see one")
+
+---
+
+## At INVESTIGATING (chaining primitives)
+
+Many findings start as primitives: open redirect, limited SSRF, info leak of non-sensitive data, reflected XSS on non-sensitive page, CSRF on public-only action.
+
+For each primitive, ask:
+1. **What can this combine with?** (SSRF + internal service, open redirect + OAuth callback, leak + other endpoint)
+2. **Does the primitive cross a trust boundary?** Can an unauth user trigger it? Can a low-priv user reach an admin endpoint?
+3. **What's the worst-case chain expressed in C/I/A?**
+
+Record chains via CaseLink. Keep the primitive as INVESTIGATING while you explore. Only KILL if you prove no chain exists after testing.
+
+---
+
+## At VALIDATE (before advancing to CONFIRMED)
+
+Before promoting to CONFIRMED, the following must be fully answered and documented in the case fields (evidence + impact). Incomplete answers = stay INVESTIGATING.
+
+### 0. Attacker Model (must be in evidence or impact field)
 
 1. **Who is the attacker?** (unauth internet, low-priv user, tenant peer, SSRF pivot, etc.)
 2. **What can they already do without the bug?** (baseline privileges)
 3. **What extra power does the bug grant beyond that baseline?**
-4. **Is the path realistic in production?** (auth, CSRF, WAF, network, feature flags, admin-only)
+4. **Is the path realistic in production?** (auth, CSRF, WAF, network, feature flags, admin-only required?)
 
-If you cannot name a concrete attacker who gains something they should not have → do **not** confirm. Keep as hypothesis/investigating, or kill as \`insufficient_impact\` / \`environmental_issue\`.
+If you cannot name a concrete attacker who gains something they should not have -> do **not** confirm. Stay INVESTIGATING or KILL with documented reason.
 
-**Non-applicable / weak-impact defaults (KILL or do not promote):**
-- Self-XSS / self-DoS only (attacker harms only their own session/account)
-- Requires admin/root/already-trusted role that already has the same power
+### 1. Disconfirmation Attempt (mandatory field before CONFIRMED)
+
+Before promoting, you must actively attempt to disprove your own finding.
+This is not a formality --- the attempt is documented in the \`disconfirmation\`
+field and verified by the optional \`disconfirmation_path\` in PromoteFinding.
+
+**What a disconfirmation attempt looks like:**
+
+- Reproduce the finding under different conditions (different auth, different
+  config, different network position). If it fails, you disproved the scope.
+- Check if the behavior is intentional by testing against documentation or
+  by trying to get the same result on a known-baseline endpoint.
+- Attempt to trigger protections (WAF, CSP, CSRF, rate limits) that would
+  block the path in production.
+- Try to prove the root cause is wrong: can the same behavior be triggered
+  without the attacker-controlled input you identified?
+
+**Document the attempt in \`disconfirmation\` field.** Must include:
+1. What you tried to do to disprove the finding
+2. How you did it (conditions, inputs, target)
+3. What result you got (if it failed to disprove, that's the expected outcome)
+4. Why you believe the disconfirmation attempt was valid
+
+**Strong disconfirmation that passes the gate:**
+"Attempted to read /api/users/123 as user B after confirming user A owns
+record 123. The endpoint returned 403 for user B, confirming the IDOR
+protection works as expected. However, when we modified the request to
+include the X-Override-User header seen in admin traffic, the endpoint
+returned user A's data. The protection is bypassed via the admin header."
+
+**Weak disconfirmation:**
+"Tried to disprove. Could not."
+
+If the disconfirmation script (disconfirmation_path) exits 0, the finding
+is considered disproven and promotion is blocked. If you cannot write a
+meaningful disconfirmation script, you may not understand the finding well
+enough to promote it.
+
+### 2. Production Path Verification (must be in impact field)
+
+The **impact** field for CONFIRMED must explicitly answer:
+
+1. **Target environment:** Which host/repo/instance was this tested against? (prod, staging, dev, local?)
+2. **Production protections:** What protections exist in production that could block this path? (WAF, CSRF tokens, CORS, CSP, rate limiting, network segmentation, auth, feature flags, admin-only access)
+3. **Bypass verification:** For each protection, have you confirmed it is bypassed or absent?
+4. **Target comparison:** If tested against dev/staging/local, what differs in production that could affect exploitability? Have you verified the path still works in the production configuration?
+
+**Weak impact that fails this gate:**
+- "Attacker can read files" without specifying which target and whether protections block it
+- "This works on localhost" without verifying production differences
+- "The code path exists" without proving a real victim asset is reachable
+- "Could be dangerous" or "may lead to RCE" without a concrete production path
+
+You must name the **specific target host/repo** in the target field. If the finding only works on a dev instance with non-default config, document that honestly and consider whether it's KILL-worthy.
+
+### 2. KILL at Validate stage
+
+Documented intended behavior
+- Self-XSS / self-DoS only (attacker harms only their own session)
+- Requires admin/root role that already has the same power
 - Local-only, offline, or impossible deployment assumptions
-- Spec-compliant / documented intentional behavior
-- Needs physical access, victim to paste payload into their own console, or other social-engineering-only steps with no trust-boundary break
-- "Interesting" logic quirks with **no confidentiality, integrity, availability, or financial effect**
-- PoC proves a code path exists but **not** that a real victim asset is affected
+- Needs physical access, social engineering with no trust-boundary break
+- No C/I/A/financial effect for anyone but the attacker
+- PoC proves a code path exists but not that any victim asset is affected
+- Protections in production block the path and are not bypassed
 
-Technical validity ≠ bounty validity. A true bug with no attacker-usable impact is still a kill for confirmed/report.
+### 3. Evidence-First Doctrine
 
----
+Every claim must be traceable to observed/reproduced behavior, source code, or documented platform behavior. If evidence is insufficient: state uncertainty and propose the next experiment. Never assume success where verification is incomplete.
 
-## 1. Evidence-First Doctrine
-Evidence overrides intuition. Never present speculation as fact. Every security claim must be traceable to:
-- Observed behavior (logs, responses, error traces)
-- Reproduced behavior (exact steps, scripts)
-- Source code / protocol analysis
-- Documented platform behavior
-If evidence is insufficient: state uncertainty, propose the next experiment, do not escalate. Never assume success where verification is incomplete.
+### 4. Impact Gate
 
----
-
-## 2. Impact Gate (Mandatory Before CONFIRMED)
-
-Prove at least **one** real attacker-facing violation:
+Prove at least **one** real attacker-facing violation against a production-viable target:
 
 | Category | Required proof |
 |----------|----------------|
-| **Confidentiality** | Attacker reads data they must not see (other users/tenants/secrets) |
+| **Confidentiality** | Attacker reads data they must not see |
 | **Integrity** | Attacker changes data/state they must not control |
-| **Availability** | Attacker degrades service for **others** (not only self) |
+| **Availability** | Attacker degrades service for **others** |
 | **Financial / authz** | Direct money, privilege, or account takeover path |
 
-Impact text must answer: *who is hurt, what is lost, how the attacker reaches it.*  
-Vague impact like "could be dangerous" or "may lead to RCE" without a path is not impact_proof.
+Impact text must answer: *who is hurt, what is lost, how the attacker reaches it from production.*
 
-If impact is only theoretical, needs a second unproven bug, or is not yet capable from the attacker's seat → stay INVESTIGATING (chain it) or KILL \`insufficient_impact\`. Do **not** confirm "valid but non-applicable" findings.
+If impact is theoretical, needs a second unproven bug, or is not yet reachable from the attacker's position -> stay INVESTIGATING (chain it) or KILL.
 
----
+### 5. Adversarial Self-Review
 
-## 3. Adversarial Self-Review (Mandatory Before CONFIRMED)
-Argue against yourself:
-1. Why this might NOT be a vulnerability (intended, sandbox, misconfig, already authorized).
+1. Why this might NOT be a vulnerability.
 2. Alternative explanations for the observation.
 3. Why each alternative was rejected **with evidence**.
-4. What blocks a real attacker today (auth, CSRF, network, role checks) and whether each is bypassed.
-5. Would a program triage say "informative / N/A" because impact is self-only or privileged-only?
+4. What blocks a real attacker in production today and whether each is bypassed.
+5. Would a program triage reject this as informative/N/A?
 
----
+### 6. Root Cause -> Boundary -> Impact
 
-## 4. False Positive / Non-Applicable Kill Checklist
-KILL immediately when any apply:
-- Matches documented/spec behavior (\`intended_behavior\`)
-- Browser quirk, test artifact, or cache noise
-- Framework/middleware/WAF blocks the path and is not bypassed (\`framework_protection\`)
-- Requires privileges the attacker already has or cannot obtain (\`environmental_issue\`)
-- No C/I/A/financial effect for anyone but the attacker themselves (\`insufficient_impact\`)
-- Exploit unreliable / not reproducible twice (\`exploit_unreliable\`)
-- Duplicate of an existing case (\`duplicate\`)
-
----
-
-## 5. Root Cause → Boundary → Impact (Not Behavior → Hype)
-Trace:
 \`\`\`
-Entry (attacker-controlled) ──→ Reachable code path ──→ Trust boundary crossed ──→ Victim impact
+Entry (attacker-controlled) -> Code path -> Trust boundary crossed -> Victim impact
 \`\`\`
-- Minimum: reproduce successfully at least twice or via two independent methods.
-- Record: **Observed Facts**, **Assumptions**, **Unknowns**, **Experiments Remaining**.
-- If the bug is only a **primitive** (e.g. open redirect, limited SSRF, info leak of non-sensitive data), either chain to high impact or keep severity honest — do not inflate.
+
+Reproduce at least twice or via two methods.
 
 ---
 
-## 6. Duplicate Check
-Before CaseAdd:
-- Is this new?
-- Same root cause as an open case?
-- Multiple endpoints, one bug?
-Continue the existing case ID when scope matches.
+## At REPORT (before advancing to REPORTED)
 
----
-
-## 7. Report-Readiness Gate
-Before REPORTED:
 - Another researcher can reproduce deterministically
-- Steps are complete and production-realistic
-- Impact is justified without inflation (would the vendor agree?)
-- Root cause and fix guidance are concrete
-- Attacker model + victim impact are explicit in the write-up
+- Steps realistic in production
+- Impact justified without inflation (would the vendor agree?)
+- Root cause + fix guidance are concrete
+- Attacker model + victim impact + target explicit
 
 ---
 
-## 8. Permanent KILLED Cataloging
-Keep killed reasons explicit in assumptions/blockers:
-- \`intended_behavior\`
-- \`duplicate\`
-- \`framework_protection\`
-- \`exploit_unreliable\`
-- \`insufficient_impact\`
-- \`environmental_issue\`
-- \`not_applicable\` (true bug / interesting behavior, no realistic attacker value)
-Documenting kills prevents re-opening dead ends.
+## KILLED cataloging
 
----
+When a case is definitively dead (not "I don't know yet"), record the reason:
+- intended_behavior / duplicate / framework_protection
+- exploit_unreliable / insufficient_impact / environmental_issue
+- not_applicable (true bug / interesting behavior, no realistic attacker value)
 
-## 9. Tool Ecosystem (USE PROACTIVELY)
-
-You have offensive tools beyond casefile. Use them — do not rely on memory or guesswork.
-
-| Tool | When to use | Do NOT skip it when... |
-|------|------------|------------------------|
-| **ExploitSearch** | Before writing any PoC. Search for known techniques, bypasses, and attack primitives relevant to the target stack/vuln class. | ...you are investigating a hypothesis or building a PoC. Ground your approach in real write-ups, not memory. |
-| **web_search** | To find CVEs, advisories, prior bug reports, documentation, or any live information about the target. | ...you need to check if a vulnerability is known, find version-specific issues, or research a technology. |
-| **web_fetch** | To read full page content from a URL you already have (advisory, write-up, target page). | ...you have a specific URL to inspect. |
-| **context7** | To look up current library/framework API docs and behavior. | ...you need to understand how a framework feature works (auth, parsing, routing). |
-| **deepwiki** | To ask questions about a public GitHub repository's architecture and internals. | ...the target is an open-source project and you need to understand its design. |
-| **codebase-memory-mcp** | To index a codebase and trace source-to-sink paths. index_repository, get_architecture, search_graph, trace_path. | ...you have access to the target source code and need structural reachability analysis. |
-
-**pdtm CLI tools** (run via bash; each takes auth/flags differently — read the flags, do not guess):
-- subfinder -d host (-silent, -t threads) — passive subdomain enum from API sources; no target auth. Pipe to httpx, not straight to nuclei.
-- httpx -u <url> / -l hosts.txt (-t threads, -td tech-detect, -mc match-status, -H "Name: Value") — fast probe of authed endpoints; supports Header/Cookie/Bearer.
-- ffuf -u <url> -w wordlist (-t threads, -rate, -H "..." -b "c=v", -mc/-fs filters) — authed fuzzing / content discovery.
-- whatweb <url> (-a aggression 1-4, -t threads, --cookie) — tech fingerprint; positional URL, no -u.
-- naabu -host <ip> / -l (-p ports, -rate, -c top-ports) — port scan; hosts, not web-auth.
-- katana -u <url> / -list (-d depth, -jc js-crawl, -H "...") — crawl.
-- nuclei -l hosts.txt / -u <url> (-tags, -severity, -type http, -silent; -c threads -bs host-batch -rl rate-limit -timeout 5 -retries 0): FAST when filtered, slow only if naive.
-  - Do not run all 9000+ templates. Filter: -tags cve,exposure,rce -severity critical,high -type http -t http/misconfiguration/.
-  - Pre-filter targets: subfinder -> httpx -mc 200,403 -> nuclei (cuts ~80% of work).
-  - Tune: -c 100-200 -bs 50-100 -rl 300 (avoid Cloudflare tarpit) -timeout 5 -retries 0 -mhe 10.
-  - Many hosts: -scan-strategy host-spray (v3). Few hosts many templates: template-spray.
-
-**Default behavior when XP mode is ON:**
-1. Start recon with ExploitSearch + web_search before diving into code.
-2. Use context7/deepwiki to understand framework internals before claiming a vuln.
-3. Use codebase-memory-mcp (if available) to prove reachability structurally.
-4. Log everything to casefile (CaseAdd/CaseUpdate). Do not skip the ledger.
+Documenting kills prevents re-opening dead ends. Cases with unresolved unknowns should stay INVESTIGATING, not killed.
 `.trim();

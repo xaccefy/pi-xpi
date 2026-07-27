@@ -1,23 +1,26 @@
 {
-  "name": "@xaccefy/pi-lookup",
+  "name": "@xaccefy/pi-webxp",
   "version": "0.5.7",
-  "description": "Web search, page fetch, library docs (Context7), and GitHub repo Q&A (DeepWiki) for Pi Agent",
+  "description": "Web search, page fetch, library docs, repo Q&A, and exploit technique search for Pi Agent",
   "keywords": [
     "pi-package",
     "pi-extension",
     "xpi",
     "web-search",
     "lookup",
-    "documentation"
+    "documentation",
+    "security",
+    "exploit",
+    "bug-bounty"
   ],
   "type": "module",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/x4cc3/pi-xpi.git",
-    "directory": "packages/pi-lookup"
+    "directory": "packages/pi-webxp"
   },
-  "homepage": "https://github.com/x4cc3/pi-xpi/tree/main/packages/pi-lookup#readme",
+  "homepage": "https://github.com/x4cc3/pi-xpi/tree/main/packages/pi-webxp#readme",
   "bugs": {
     "url": "https://github.com/x4cc3/pi-xpi/issues"
   },
@@ -28,8 +31,10 @@
   "files": [
     "src/index.ts",
     "src/websearch.ts",
+    "src/httprequest.ts",
     "src/context7.ts",
     "src/deepwiki.ts",
+    "src/exploitsearch.ts",
     "src/cache.ts",
     "README.md",
     "LICENSE"
@@ -42,6 +47,7 @@
   },
   "dependencies": {
     "@sinclair/typebox": "^0.32.34",
+    "@xaccefy/pi-shared": "*",
     "open-websearch": "^2.1.11"
   },
   "devDependencies": {

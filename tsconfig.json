@@ -10,13 +10,11 @@
     "types": ["bun"]
   },
   "include": [
-    "packages/pi-exploitsearch/src/**/*.ts",
-    "packages/pi-exploitsearch/test/**/*.ts",
-    "packages/pi-casefile/src/**/*.ts",
-    "packages/pi-casefile/test/**/*.ts",
-    "packages/pi-lookup/src/**/*.ts",
-    "packages/pi-lookup/test/**/*.ts",
+    "packages/pi-shared/src/**/*.ts",
+    "packages/pi-webxp/src/**/*.ts",
+    "packages/pi-webxp/test/**/*.ts",
     "packages/pi-xtodo/index.ts",
-    "packages/pi-xtodo/test/**/*.ts"
+    "packages/pi-xtodo/test/**/*.ts",
+    "test-utils.ts"
   ]
 }

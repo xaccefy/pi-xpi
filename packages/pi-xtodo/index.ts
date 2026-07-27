@@ -54,38 +54,41 @@ interface TaskDetails {
 // ---------------------------------------------------------------------------
 // TypeBox Schema
 // ---------------------------------------------------------------------------
-export const TodoParamsSchema = Type.Object({
-  action: Type.String({
-    enum: ["create", "update", "list", "get", "delete", "clear"],
-    description: "create | update | list | get | delete | clear",
-  }),
-  subject: Type.Optional(Type.String({ description: "Task subject (required for create)" })),
-  description: Type.Optional(Type.String({ description: "Long-form task description" })),
-  activeForm: Type.Optional(
-    Type.String({ description: "Spinner label while status is in_progress" }),
-  ),
-  status: Type.Optional(
-    Type.String({
-      enum: ["pending", "in_progress", "completed", "deleted"],
-      description: "Target status (update) or list filter (list)",
+export const TodoParamsSchema = Type.Object(
+  {
+    action: Type.String({
+      enum: ["create", "update", "list", "get", "delete", "clear"],
+      description: "create | update | list | get | delete | clear",
     }),
-  ),
-  blockedBy: Type.Optional(
-    Type.Array(Type.Number(), { description: "Initial blockedBy ids (create only)" }),
-  ),
-  addBlockedBy: Type.Optional(
-    Type.Array(Type.Number(), { description: "Task ids to add to blockedBy (update)" }),
-  ),
-  removeBlockedBy: Type.Optional(
-    Type.Array(Type.Number(), { description: "Task ids to remove from blockedBy (update)" }),
-  ),
-  owner: Type.Optional(Type.String({ description: "Agent/owner assigned" })),
-  metadata: Type.Optional(
-    Type.Record(Type.String(), Type.Unknown(), { description: "Arbitrary metadata" }),
-  ),
-  id: Type.Optional(Type.Number({ description: "Task id (required for update, get, delete)" })),
-  includeDeleted: Type.Optional(Type.Boolean({ description: "Include deleted tasks in list" })),
-});
+    subject: Type.Optional(Type.String({ description: "Task subject (required for create)" })),
+    description: Type.Optional(Type.String({ description: "Long-form task description" })),
+    activeForm: Type.Optional(
+      Type.String({ description: "Spinner label while status is in_progress" }),
+    ),
+    status: Type.Optional(
+      Type.String({
+        enum: ["pending", "in_progress", "completed", "deleted"],
+        description: "Target status (update) or list filter (list)",
+      }),
+    ),
+    blockedBy: Type.Optional(
+      Type.Array(Type.Number(), { description: "Initial blockedBy ids (create only)" }),
+    ),
+    addBlockedBy: Type.Optional(
+      Type.Array(Type.Number(), { description: "Task ids to add to blockedBy (update)" }),
+    ),
+    removeBlockedBy: Type.Optional(
+      Type.Array(Type.Number(), { description: "Task ids to remove from blockedBy (update)" }),
+    ),
+    owner: Type.Optional(Type.String({ description: "Agent/owner assigned" })),
+    metadata: Type.Optional(
+      Type.Record(Type.String(), Type.Unknown(), { description: "Arbitrary metadata" }),
+    ),
+    id: Type.Optional(Type.Number({ description: "Task id (required for update, get, delete)" })),
+    includeDeleted: Type.Optional(Type.Boolean({ description: "Include deleted tasks in list" })),
+  },
+  { additionalProperties: false },
+);
 
 // ---------------------------------------------------------------------------
 // State

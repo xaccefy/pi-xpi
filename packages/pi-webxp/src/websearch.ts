@@ -86,14 +86,6 @@ function startDaemon(): void {
   });
 }
 
-process.on("exit", () => {
-  if (daemonProcess) {
-    try {
-      daemonProcess.kill();
-    } catch {}
-  }
-});
-
 async function ensureDaemonRunning(): Promise<boolean> {
   if (shuttingDown) return false;
   // Assign the shared promise BEFORE any await so concurrent callers coalesce
@@ -102,6 +94,9 @@ async function ensureDaemonRunning(): Promise<boolean> {
 
   startupPromise = (async () => {
     if (await checkDaemonRunning()) return true;
+    // Re-check after the async health probe: a concurrent session_shutdown may
+    // have flipped shuttingDown while we were awaiting. Don't spawn a daemon
+    // the shutdown just killed.
     if (shuttingDown) return false;
     if (!daemonProcess) startDaemon();
     for (let i = 0; i < STARTUP_RETRIES; i++) {
@@ -405,23 +400,26 @@ export default function websearchExtension(pi: ExtensionAPI) {
     promptSnippet: "Search the web for exploits, docs, or general info",
     promptGuidelines: [
       "Use web_search to find CVEs, advisories, documentation, write-ups, or any live web results (no API key needed).",
-      "Prefer web_search for general web lookups; use ExploitSearch for offense-specific technique grounding, and context7/deepwiki for library/repo docs.",
+      "Prefer web_search for general web lookups; use exploit_search for offense-specific technique grounding, and context7/deepwiki for library/repo docs.",
     ],
-    parameters: Type.Object({
-      query: Type.String({ description: "Search query string" }),
-      limit: Type.Optional(
-        Type.Integer({
-          description: "Max search results (1-50, default: 10)",
-          minimum: 1,
-          maximum: 50,
-        }),
-      ),
-      engines: Type.Optional(
-        Type.Array(Type.String(), {
-          description: "Engines to query (e.g. bing, duckduckgo, brave, exa)",
-        }),
-      ),
-    }),
+    parameters: Type.Object(
+      {
+        query: Type.String({ description: "Search query string" }),
+        limit: Type.Optional(
+          Type.Integer({
+            description: "Max search results (1-50, default: 10)",
+            minimum: 1,
+            maximum: 50,
+          }),
+        ),
+        engines: Type.Optional(
+          Type.Array(Type.String(), {
+            description: "Engines to query (e.g. bing, duckduckgo, brave, exa)",
+          }),
+        ),
+      },
+      { additionalProperties: false },
+    ),
 
     async execute(_id, params, signal, _onUpdate, _ctx) {
       try {
@@ -509,9 +507,12 @@ export default function websearchExtension(pi: ExtensionAPI) {
       "SPAs and JS-rendered pages are re-rendered headlessly, so the real content is returned; just pass the URL.",
       "Prefer web_fetch over web_search when you already have a target URL.",
     ],
-    parameters: Type.Object({
-      url: Type.String({ description: "Valid HTTP or HTTPS URL to fetch" }),
-    }),
+    parameters: Type.Object(
+      {
+        url: Type.String({ description: "Valid HTTP or HTTPS URL to fetch" }),
+      },
+      { additionalProperties: false },
+    ),
 
     async execute(_id, params, signal, _onUpdate, _ctx) {
       try {

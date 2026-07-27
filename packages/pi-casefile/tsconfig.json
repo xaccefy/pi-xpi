@@ -13,7 +13,8 @@
     "src/index.ts",
     "src/ledger.ts",
     "src/poc-runner.ts",
-    "src/sqlite-compat.ts",
-    "test/ledger.test.ts"
+    "src/workflow.ts",
+    "src/sqlite-compat/index.ts",
+    "test/**/*.ts"
   ]
 }

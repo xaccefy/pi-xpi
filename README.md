@@ -20,11 +20,11 @@ pi install npm:@xaccefy/pi-xpi
 
 | Variable | Package | Purpose |
 |----------|---------|---------|
-| `PREVIEW_IS_API_KEY` | exploitsearch | Required for `ExploitSearch` ([preview.is](https://preview.is)) |
+| `PREVIEW_IS_API_KEY` | webxp | Required for `exploit_search` ([preview.is](https://preview.is)) |
 | `PI_XP_MODE` | casefile | `on` / `off` — force casefile cyber-workflow injection |
 | `PI_CASEFILE_PATH` | casefile | Override SQLite ledger path |
-| `PI_WEBSEARCH_PORT` | lookup | open-websearch daemon port (default `3210`) |
-| `PI_CHROMIUM_PATH` | lookup | Chromium binary for SPA re-render in `web_fetch` |
+| `PI_WEBSEARCH_PORT` | webxp | open-websearch daemon port (default `3210`) |
+| `PI_CHROMIUM_PATH` | webxp | Chromium binary for SPA re-render in `web_fetch` |
 
 ```bash
 export PREVIEW_IS_API_KEY="rk_yourkeyhere"
@@ -34,7 +34,7 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 
 | Tool | Use for |
 |------|---------|
-| ExploitSearch | Attack techniques, primitives, bypasses (`PREVIEW_IS_API_KEY`) |
+| exploit_search | Attack techniques, primitives, bypasses (`PREVIEW_IS_API_KEY`) |
 | web_search | CVEs, advisories, documentation |
 | web_fetch | Page content; SPA pages re-rendered via Chromium when the shell is thin |
 | context7 | Current library docs |
@@ -46,7 +46,7 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 | /casefile | Case dashboard |
 | /xp | Toggle casefile **XP mode** (cyber workflow injection; **default OFF**) |
 | todo / /todos | Multi-step task lists |
-| codebase-memory-mcp | Polyglot code indexer (158 languages). Tools: `index_repository`, `search_graph`, `trace_path`, `get_architecture`, `query_graph`. Installed by `install.sh` as an MCP server. |
+| fff (`ffgrep` / `fffind`) | Frecency-ranked file + content search; in `override` mode transparently upgrades pi's built-in `grep`/`find`. Installed by `install.sh`. |
 
 ## Quick start
 
@@ -56,13 +56,13 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 
 Skills (`skills/web-pentest`, `skills/pipeline`) auto-load into agent context. No slash commands needed for methodology — just tell the agent what to hunt. Run `/xp on` for the full attacker discipline with casefile tracking.
 
-## Code intelligence (codebase-memory-mcp)
+## Code search (fff)
 
-XPI uses [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) as its default code indexer. It's a single static binary that indexes **158 languages** via tree-sitter plus a Hybrid LSP type-resolution layer, exposing 14 MCP tools (`index_repository`, `search_graph`, `trace_path`, `get_architecture`, `query_graph`, `get_code_snippet`, …).
+XPI uses [fff](https://github.com/dmtrKovalenko/fff) (`@ff-labs/pi-fff`) for file and content search. It's a frecency-ranked, typo-tolerant search engine that runs as a native Pi extension — no separate MCP process.
 
-`install.sh` installs it as an MCP server alongside the in-process XPI extensions. For a readable target repo, index once with `index_repository`, then `get_architecture` for layout and `trace_path` to prove source→sink reachability — across Go, Solidity, Python, Rust, TS/JS, and 150+ others.
+`install.sh` installs it and sets `PI_FFF_MODE=override`, which transparently replaces pi's built-in `grep`/`find`/`multi_grep` with fff's implementations. The agent's existing `grep`/`find` calls become faster and smarter with no prompt or skill changes — `ffgrep` auto-detects regex vs fuzzy, `fffind` matches whole repo-relative paths and ranks by frecency.
 
-> The previous in-process `@xaccefy/pi-codeintel` package (TS/JS-only, TypeScript-compiler-based) was removed in favor of this polyglot backend. The agent falls back to `grep`/`read` when no indexer is available.
+For a target repo, the auditor and tracer agents use `grep`/`find`/`read` to locate sinks, entry points, and call chains — fff makes those searches accurate across large codebases without a heavy index step.
 
 ## Packages
 
@@ -70,8 +70,7 @@ XPI uses [codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) 
 |---------|-----|
 | Umbrella | `@xaccefy/pi-xpi` |
 | Case ledger | `@xaccefy/pi-casefile` |
-| Lookup | `@xaccefy/pi-lookup` |
-| Exploit search | `@xaccefy/pi-exploitsearch` |
+| Web lookup + exploit search | `@xaccefy/pi-webxp` |
 | Todos | `@xaccefy/pi-xtodo` |
 
 See each package’s `README.md` under `packages/*/`.
@@ -83,8 +82,7 @@ pi-xpi/
 ├── agents/                  # auditor, tracer, exploit, harness
 ├── packages/
 │   ├── pi-casefile
-│   ├── pi-exploitsearch
-│   ├── pi-lookup
+│   ├── pi-webxp
 │   └── pi-xtodo
 ├── schemas/                 # stage-finding, stage-trace, stage-validation, stage-report
 ├── scripts/                 # bump-version, release

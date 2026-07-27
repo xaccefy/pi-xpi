@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -102,6 +102,8 @@ describe("casefile sqlite ledger", () => {
       severity: "medium",
       impact: "Session theft",
       poc: "alert(1) in search box",
+      target: "example-app",
+      disconfirmation: "Tried to reproduce without search input; could not.",
     });
     const ok = assertPromotable(record.id);
     assert.strictEqual(ok.id, record.id);
@@ -121,6 +123,9 @@ describe("casefile sqlite ledger", () => {
       poc: "Request /exports/123 as another user",
       impact: "Unauthorized file disclosure",
       evidence: "Observed sequential IDs",
+      target: "example-app",
+      disconfirmation:
+        "Attempted to access own export without authentication; blocked. Only IDOR through authenticated session.",
     });
     assert.strictEqual(updated.changed, true);
 
@@ -243,6 +248,8 @@ describe("casefile sqlite ledger", () => {
       impact: "data leak",
       severity: "high",
       poc: "/tmp/poc.sh",
+      target: "example-app",
+      disconfirmation: "Checked if data is public by default; it is not.",
     });
     promoteFindingResult(live.id, {
       path: "/tmp/poc.sh",
@@ -312,5 +319,72 @@ describe("casefile sqlite ledger", () => {
     const page = searchCases({ limit: 1, offset: 0 });
     assert.strictEqual(page.total, 3);
     assert.strictEqual(page.cases.length, 1);
+  });
+
+  it("writeCaseReport includes the disconfirmation attempt and verification log", () => {
+    const record = addCase({
+      title: "IDOR with disconfirmation",
+      status: "investigating",
+      evidence: "Observed sequential IDs",
+      confidence: "medium",
+    });
+    updateCaseResult(record.id, {
+      confidence: "high",
+      severity: "high",
+      poc: "Request /exports/123 as another user",
+      impact: "Unauthorized file disclosure",
+      evidence: "Observed sequential IDs",
+      target: "example-app",
+      disconfirmation:
+        "Attempted to access own export without auth; blocked. Only IDOR via session works.",
+    });
+    promoteFindingResult(record.id, {
+      path: "/workspace/idor-poc.py",
+      exitCode: 0,
+      ranAt: "2024-01-01T00:00:00Z",
+      sandbox: true,
+    });
+    const { path } = writeCaseReport(record.id);
+    const report = readFileSync(path, "utf8");
+    assert.ok(
+      report.includes("## Disconfirmation Attempt"),
+      "report must include the disconfirmation text section",
+    );
+    assert.ok(
+      report.includes("Attempted to access own export without auth"),
+      "report must include the disconfirmation body",
+    );
+  });
+
+  it("demoting confirmed → investigating clears both pocVerified and disconfirmationVerified", () => {
+    const record = addCase({
+      title: "Confirmed then demoted",
+      status: "investigating",
+      evidence: "repro steps",
+      confidence: "high",
+      impact: "data leak",
+      severity: "high",
+      poc: "/tmp/poc.sh",
+      target: "example-app",
+      disconfirmation: "Tried to disprove; could not.",
+    });
+    promoteFindingResult(
+      record.id,
+      { path: "/tmp/poc.sh", exitCode: 0, ranAt: "2024-01-01T00:00:00Z", sandbox: true },
+      { path: "/tmp/disconfirm.sh", exitCode: 1, ranAt: "2024-01-01T00:00:00Z", sandbox: true },
+    );
+    const confirmed = readCasefile().find((c) => c.id === record.id)!;
+    assert.ok(confirmed.pocVerified, "pocVerified set after promotion");
+    assert.ok(confirmed.disconfirmationVerified, "disconfirmationVerified set after promotion");
+
+    // Demote back to investigating — both verification artifacts must be cleared.
+    updateCaseResult(record.id, { status: "investigating" });
+    const demoted = readCasefile().find((c) => c.id === record.id)!;
+    assert.strictEqual(demoted.pocVerified, undefined, "pocVerified cleared on demotion");
+    assert.strictEqual(
+      demoted.disconfirmationVerified,
+      undefined,
+      "disconfirmationVerified cleared on demotion",
+    );
   });
 });

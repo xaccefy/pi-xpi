@@ -1,12 +1,12 @@
 import assert from "node:assert";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { MockExtensionAPI } from "../../../test-utils.ts";
-import piLookup from "../src/index.ts";
+import piWebxp from "../src/index.ts";
 
 // Save original global fetch
 const originalFetch = globalThis.fetch;
 
-describe("pi-lookup tool tests", () => {
+describe("pi-webxp: web_search/web_fetch", () => {
   beforeEach(() => {
     globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       const urlStr = url.toString();
@@ -64,7 +64,7 @@ describe("pi-lookup tool tests", () => {
 
   it("registers web_search and web_fetch tools and calls mock daemon endpoints", async () => {
     const pi = new MockExtensionAPI();
-    piLookup(pi as any);
+    piWebxp(pi as any);
 
     // Assert tools are registered
     const searchTool = pi.tools.find((t) => t.name === "web_search");
@@ -98,7 +98,7 @@ describe("pi-lookup tool tests", () => {
 
   it("retries fetchWithRetry once on a transient 500 then succeeds", async () => {
     const pi = new MockExtensionAPI();
-    piLookup(pi as any);
+    piWebxp(pi as any);
     const searchTool = pi.tools.find((t) => t.name === "web_search");
 
     let searchCalls = 0;
@@ -181,7 +181,7 @@ describe("pi-lookup tool tests", () => {
       }) as any;
 
       const pi = new MockExtensionAPI();
-      piLookup(pi as any);
+      piWebxp(pi as any);
       const fetchTool = pi.tools.find((t) => t.name === "web_fetch");
       assert.ok(fetchTool);
 
@@ -204,7 +204,7 @@ describe("pi-lookup tool tests", () => {
 
   it("session_start does not block on daemon startup", async () => {
     const pi = new MockExtensionAPI();
-    piLookup(pi as any);
+    piWebxp(pi as any);
 
     // Make the daemon health check hang forever; any `await ensureDaemonRunning()`
     // would block. The handler uses `void ensureDaemonRunning()`, so session_start

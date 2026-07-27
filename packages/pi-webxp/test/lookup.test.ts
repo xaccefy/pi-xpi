@@ -4,7 +4,7 @@ import { deepwikiTool } from "../src/deepwiki.ts";
 
 const originalFetch = globalThis.fetch;
 
-describe("pi-lookup context7", () => {
+describe("pi-webxp: context7", () => {
   beforeEach(() => {
     globalThis.fetch = (async (url: string | URL | Request, _init?: RequestInit) => {
       const urlStr = url.toString();
@@ -81,7 +81,7 @@ describe("pi-lookup context7", () => {
   });
 });
 
-describe("pi-lookup deepwiki", () => {
+describe("pi-webxp: deepwiki", () => {
   beforeEach(() => {
     globalThis.fetch = (async (_url: string | URL | Request, _init?: RequestInit) => {
       return {
