@@ -20,6 +20,7 @@ function run(cmd, options = {}) {
     return execSync(cmd, {
       encoding: "utf-8",
       stdio: options.silent ? "pipe" : "inherit",
+      timeout: 30_000,
       ...options,
     });
   } catch (_e) {
@@ -56,7 +57,7 @@ function stageChangedFiles() {
 
 function commitIfStaged(message) {
   try {
-    execSync("git diff --cached --quiet");
+    execSync("git diff --cached --quiet", { timeout: 30_000 });
   } catch {
     run(`git commit -m "${message}"`);
   }
