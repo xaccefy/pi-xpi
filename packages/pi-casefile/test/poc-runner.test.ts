@@ -49,11 +49,12 @@ describe("poc-runner", () => {
   });
 
   it("sanitizes control characters from output", () => {
-    const shPoc = join(tempDir, "poc.sh");
-    // Print ANSI color escape and a null byte
-    writeFileSync(shPoc, '#!/bin/sh\nprintf "\\033[31mhello\\033[0m \\000world\\n"', "utf8");
+    // Use a node script to output ANSI + null byte — cross-platform, avoids
+    // dash's printf \000 which hangs Bun spawnSync on CI (ubuntu /bin/sh=dash).
+    const jsPoc = join(tempDir, "poc.js");
+    writeFileSync(jsPoc, 'process.stdout.write("\x1b[31mhello\x1b[0m \x00world\n")', "utf8");
 
-    const result = runPoc(shPoc, false);
+    const result = runPoc(jsPoc, false);
 
     // ANSI codes and null byte should be stripped
     expect(result.output).not.toContain("\x1b[31m");
