@@ -83,7 +83,7 @@ describe("poc-runner", () => {
     // actually run and we can't deterministically assert fail-closed.
     let hasDocker = false;
     try {
-      hasDocker = spawnSync("docker", ["--version"]).status === 0;
+      hasDocker = spawnSync("docker", ["--version"], { timeout: 5_000 }).status === 0;
     } catch {
       hasDocker = false;
     }
