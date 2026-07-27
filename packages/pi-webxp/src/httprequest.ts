@@ -169,7 +169,7 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
     name: "http_request",
     label: "HTTP Request",
     description:
-      "Send a raw HTTP request with a persistent cookie jar, custom headers, and body control. Use for authenticated web-app testing (login → probe), API vulnerability probing, and verifying HTTP behavior. Unlike web_fetch (stateless, read-only), http_request persists cookies and auth across calls within a session, supports all methods, and surfaces raw responses.",
+      "Send a raw HTTP request with a persistent cookie jar, custom headers, and body control. Use for authenticated web-app testing (login → probe), API vulnerability probing, and verifying HTTP behavior. Unlike web_fetch (stateless, read-only), http_request persists cookies across calls within a session, supports all methods, and surfaces raw responses.",
     promptSnippet: "Send HTTP requests with cookies, headers, and body control",
     promptGuidelines: [
       "Use http_request for authenticated web-app testing: POST to login, then GET protected resources — the cookie jar persists across calls automatically.",

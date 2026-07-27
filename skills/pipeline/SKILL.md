@@ -26,7 +26,7 @@ The pipeline assumes the target is **in scope** and the agent has the tools to p
 
 1. **Scope is defined.** Record the in-scope hosts/paths in the pipeline-run case `target` + `assumptions`. Every probe must hit a host in scope. If scope is ambiguous, ask the user — do not guess.
 2. **Auth is available (if needed).** If the target requires auth, the user must supply credentials/tokens. Store them in env vars (`TARGET_COOKIE`, `TARGET_TOKEN`). The pipeline cannot create accounts.
-3. **CLI tools are present.** Recon and probing rely on `curl`, `httpx`, `ffuf`, `nuclei`, `subfinder`, `nmap`, `jq` — all driven via `bash`. If a tool is missing, the auditor falls back to `curl` + `grep` (slower). Check with `bash("command -v httpx ffuf nuclei")` at run start and record what's available.
+3. **CLI tools are present.** Recon and probing rely on `http_request` (stateful HTTP, cookie persistence) plus CLI tools `httpx`, `ffuf`, `nuclei`, `subfinder`, `nmap`, `jq` via `bash`. If a CLI tool is missing, fall back to `http_request` + `grep` (slower). Check with `bash("command -v httpx ffuf nuclei")` at run start and record what's available.
 4. **OOB channel for blind classes.** Blind SQLi / blind SSRF / blind command injection can only be confirmed via an out-of-band callback. If no listener is running (`interactsh-client` or a `nc` listener), blind classes will be **un-confirmable** — record them as `INCOMPLETE` with `nextStep: "blocked: no OOB listener"`, don't kill them.
 5. **Rate limits are set.** Hard cap: ≤10 threads, ≤50 req/min. Stop on 429/403. The pipeline must not DoS the target.
 
