@@ -147,6 +147,8 @@ is considered disproven and promotion is blocked. If you cannot write a
 meaningful disconfirmation script, you may not understand the finding well
 enough to promote it.
 
+**Adversarial disconfirmation (skeptic subagent):** For findings at severity >= high, a dedicated skeptic subagent independently re-reads the source and tries to disprove the finding BEFORE the exploit agent runs. The skeptic's \`disconfirmation_attempt\` is written into this \`disconfirmation\` field by the harness — it satisfies this gate and is stronger than self-disconfirmation because a separate agent produced it. If the skeptic says DISPROVEN, the finding is killed directly. Self-disconfirmation still applies for findings below high severity.
+
 ### 2. Production Path Verification (must be in impact field)
 
 The **impact** field for CONFIRMED must explicitly answer:

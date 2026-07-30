@@ -1,0 +1,207 @@
+import assert from "node:assert";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, it } from "node:test";
+
+import {
+  getRunDir,
+  getScratchpadRoot,
+  scratchpad_checkpoint,
+  scratchpad_clear,
+  scratchpad_clear_all,
+  scratchpad_finish,
+  scratchpad_init,
+  scratchpad_list,
+  scratchpad_list_runs,
+  scratchpad_phase_done,
+  scratchpad_read,
+  scratchpad_resume,
+  scratchpad_write,
+  setScratchpadRoot,
+} from "../src/scratchpad.ts";
+
+let tempDir: string;
+
+beforeEach(() => {
+  tempDir = mkdtempSync(join(tmpdir(), "scratchpad-test-"));
+  setScratchpadRoot(tempDir);
+});
+
+afterEach(async () => {
+  setScratchpadRoot(undefined);
+  await rm(tempDir, { recursive: true, force: true });
+});
+
+describe("scratchpad", () => {
+  it("init creates the directory structure and state.json", () => {
+    const cp = scratchpad_init("run-1");
+    assert.strictEqual(cp.run_id, "run-1");
+    assert.strictEqual(cp.done, false);
+    assert.deepStrictEqual(cp.completed_phases, []);
+
+    const runDir = getRunDir("run-1", tempDir);
+    assert.ok(existsSync(join(runDir, "state.json")));
+    assert.ok(existsSync(join(runDir, "recon")));
+    assert.ok(existsSync(join(runDir, "trace")));
+    assert.ok(existsSync(join(runDir, "verify")));
+  });
+
+  it("init is idempotent — returns existing checkpoint on re-init", () => {
+    scratchpad_init("run-1");
+    scratchpad_checkpoint("run-1", "recon", { ids: ["case_a"], summary: "done" });
+
+    const second = scratchpad_init("run-1");
+    assert.strictEqual(second.run_id, "run-1");
+    // Re-init must not wipe the checkpoint.
+    assert.ok(second.completed_phases.includes("recon"));
+  });
+
+  it("write + read round-trips an artifact", () => {
+    scratchpad_init("run-1");
+    const path = scratchpad_write("run-1", "trace", "finding-abc.json", '{"reachable": true}');
+    assert.ok(path.endsWith("finding-abc.json"));
+
+    const content = scratchpad_read("run-1", "trace", "finding-abc.json");
+    assert.strictEqual(content, '{"reachable": true}');
+  });
+
+  it("read returns null for missing artifact", () => {
+    scratchpad_init("run-1");
+    assert.strictEqual(scratchpad_read("run-1", "trace", "nope.json"), null);
+  });
+
+  it("write sanitizes artifact names to prevent path traversal", () => {
+    scratchpad_init("run-1");
+    const path = scratchpad_write("run-1", "recon", "../../etc/passwd", "evil");
+    // The file must land inside the recon dir — no escape.
+    const reconDir = join(getRunDir("run-1", tempDir), "recon");
+    assert.ok(path.startsWith(reconDir), `path ${path} escaped recon dir`);
+    // Verify the content was actually written to the sanitized path.
+    assert.strictEqual(scratchpad_read("run-1", "recon", "../../etc/passwd"), "evil");
+  });
+
+  it("list returns artifacts for a phase", () => {
+    scratchpad_init("run-1");
+    scratchpad_write("run-1", "trace", "a.json", "a");
+    scratchpad_write("run-1", "trace", "b.json", "b");
+    const list = scratchpad_list("run-1", "trace");
+    assert.deepStrictEqual(list.sort(), ["a.json", "b.json"]);
+  });
+
+  it("list returns empty for a phase with no artifacts", () => {
+    scratchpad_init("run-1");
+    assert.deepStrictEqual(scratchpad_list("run-1", "trace"), []);
+  });
+
+  it("checkpoint records phase completion, ids, and summary", () => {
+    scratchpad_init("run-1");
+    const cp = scratchpad_checkpoint("run-1", "hunt", {
+      ids: ["case_1", "case_2"],
+      summary: "found 2 hypotheses",
+    });
+    assert.deepStrictEqual(cp.completed_phases, ["hunt"]);
+    assert.deepStrictEqual(cp.phase_ids.hunt, ["case_1", "case_2"]);
+    assert.strictEqual(cp.phase_summaries.hunt, "found 2 hypotheses");
+    assert.ok(cp.last_phase_at);
+  });
+
+  it("checkpoint is idempotent — does not duplicate phase in completed_phases", () => {
+    scratchpad_init("run-1");
+    scratchpad_checkpoint("run-1", "hunt", { summary: "first" });
+    scratchpad_checkpoint("run-1", "hunt", { summary: "second" });
+    const cp = scratchpad_resume("run-1")!;
+    assert.strictEqual(cp.checkpoint.completed_phases.filter((p) => p === "hunt").length, 1);
+    assert.strictEqual(cp.checkpoint.phase_summaries.hunt, "second");
+  });
+
+  it("checkpoint keeps completed_phases in pipeline order", () => {
+    scratchpad_init("run-1");
+    // Checkpoint out of order.
+    scratchpad_checkpoint("run-1", "validate", { summary: "v" });
+    scratchpad_checkpoint("run-1", "recon", { summary: "r" });
+    scratchpad_checkpoint("run-1", "trace", { summary: "t" });
+    const cp = scratchpad_resume("run-1")!;
+    assert.deepStrictEqual(cp.checkpoint.completed_phases, ["recon", "trace", "validate"]);
+  });
+
+  it("phase_done reports completion status", () => {
+    scratchpad_init("run-1");
+    assert.strictEqual(scratchpad_phase_done("run-1", "recon"), false);
+    scratchpad_checkpoint("run-1", "recon", { summary: "done" });
+    assert.strictEqual(scratchpad_phase_done("run-1", "recon"), true);
+  });
+
+  it("resume returns null for a non-existent run", () => {
+    assert.strictEqual(scratchpad_resume("nope"), null);
+  });
+
+  it("resume returns next_phase and artifacts for a partial run", () => {
+    scratchpad_init("run-1");
+    scratchpad_write("run-1", "recon", "fingerprint.json", "tech: express");
+    scratchpad_checkpoint("run-1", "recon", { ids: ["case_r"], summary: "recon done" });
+
+    const resume = scratchpad_resume("run-1")!;
+    assert.strictEqual(resume.checkpoint.run_id, "run-1");
+    assert.strictEqual(resume.next_phase, "hunt");
+    assert.deepStrictEqual(resume.artifacts.recon, ["fingerprint.json"]);
+  });
+
+  it("resume returns null next_phase when all phases complete", () => {
+    scratchpad_init("run-1");
+    for (const phase of [
+      "recon",
+      "hunt",
+      "gapfil",
+      "trace",
+      "skeptic",
+      "validate",
+      "chain",
+      "patch",
+      "report",
+    ] as const) {
+      scratchpad_checkpoint("run-1", phase, { summary: `${phase} done` });
+    }
+    const resume = scratchpad_resume("run-1")!;
+    assert.strictEqual(resume.next_phase, null);
+  });
+
+  it("finish marks the run as done", () => {
+    scratchpad_init("run-1");
+    const cp = scratchpad_finish("run-1");
+    assert.strictEqual(cp.done, true);
+  });
+
+  it("clear removes a single run without touching others", () => {
+    scratchpad_init("run-1");
+    scratchpad_init("run-2");
+    scratchpad_clear("run-1");
+    const runs = scratchpad_list_runs();
+    assert.deepStrictEqual(runs, ["run-2"]);
+  });
+
+  it("clear_all removes every run", () => {
+    scratchpad_init("run-1");
+    scratchpad_init("run-2");
+    scratchpad_clear_all();
+    assert.deepStrictEqual(scratchpad_list_runs(), []);
+    assert.ok(!existsSync(getScratchpadRoot(tempDir)));
+  });
+
+  it("list_runs returns all run directories sorted", () => {
+    scratchpad_init("run-b");
+    scratchpad_init("run-a");
+    assert.deepStrictEqual(scratchpad_list_runs(), ["run-a", "run-b"]);
+  });
+
+  it("state.json is valid JSON with the expected shape", () => {
+    scratchpad_init("run-1");
+    scratchpad_checkpoint("run-1", "recon", { ids: ["x"], summary: "s" });
+    const raw = readFileSync(join(getRunDir("run-1", tempDir), "state.json"), "utf8");
+    const parsed = JSON.parse(raw);
+    assert.strictEqual(parsed.run_id, "run-1");
+    assert.ok(Array.isArray(parsed.completed_phases));
+    assert.strictEqual(parsed.done, false);
+  });
+});

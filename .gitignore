@@ -15,6 +15,9 @@ dist/
 # Casefile local database
 .casefile/
 
+# Pipeline scratchpad (per-run artifacts)
+.scratchpad/
+
 # OS files
 .DS_Store
 Thumbs.db

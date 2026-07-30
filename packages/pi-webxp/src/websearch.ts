@@ -34,12 +34,7 @@ let daemonProcess: ChildProcess | null = null;
 let startupPromise: Promise<boolean> | null = null;
 
 // Domain mapping for fetch endpoints
-const DOMAIN_ENDPOINT_MAP = [
-  { match: "github.com", endpoint: "/fetch-github-readme" },
-  { match: "csdn.net", endpoint: "/fetch-csdn" },
-  { match: "juejin.cn", endpoint: "/fetch-juejin" },
-  { match: "linux.do", endpoint: "/fetch-linuxdo" },
-];
+const DOMAIN_ENDPOINT_MAP = [{ match: "github.com", endpoint: "/fetch-github-readme" }];
 
 // ── Helpers ──────────────────────────────────────────────────────────
 

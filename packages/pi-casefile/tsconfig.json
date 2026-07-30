@@ -14,6 +14,7 @@
     "src/ledger.ts",
     "src/poc-runner.ts",
     "src/workflow.ts",
+    "src/scratchpad.ts",
     "src/sqlite-compat/index.ts",
     "test/**/*.ts"
   ]

@@ -106,6 +106,13 @@ describe("casefile extension", () => {
       "CaseUnlink",
       "CaseUpdate",
       "PromoteFinding",
+      "ScratchpadCheckpoint",
+      "ScratchpadClear",
+      "ScratchpadInit",
+      "ScratchpadPhaseDone",
+      "ScratchpadRead",
+      "ScratchpadResume",
+      "ScratchpadWrite",
     ]);
     expect([...pi.commands.keys()].sort()).toEqual(["casefile", "xp"]);
     expect(pi.events.has("session_start")).toBe(true);

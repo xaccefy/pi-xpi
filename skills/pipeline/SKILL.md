@@ -8,13 +8,13 @@ description: Full pipeline orchestration skill for vulnerability discovery. Teac
 ## Stage Machine
 
 ```
-RECON → HUNT → GAPFIL(loop) → TRACE → VALIDATE → CHAIN → REPORT
+RECON → HUNT → GAPFIL(loop) → TRACE → SKEPTIC → VALIDATE → CHAIN → REPORT
   ↑___________________|                    |
-  └────── FEEDBACK ────┘                    |
-         (traces into new hunts)            |
-                                            ↓
-                                      FIX (optional)
+  └────── FEEDBACK ────┘                    ↓
+         (traces into new hunts)      FIX (optional)
 ```
+
+SKEPTIC runs between TRACE and VALIDATE, but only for findings at severity >= high. The skeptic independently re-reads source to disprove the finding. If the skeptic says DISPROVEN, the finding is killed directly — no tie-breaker.
 
 Finish coverage (hunt + gapfill) before spending trace budget. Trace only the hypotheses that survived a complete hunt, then validate the reachable ones.
 
@@ -35,11 +35,10 @@ If any prerequisite is missing, record it in the pipeline-run case and either as
 ## Stage Config
 
 Each stage has:
-- **model** — which model class to dispatch on (hunt = standard, trace = strong, validate = different than hunt for deliberate disagreement)
-- **tools** — what tools the agent gets (trace has no write tools)
+- **model** — which model class to dispatch on (hunt = standard, trace = strong, skeptic = strong [deliberate disagreement with auditor], validate = different than hunt for deliberate disagreement)
+- **tools** — what tools the agent gets (trace/skeptic have no write tools)
 - **output schema** — what shape the stage must emit
 - **max_turns** — when to terminate a stuck agent
-- **concurrency** — how many parallel agents to run
 
 ## State Tracking via Casefile
 
@@ -62,6 +61,39 @@ Record per-stage progress with `CaseUpdate`:
 
 This gives you resume capability: on restart, `CaseList(tag: "pipeline")` shows previous runs and their last recorded stage.
 
+## Scratchpad (Artifact Store)
+
+The casefile owns state transitions; the scratchpad owns artifacts. Agents write their intermediate outputs (recon maps, trace outputs, verification logs) to the scratchpad instead of stuffing everything into casefile text fields or relying on each other's output streams.
+
+**Directory layout** (created by `scratchpad_init`):
+```
+{project_root}/.scratchpad/{run_id}/
+  recon/      — fingerprints, tech detection, surface maps
+  hunt/       — per-class coverage logs, finding candidates
+  gapfil/     — gapfill re-queue artifacts
+  trace/      — per-finding reachability traces
+  skeptic/    — per-finding disconfirmation verdicts
+  verify/     — PoC logs, run outputs
+  chain/      — chain analysis artifacts
+  patch/      — patch diffs, re-attack results
+  report/     — final report drafts
+  state.json  — checkpoint file with phase completion + key IDs
+```
+
+**API:** see `packages/pi-casefile/src/scratchpad.ts` for the full API. Key functions: `scratchpad_init`, `scratchpad_write`, `scratchpad_read`, `scratchpad_checkpoint`, `scratchpad_resume`, `scratchpad_phase_done`, `scratchpad_clear`.
+
+**Rules:**
+- Agents write artifacts to scratchpad, not to each other's output files (prevents echo chamber).
+- Casefile still owns state transitions; scratchpad owns artifacts.
+- Resume re-reads scratchpad artifacts, does not re-run completed phases (idempotent). A completed phase with a checkpoint artifact is a no-op on re-run.
+- The `.scratchpad/` directory is preserved between runs; `--fresh` clears it.
+
+## Resume + Checkpoints
+
+After every phase: `scratchpad_checkpoint(run_id, "<phase>", { ids: [<case-ids>], summary: "<one-line>" })`.
+
+On pipeline start: `scratchpad_resume(run_id) ?? scratchpad_init(run_id)`. If resume returns a checkpoint, skip completed phases (check `scratchpad_phase_done` before each dispatch) and continue from `resume.next_phase`. `--fresh` clears the scratchpad via `scratchpad_clear(run_id)`.
+
 ## Schema Validation at Stage Boundaries
 
 Every stage output must conform to its schema before the next stage begins. Validate by reading the schema file and checking each required field.
@@ -72,6 +104,7 @@ Every stage output must conform to its schema before the next stage begins. Vali
 |-------|--------|-----------------|
 | **HUNT** | `schemas/stage-finding.json` | vuln_class, file, line, sink, entry_point, confidence, evidence |
 | **TRACE** | `schemas/stage-trace.json` | trace_result, entry_point, call_chain, defenses_checked, attacker_model |
+| **SKEPTIC** | `schemas/stage-skeptic.json` | finding_id, verdict, reasoning, evidence_reviewed |
 | **VALIDATE** | `schemas/stage-validation.json` | finding_id, status, technique_used, detection_method |
 | **CHAIN** | `schemas/stage-chain.json` | chains[], summary |
 | **REPORT** | `schemas/stage-report.json` | target, pipeline_status, findings, coverage, summary |
@@ -117,6 +150,29 @@ For each hypothesis that passed validation:
 ```
 
 Only findings with `TRACE RESULT: REACHABLE` advance to exploit.
+
+### SKEPTIC: One agent per high-severity traced finding (adversarial disconfirmation)
+
+Runs for every REACHABLE finding with severity >= high. The skeptic independently re-reads source to disprove the finding — it does not trust the auditor's or tracer's summary.
+
+```
+For each REACHABLE finding with severity >= high:
+  subagent({agent: "skeptic",
+    task: "Disprove finding <case-id>. vuln_class=<class>, sink=<file:line>, entry_point=<entry>.
+           Trace result: REACHABLE via <call_chain>. Auditor evidence: <evidence>.
+           Read the source yourself. Try to disprove it. Output conforming to schemas/stage-skeptic.json.",
+    turnBudget: {maxTurns: 12, graceTurns: 2}})
+```
+
+Validate skeptic output against `schemas/stage-skeptic.json`:
+- Must have finding_id, verdict (CONFIRMED|DISPROVEN), reasoning, evidence_reviewed
+- If DISPROVEN: must have disproval_reason
+
+**Skeptic verdict handling:**
+- **CONFIRMED** — the skeptic agrees the finding is real. Write the skeptic's `disconfirmation_attempt` into the case's `disconfirmation` field via `CaseUpdate(id, { disconfirmation: <skeptic's attempt> })`. The finding advances to VALIDATE.
+- **DISPROVEN** — the skeptic found a concrete reason the finding is false. Kill directly: `CaseUpdate(id, { status: "killed", nextStep: "killed: skeptic-disproven — <disproval_reason>" })`. No tie-breaker — a read-only re-read of source that found no path is the answer.
+
+The skeptic's `disconfirmation_attempt` IS the case's disconfirmation record — it satisfies the disconfirmation gate before CONFIRMED. This is stronger than self-disconfirmation because a different agent produced it.
 
 ### VALIDATE: One agent per traced finding
 
@@ -209,6 +265,7 @@ CaseUpdate(<pipeline-case-id>, {
 Target token budgets per stage (cumulative input+output):
 - HUNT: ~50K tokens per class
 - TRACE: ~20K per finding
+- SKEPTIC: ~15K per finding (only severity >= high)
 - VALIDATE: ~30K per finding (exploit phase)
 - CHAIN: ~20K total
 - PATCH: ~40K per finding
@@ -230,5 +287,13 @@ subagent({agent: "auditor",
 | auditor | 20 | 25 with gapfill |
 | tracer | 12 | read-only, should be fast |
 | exploit (phase 1) | 15 | PoC writing + refine |
-| exploit (phase 2) | 20 | patch + verify + re-attack |
+| skeptic | 12 | read-only adversarial review |
 | chain | 8 | lightweight analysis |
+
+## Non-negotiables
+- No finding advances without passing its stage schema. If the output is malformed, send it back.
+- No finding is validated without a reachability trace showing REACHABLE.
+- A High/Critical finding is not validated until the skeptic stage runs — either the skeptic confirms it, or it's killed on DISPROVEN.
+- A finding is only `confirmed` with evidence + poc + impact + severity and a PoC that exited 0.
+- A patch isn't safe until a fresh tracer confirms the sink is no longer reachable.
+- Coverage must be tracked per class with entry-point lists. Only `INCOMPLETE` classes re-queue in gapfill; `NOT_FOUND` requires an empty UNCHECKED list.

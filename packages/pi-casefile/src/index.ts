@@ -1,7 +1,7 @@
 /**
  * Casefile — offensive security case tracker for Pi.
  *
- * Tools: CaseAdd, CaseUpdate, PromoteFinding, CaseGet, CaseList, CaseSearch, CaseLink, CaseUnlink, CaseReport
+ * Tools: CaseAdd, CaseUpdate, PromoteFinding, CaseGet, CaseList, CaseSearch, CaseLink, CaseUnlink, CaseReport, ScratchpadInit, ScratchpadResume, ScratchpadCheckpoint, ScratchpadWrite, ScratchpadRead, ScratchpadPhaseDone, ScratchpadClear
  * Command: /casefile — interactive dashboard
  * Event: before_agent_start — injects cyber workflow (+ active case list) once per user prompt
  */
@@ -46,6 +46,17 @@ import {
   writeCaseReport,
 } from "./ledger.ts";
 import { type PocRun, runPoc } from "./poc-runner.ts";
+import {
+  type ScratchpadPhase,
+  type ScratchpadResume,
+  scratchpad_checkpoint,
+  scratchpad_clear,
+  scratchpad_init,
+  scratchpad_phase_done,
+  scratchpad_read,
+  scratchpad_resume,
+  scratchpad_write,
+} from "./scratchpad.ts";
 import { STATIC_CYBER_WORKFLOW } from "./workflow.ts";
 
 // ── Schemas ───────────────────────────────────────────────────────────
@@ -212,6 +223,88 @@ const UnlinkSchema = Type.Object(
 const ReportSchema = Type.Object(
   {
     id: Type.String({ description: "Case ID to turn into a markdown report" }),
+  },
+  { additionalProperties: false },
+);
+
+// ── Tool: Scratchpad ─────────────────────────────────────────────────
+//
+// The scratchpad is the pipeline's crash-recoverable artifact store.
+// The casefile owns state transitions; the scratchpad owns artifacts
+// (recon maps, trace outputs, verification logs). Resume re-reads
+// artifacts; it does not re-run completed phases (idempotent).
+
+const SCRATCHPAD_PHASES = [
+  "recon",
+  "hunt",
+  "gapfil",
+  "trace",
+  "skeptic",
+  "validate",
+  "chain",
+  "patch",
+  "report",
+] as const;
+
+const ScratchpadPhaseSchema = Type.String({
+  enum: [...SCRATCHPAD_PHASES],
+  description: "Pipeline phase: recon | hunt | gapfil | trace | skeptic | validate | chain | patch | report",
+});
+
+const ScratchpadInitSchema = Type.Object(
+  {
+    run_id: Type.String({ description: "Unique run identifier for this pipeline run" }),
+  },
+  { additionalProperties: false },
+);
+
+const ScratchpadResumeSchema = Type.Object(
+  {
+    run_id: Type.String({ description: "Run identifier to resume" }),
+  },
+  { additionalProperties: false },
+);
+
+const ScratchpadCheckpointSchema = Type.Object(
+  {
+    run_id: Type.String({ description: "Run identifier" }),
+    phase: ScratchpadPhaseSchema,
+    ids: Type.Optional(Type.Array(Type.String(), { description: "Key IDs produced by this phase (case IDs, finding IDs)" })),
+    summary: Type.Optional(Type.String({ description: "One-line summary of phase completion" })),
+  },
+  { additionalProperties: false },
+);
+
+const ScratchpadWriteSchema = Type.Object(
+  {
+    run_id: Type.String({ description: "Run identifier" }),
+    phase: ScratchpadPhaseSchema,
+    artifact_name: Type.String({ description: "Artifact filename (sanitized; path traversal is blocked)" }),
+    content: Type.String({ description: "Artifact content to write" }),
+  },
+  { additionalProperties: false },
+);
+
+const ScratchpadReadSchema = Type.Object(
+  {
+    run_id: Type.String({ description: "Run identifier" }),
+    phase: ScratchpadPhaseSchema,
+    artifact_name: Type.String({ description: "Artifact filename to read" }),
+  },
+  { additionalProperties: false },
+);
+
+const ScratchpadPhaseDoneSchema = Type.Object(
+  {
+    run_id: Type.String({ description: "Run identifier" }),
+    phase: ScratchpadPhaseSchema,
+  },
+  { additionalProperties: false },
+);
+
+const ScratchpadClearSchema = Type.Object(
+  {
+    run_id: Type.String({ description: "Run identifier to clear (deletes that run only)" }),
   },
   { additionalProperties: false },
 );
@@ -1063,6 +1156,366 @@ export default function casefileExtension(pi: ExtensionAPI) {
         `Casefile XP mode: ${next.toUpperCase()} (takes effect on the next prompt)`,
         next === "on" ? "info" : "warning",
       );
+    },
+  });
+
+  // ── Tool: ScratchpadInit ──
+
+  pi.registerTool({
+    name: "ScratchpadInit",
+    label: "Init Scratchpad",
+    description:
+      "Initialize a crash-recoverable artifact store for a pipeline run. Creates the directory structure and an initial state.json checkpoint. Idempotent — safe to call on resume without --fresh; returns the existing checkpoint if the run already exists.",
+    promptSnippet: "Initialize the pipeline artifact store for a run",
+    promptGuidelines: [
+      "Call ScratchpadInit once at the start of a pipeline run (or on resume before ScratchpadResume).",
+      "The run_id is arbitrary but should be unique per pipeline run — typically <target>-<timestamp>.",
+      "On resume, ScratchpadInit returns the existing checkpoint without wiping it; pair with ScratchpadResume to skip completed phases.",
+    ],
+    parameters: ScratchpadInitSchema,
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const cp = scratchpad_init(params.run_id as string);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Scratchpad initialized for run ${cp.run_id}.\nCompleted phases: ${cp.completed_phases.length ? cp.completed_phases.join(", ") : "none"}\nDone: ${cp.done}`,
+          },
+        ],
+        details: { checkpoint: cp },
+      };
+    },
+
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("ScratchpadInit ")) +
+          theme.fg("dim", (args.run_id as string) ?? ""),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const cp = (result.details as { checkpoint: { run_id: string; done: boolean } } | undefined)?.checkpoint;
+      return new Text(
+        theme.fg("success", "✓ ") +
+          `ScratchpadInit ${cp?.run_id ?? ""}${cp?.done ? " (done)" : ""}`,
+        0,
+        0,
+      );
+    },
+  });
+
+  // ── Tool: ScratchpadResume ──
+
+  pi.registerTool({
+    name: "ScratchpadResume",
+    label: "Resume Scratchpad",
+    description:
+      "Read the checkpoint and artifact listing for a pipeline run to decide where to resume. Returns the next phase to run (or null if done) and which phases already completed. Returns null if the run does not exist.",
+    promptSnippet: "Check pipeline resume state — which phases are done",
+    promptGuidelines: [
+      "Call ScratchpadResume at pipeline start to determine where to resume. If it returns a checkpoint, skip completed phases (check ScratchpadPhaseDone before each dispatch) and continue from next_phase.",
+      "If ScratchpadResume returns null, the run has no checkpoint — call ScratchpadInit to start fresh.",
+      "Use ScratchpadPhaseDone before dispatching each stage to avoid re-running completed phases (idempotent resume).",
+    ],
+    parameters: ScratchpadResumeSchema,
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const resume = scratchpad_resume(params.run_id as string);
+      if (!resume) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `No scratchpad found for run ${params.run_id}. Call ScratchpadInit to start a new run.`,
+            },
+          ],
+          details: { resume: null },
+        };
+      }
+      const cp = resume.checkpoint;
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Resume run ${cp.run_id}:\n` +
+              `Completed phases: ${cp.completed_phases.length ? cp.completed_phases.join(", ") : "none"}\n` +
+              `Next phase: ${resume.next_phase ?? "none (run is done)"}\n` +
+              `Done: ${cp.done}`,
+          },
+        ],
+        details: { resume },
+      };
+    },
+
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("ScratchpadResume ")) +
+          theme.fg("dim", (args.run_id as string) ?? ""),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const resume = (result.details as { resume: ScratchpadResume | null } | undefined)?.resume;
+      if (!resume) return new Text(theme.fg("warning", "↷ ScratchpadResume — no run found"), 0, 0);
+      return new Text(
+        theme.fg("success", "✓ ") +
+          `ScratchpadResume ${resume.checkpoint.run_id} → next: ${resume.next_phase ?? "done"}`,
+        0,
+        0,
+      );
+    },
+  });
+
+  // ── Tool: ScratchpadCheckpoint ──
+
+  pi.registerTool({
+    name: "ScratchpadCheckpoint",
+    label: "Checkpoint Phase",
+    description:
+      "Mark a pipeline phase as complete in the scratchpad state.json. Records the completion timestamp, key IDs, and an optional summary. Idempotent — re-checkpointing a phase overwrites its summary/IDs without duplicating the completed_phases entry.",
+    promptSnippet: "Record a pipeline phase as complete",
+    promptGuidelines: [
+      "Call ScratchpadCheckpoint after every phase completes: ScratchpadCheckpoint(run_id, phase, { ids, summary }).",
+      "ids are the key case/finding IDs the phase produced — used by resume to reconstruct state.",
+      "Keep completed_phases in pipeline order; the checkpoint sorts automatically.",
+    ],
+    parameters: ScratchpadCheckpointSchema,
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const cp = scratchpad_checkpoint(
+        params.run_id as string,
+        params.phase as ScratchpadPhase,
+        { ids: params.ids as string[] | undefined, summary: params.summary as string | undefined },
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Phase ${params.phase} checkpointed for run ${cp.run_id}.\n` +
+              `Completed phases: ${cp.completed_phases.join(", ")}`,
+          },
+        ],
+        details: { checkpoint: cp },
+      };
+    },
+
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("ScratchpadCheckpoint ")) +
+          theme.fg("dim", `${args.run_id ?? ""} ${args.phase ?? ""}`),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const cp = (result.details as { checkpoint: { run_id: string; completed_phases: string[] } } | undefined)?.checkpoint;
+      return new Text(
+        theme.fg("success", "✓ ") +
+          `ScratchpadCheckpoint ${cp?.run_id ?? ""} — ${cp?.completed_phases.length ?? 0} phases done`,
+        0,
+        0,
+      );
+    },
+  });
+
+  // ── Tool: ScratchpadWrite ──
+
+  pi.registerTool({
+    name: "ScratchpadWrite",
+    label: "Write Artifact",
+    description:
+      "Write an intermediate artifact (recon map, trace output, verification log) to a phase's subdirectory in the scratchpad. Overwrites if the name exists. Artifact names are sanitized — path traversal is blocked.",
+    promptSnippet: "Save a pipeline artifact to the scratchpad",
+    promptGuidelines: [
+      "Agents write artifacts to the scratchpad, not to each other's output files (prevents an echo chamber).",
+      "The casefile owns state transitions; the scratchpad owns artifacts. Use ScratchpadWrite for bulky intermediate outputs, not CaseUpdate.",
+    ],
+    parameters: ScratchpadWriteSchema,
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const path = scratchpad_write(
+        params.run_id as string,
+        params.phase as ScratchpadPhase,
+        params.artifact_name as string,
+        params.content as string,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Artifact written: ${params.artifact_name} → ${path}`,
+          },
+        ],
+        details: { path, artifact_name: params.artifact_name },
+      };
+    },
+
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("ScratchpadWrite ")) +
+          theme.fg("dim", `${args.run_id ?? ""}/${args.phase ?? ""}/${args.artifact_name ?? ""}`),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const name = (result.details as { artifact_name?: string } | undefined)?.artifact_name;
+      return new Text(theme.fg("success", `✓ ScratchpadWrite ${name ?? ""}`), 0, 0);
+    },
+  });
+
+  // ── Tool: ScratchpadRead ──
+
+  pi.registerTool({
+    name: "ScratchpadRead",
+    label: "Read Artifact",
+    description:
+      "Read an artifact from a phase's subdirectory in the scratchpad. Returns null if the artifact is missing. Use to resume a phase from a prior run's intermediate output.",
+    promptSnippet: "Read a pipeline artifact from the scratchpad",
+    promptGuidelines: [
+      "On resume, ScratchpadRead retrieves a prior phase's intermediate output so the next phase can proceed without re-running it.",
+      "Returns null for missing artifacts — treat as 'not yet produced' rather than an error.",
+    ],
+    parameters: ScratchpadReadSchema,
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const content = scratchpad_read(
+        params.run_id as string,
+        params.phase as ScratchpadPhase,
+        params.artifact_name as string,
+      );
+      if (content === null) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Artifact not found: ${params.artifact_name} in ${params.phase}/`,
+            },
+          ],
+          details: { artifact_name: params.artifact_name, found: false },
+        };
+      }
+      return {
+        content: [{ type: "text", text: content }],
+        details: { artifact_name: params.artifact_name, found: true, length: content.length },
+      };
+    },
+
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("ScratchpadRead ")) +
+          theme.fg("dim", `${args.run_id ?? ""}/${args.phase ?? ""}/${args.artifact_name ?? ""}`),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const found = (result.details as { found?: boolean } | undefined)?.found;
+      return new Text(
+        found ? theme.fg("success", "✓ ScratchpadRead") : theme.fg("warning", "↷ ScratchpadRead — not found"),
+        0,
+        0,
+      );
+    },
+  });
+
+  // ── Tool: ScratchpadPhaseDone ──
+
+  pi.registerTool({
+    name: "ScratchpadPhaseDone",
+    label: "Phase Done?",
+    description:
+      "Check whether a phase has already been checkpointed in the scratchpad — for idempotent re-run. Returns true if the phase is complete; skip re-dispatching it on resume.",
+    promptSnippet: "Check if a pipeline phase is already complete",
+    promptGuidelines: [
+      "Call ScratchpadPhaseDone before dispatching each stage to avoid re-running completed phases on resume.",
+      "A completed phase with a checkpoint is a no-op on re-run — skip it and continue to the next incomplete phase.",
+    ],
+    parameters: ScratchpadPhaseDoneSchema,
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const done = scratchpad_phase_done(
+        params.run_id as string,
+        params.phase as ScratchpadPhase,
+      );
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Phase ${params.phase} for run ${params.run_id}: ${done ? "DONE (skip on resume)" : "not done"}`,
+          },
+        ],
+        details: { phase: params.phase, done },
+      };
+    },
+
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("ScratchpadPhaseDone ")) +
+          theme.fg("dim", `${args.run_id ?? ""} ${args.phase ?? ""}`),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const done = (result.details as { done?: boolean } | undefined)?.done;
+      return new Text(
+        done ? theme.fg("success", "✓ ScratchpadPhaseDone — done") : theme.fg("warning", "↷ ScratchpadPhaseDone — not done"),
+        0,
+        0,
+      );
+    },
+  });
+
+  // ── Tool: ScratchpadClear ──
+
+  pi.registerTool({
+    name: "ScratchpadClear",
+    label: "Clear Run",
+    description:
+      "Clear a single pipeline run's scratchpad directory. Used by --fresh for one run. Does not touch other runs. The run must be re-initialized with ScratchpadInit afterward.",
+    promptSnippet: "Clear one pipeline run's artifacts",
+    promptGuidelines: [
+      "Use ScratchpadClear to force a fresh start for a single run (--fresh). It deletes that run's directory only.",
+      "After clearing, call ScratchpadInit to recreate the directory structure before writing artifacts.",
+    ],
+    parameters: ScratchpadClearSchema,
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      scratchpad_clear(params.run_id as string);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Scratchpad cleared for run ${params.run_id}. Call ScratchpadInit to start a new run.`,
+          },
+        ],
+        details: { run_id: params.run_id, cleared: true },
+      };
+    },
+
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("ScratchpadClear ")) +
+          theme.fg("dim", (args.run_id as string) ?? ""),
+        0,
+        0,
+      );
+    },
+
+    renderResult(_result, _opts, theme) {
+      return new Text(theme.fg("success", "✓ ScratchpadClear"), 0, 0);
     },
   });
 

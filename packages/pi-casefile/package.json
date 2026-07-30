@@ -35,6 +35,7 @@
     "src/ledger.ts",
     "src/workflow.ts",
     "src/poc-runner.ts",
+    "src/scratchpad.ts",
     "src/sqlite-compat/index.ts",
     "skills",
     "README.md",

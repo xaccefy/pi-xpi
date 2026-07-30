@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Stage Skeptic",
+  "description": "Adversarial disconfirmation verdict from the skeptic subagent. Runs between TRACE and VALIDATE for severity >= high. The skeptic independently re-reads source code and tries to disprove the finding.",
+  "type": "object",
+  "required": ["finding_id", "verdict", "reasoning", "evidence_reviewed"],
+  "properties": {
+    "finding_id": {
+      "type": "string",
+      "description": "Case ID of the finding under review"
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["CONFIRMED", "DISPROVEN"],
+      "description": "CONFIRMED = skeptic agrees the finding is real and reachable. DISPROVEN = skeptic found it to be a false positive, overstated, or unreachable."
+    },
+    "reasoning": {
+      "type": "string",
+      "description": "The skeptic's independent reasoning. Must cite real code (file:line) the skeptic actually read, not the auditor's summary."
+    },
+    "evidence_reviewed": {
+      "type": "array",
+      "description": "Source files the skeptic independently opened and read to reach the verdict.",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "disconfirmation_attempt": {
+      "type": "string",
+      "description": "What the skeptic tried in order to disprove the finding (alternative paths, defenses, intended-behavior check, different attacker model). Required-strength: a concrete attempt, not 'could not disprove'."
+    },
+    "disproval_reason": {
+      "type": "string",
+      "enum": [
+        "unreachable",
+        "framework_protection",
+        "input_validation_blocks",
+        "requires_privilege_attacker_lacks",
+        "intended_behavior",
+        "overstated_impact",
+        "duplicate",
+        "test_artifact"
+      ],
+      "description": "Why the finding is disproven (required when verdict is DISPROVEN)"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "verdict": { "const": "DISPROVEN" } } },
+      "then": { "required": ["disproval_reason"] }
+    }
+  ]
+}
