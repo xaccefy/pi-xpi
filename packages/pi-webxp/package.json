@@ -1,6 +1,6 @@
 {
   "name": "@xaccefy/pi-webxp",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Web search, page fetch, library docs, repo Q&A, and exploit technique search for Pi Agent",
   "keywords": [
     "pi-package",
