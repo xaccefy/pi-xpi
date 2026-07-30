@@ -7,7 +7,6 @@
  */
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
@@ -121,6 +120,11 @@ const PromoteSchema = Type.Object(
     id: Type.String({ description: "Case ID to promote" }),
     poc_path: Type.String({
       description: "Absolute path to the PoC script on disk",
+    }),
+    verification_marker: Type.String({
+      minLength: 1,
+      description:
+        "A unique string the PoC must print to stdout to prove exploitation actually occurred. The gate checks the PoC output contains this marker — exit code 0 alone is NOT sufficient. The marker should be specific to the finding (e.g. 'VULN_CONFIRMED_<case-id>') and only printed after the PoC has verified the exploit worked (e.g. after extracting data, receiving a callback, seeing the payload reflected). This prevents fluke exit 0 and mocked PoCs from passing the gate.",
     }),
     disconfirmation_path: Type.Optional(
       Type.String({
@@ -248,7 +252,8 @@ const SCRATCHPAD_PHASES = [
 
 const ScratchpadPhaseSchema = Type.String({
   enum: [...SCRATCHPAD_PHASES],
-  description: "Pipeline phase: recon | hunt | gapfil | trace | skeptic | validate | chain | patch | report",
+  description:
+    "Pipeline phase: recon | hunt | gapfil | trace | skeptic | validate | chain | patch | report",
 });
 
 const ScratchpadInitSchema = Type.Object(
@@ -269,7 +274,11 @@ const ScratchpadCheckpointSchema = Type.Object(
   {
     run_id: Type.String({ description: "Run identifier" }),
     phase: ScratchpadPhaseSchema,
-    ids: Type.Optional(Type.Array(Type.String(), { description: "Key IDs produced by this phase (case IDs, finding IDs)" })),
+    ids: Type.Optional(
+      Type.Array(Type.String(), {
+        description: "Key IDs produced by this phase (case IDs, finding IDs)",
+      }),
+    ),
     summary: Type.Optional(Type.String({ description: "One-line summary of phase completion" })),
   },
   { additionalProperties: false },
@@ -279,7 +288,9 @@ const ScratchpadWriteSchema = Type.Object(
   {
     run_id: Type.String({ description: "Run identifier" }),
     phase: ScratchpadPhaseSchema,
-    artifact_name: Type.String({ description: "Artifact filename (sanitized; path traversal is blocked)" }),
+    artifact_name: Type.String({
+      description: "Artifact filename (sanitized; path traversal is blocked)",
+    }),
     content: Type.String({ description: "Artifact content to write" }),
   },
   { additionalProperties: false },
@@ -415,9 +426,7 @@ class CasefileDashboard {
 
     if (this.records.length === 0) {
       lines.push("");
-      lines.push(
-        `  ${th.fg("dim", "No active security cases. Ask the agent to CaseAdd findings!")}`,
-      );
+      lines.push(`  ${th.fg("dim", "No security cases yet. Ask the agent to CaseAdd findings!")}`);
     } else {
       lines.push("");
       for (const r of this.records) {
@@ -520,11 +529,7 @@ export const XP_MODE_ENV = "PI_XP_MODE";
 export type XpMode = "on" | "off";
 
 export function getXpModeStatePath(): string {
-  try {
-    return join(dirname(getCasefilePath()), "xp-mode");
-  } catch {
-    return join(homedir(), ".pi", "xp-mode");
-  }
+  return join(dirname(getCasefilePath()), "xp-mode");
 }
 
 export function readXpMode(
@@ -724,13 +729,14 @@ export default function casefileExtension(pi: ExtensionAPI) {
     name: "PromoteFinding",
     label: "Promote Finding",
     description:
-      "Run an on-disk PoC script (Docker sandbox or local) and, on exit 0, promote an investigating case to confirmed. Optionally run a disconfirmation script that must exit non-0 (finding survived the attempt to disprove).",
+      "Run an on-disk PoC script (Docker sandbox or local) and, on exit 0 + verification marker present in output, promote an investigating case to confirmed. The verification_marker proves the exploit actually worked — exit code 0 alone is NOT sufficient. Optionally run a disconfirmation script that must exit non-0 (finding survived the attempt to disprove).",
     promptSnippet: "Run a PoC and promote an investigating case to confirmed",
     promptGuidelines: [
       "Use PromoteFinding when an investigating case has a concrete PoC script on disk and you are ready to prove it.",
       "The case must already have status='investigating' and non-empty poc, evidence, impact, severity, target, and disconfirmation fields.",
       "By default, the PoC runs in `docker run --rm --network none`. Use local:true to run on the host (e.g. for network-dependent bugs).",
-      "Only exit code 0 promotes the case to confirmed.",
+      "Promotion requires BOTH exit code 0 AND the verification_marker appearing in the PoC output. The marker is a string you choose (e.g. 'VULN_CONFIRMED_<case-id>') that the PoC prints ONLY after it has verified the exploit worked — after extracting data, receiving a callback, seeing the payload reflected, etc. Do NOT print the marker unconditionally or before the exploit check.",
+      "The marker check prevents fluke exit 0 (script crashed before real logic) and mocked PoCs (script ran but didn't actually exploit the target) from passing the gate.",
       "Optionally provide disconfirmation_path to a script that tries to disprove the finding. If the disconfirmation script exits 0, the finding is considered disproven and promotion is blocked.",
       "Do not use CaseUpdate to set status='confirmed' directly — it is rejected. Always use PromoteFinding.",
     ],
@@ -741,6 +747,26 @@ export default function casefileExtension(pi: ExtensionAPI) {
       // 30s (plus first-time image pull), so fail cheap when the case can't
       // advance anyway (missing, wrong status, missing required fields).
       assertPromotable(params.id as string);
+
+      // Reject empty/whitespace markers BEFORE any PoC run — it's a param
+      // error, so fail cheap instead of burning a (up to 30s) sandboxed run.
+      const marker = (params.verification_marker as string | undefined)?.trim();
+      if (!marker) {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                "verification_marker is empty or whitespace. " +
+                "A non-empty marker printed only AFTER the PoC confirms exploitation is required — " +
+                "exit code 0 alone is not sufficient. Case remains investigating.",
+            },
+          ],
+          isError: true,
+          details: { record: getCaseById(params.id as string) },
+        };
+      }
+
       const run = runPoc(params.poc_path as string, params.local !== true);
 
       // Fail closed without throwing: non-zero PoC must leave the case investigating.
@@ -755,6 +781,28 @@ export default function casefileExtension(pi: ExtensionAPI) {
           ],
           isError: true,
           details: { record, run },
+        };
+      }
+
+      // Verification marker check: exit code 0 alone is NOT sufficient.
+      // The PoC must print the verification_marker to stdout, proving the
+      // exploit actually worked — not just that the script ran. This blocks
+      // fluke exit 0 (crash before real logic) and mocked PoCs that don't
+      // actually exploit the target.
+      if (!(run.output ?? "").includes(marker)) {
+        const record = getCaseById(params.id as string);
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `PoC exited 0 but the verification marker "${marker}" was NOT found in the output.\n` +
+                `This means the script ran but did not prove exploitation. The marker must be printed only AFTER the PoC verifies the exploit worked (data extracted, callback received, payload reflected, etc.).\n` +
+                `Do not print the marker unconditionally — print it only when the exploit is confirmed.\n\nOutput:\n${run.output}`,
+            },
+          ],
+          isError: true,
+          details: { record, run, markerMissing: true },
         };
       }
 
@@ -1105,7 +1153,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     name: "CaseReport",
     label: "Write Case Report",
     description:
-      "Generate a markdown report from a confirmed or reported case under the project report directory. Hypothesis/investigating/blocked/killed cases are rejected — promote to confirmed first.",
+      "Generate a markdown report from a confirmed or reported case under the casefile report directory (next to the casefile DB). Hypothesis/investigating/blocked/killed cases are rejected — promote to confirmed first.",
     promptSnippet: "Generate a bounty-style markdown report from a case",
     promptGuidelines: [
       "Use CaseReport only for confirmed or already reported cases. Keep hypotheses and investigating cases in the ledger until proof is captured.",
@@ -1180,7 +1228,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
         content: [
           {
             type: "text",
-            text: `Scratchpad initialized for run ${cp.run_id}.\nCompleted phases: ${cp.completed_phases.length ? cp.completed_phases.join(", ") : "none"}\nDone: ${cp.done}`,
+            text: `Scratchpad initialized for run ${cp.run_id}.\nCompleted phases: ${cp.completed_phases.length ? cp.completed_phases.join(", ") : "none"}`,
           },
         ],
         details: { checkpoint: cp },
@@ -1197,13 +1245,8 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderResult(result, _opts, theme) {
-      const cp = (result.details as { checkpoint: { run_id: string; done: boolean } } | undefined)?.checkpoint;
-      return new Text(
-        theme.fg("success", "✓ ") +
-          `ScratchpadInit ${cp?.run_id ?? ""}${cp?.done ? " (done)" : ""}`,
-        0,
-        0,
-      );
+      const cp = (result.details as { checkpoint: { run_id: string } } | undefined)?.checkpoint;
+      return new Text(`${theme.fg("success", "✓ ")}ScratchpadInit ${cp?.run_id ?? ""}`, 0, 0);
     },
   });
 
@@ -1243,8 +1286,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
             text:
               `Resume run ${cp.run_id}:\n` +
               `Completed phases: ${cp.completed_phases.length ? cp.completed_phases.join(", ") : "none"}\n` +
-              `Next phase: ${resume.next_phase ?? "none (run is done)"}\n` +
-              `Done: ${cp.done}`,
+              `Next phase: ${resume.next_phase ?? "none (run is done)"}`,
           },
         ],
         details: { resume },
@@ -1288,11 +1330,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
     parameters: ScratchpadCheckpointSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const cp = scratchpad_checkpoint(
-        params.run_id as string,
-        params.phase as ScratchpadPhase,
-        { ids: params.ids as string[] | undefined, summary: params.summary as string | undefined },
-      );
+      const cp = scratchpad_checkpoint(params.run_id as string, params.phase as ScratchpadPhase, {
+        ids: params.ids as string[] | undefined,
+        summary: params.summary as string | undefined,
+      });
       return {
         content: [
           {
@@ -1316,7 +1357,9 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderResult(result, _opts, theme) {
-      const cp = (result.details as { checkpoint: { run_id: string; completed_phases: string[] } } | undefined)?.checkpoint;
+      const cp = (
+        result.details as { checkpoint: { run_id: string; completed_phases: string[] } } | undefined
+      )?.checkpoint;
       return new Text(
         theme.fg("success", "✓ ") +
           `ScratchpadCheckpoint ${cp?.run_id ?? ""} — ${cp?.completed_phases.length ?? 0} phases done`,
@@ -1422,7 +1465,9 @@ export default function casefileExtension(pi: ExtensionAPI) {
     renderResult(result, _opts, theme) {
       const found = (result.details as { found?: boolean } | undefined)?.found;
       return new Text(
-        found ? theme.fg("success", "✓ ScratchpadRead") : theme.fg("warning", "↷ ScratchpadRead — not found"),
+        found
+          ? theme.fg("success", "✓ ScratchpadRead")
+          : theme.fg("warning", "↷ ScratchpadRead — not found"),
         0,
         0,
       );
@@ -1444,10 +1489,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     parameters: ScratchpadPhaseDoneSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const done = scratchpad_phase_done(
-        params.run_id as string,
-        params.phase as ScratchpadPhase,
-      );
+      const done = scratchpad_phase_done(params.run_id as string, params.phase as ScratchpadPhase);
       return {
         content: [
           {
@@ -1471,7 +1513,9 @@ export default function casefileExtension(pi: ExtensionAPI) {
     renderResult(result, _opts, theme) {
       const done = (result.details as { done?: boolean } | undefined)?.done;
       return new Text(
-        done ? theme.fg("success", "✓ ScratchpadPhaseDone — done") : theme.fg("warning", "↷ ScratchpadPhaseDone — not done"),
+        done
+          ? theme.fg("success", "✓ ScratchpadPhaseDone — done")
+          : theme.fg("warning", "↷ ScratchpadPhaseDone — not done"),
         0,
         0,
       );

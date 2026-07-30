@@ -8,16 +8,21 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 const bump = process.argv[2] || "patch";
-if (!["patch", "minor", "major"].includes(bump)) {
-  console.error(`Unknown bump type: ${bump} (expected patch|minor|major)`);
+if (!["patch", "minor", "major"].includes(bump) && !SEMVER_RE.test(bump)) {
   process.exit(1);
 }
 
 function nextVersion(v) {
+  if (SEMVER_RE.test(bump)) {
+    if (bump.localeCompare(v, undefined, { numeric: true, sensitivity: "base" }) <= 0) {
+      process.exit(1);
+    }
+    return bump;
+  }
   const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(v);
   if (!m) {
-    console.error(`Cannot parse version: ${v}`);
     process.exit(1);
   }
   let [maj, min, pat] = [Number(m[1]), Number(m[2]), Number(m[3])];
@@ -52,10 +57,6 @@ if (existsSync(pkgsDir)) {
       const pkg = JSON.parse(readFileSync(pkgPath, "utf8"));
       pkg.version = next;
       writeFileSync(pkgPath, FORMAT(pkg));
-    } catch (e) {
-      console.error(`Skipping ${pkgPath}: ${e.message}`);
-    }
+    } catch (_e) {}
   }
 }
-
-console.log(`Bumped all packages to ${next} (${bump})`);

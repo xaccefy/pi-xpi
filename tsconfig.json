@@ -10,6 +10,8 @@
     "types": ["bun"]
   },
   "include": [
+    "packages/pi-casefile/src/**/*.ts",
+    "packages/pi-casefile/test/**/*.ts",
     "packages/pi-shared/src/**/*.ts",
     "packages/pi-webxp/src/**/*.ts",
     "packages/pi-webxp/test/**/*.ts",

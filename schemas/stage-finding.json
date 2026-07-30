@@ -3,7 +3,11 @@
   "title": "Stage Finding",
   "description": "A vulnerability finding produced by the auditor/hunter stage. Must pass validation before advancing to exploit.",
   "type": "object",
-  "required": ["vuln_class", "file", "line", "sink", "entry_point", "confidence", "evidence"],
+  "required": ["vuln_class", "sink", "entry_point", "confidence", "evidence"],
+  "anyOf": [
+    { "required": ["file", "line"], "description": "Source/white-box target locator" },
+    { "required": ["endpoint"], "description": "Live black-box target locator" }
+  ],
   "properties": {
     "vuln_class": {
       "type": "string",
@@ -29,8 +33,19 @@
         "other"
       ]
     },
-    "file": { "type": "string", "description": "Source file path relative to repo root" },
-    "line": { "type": "integer", "description": "Line number of the sink", "minimum": 1 },
+    "file": {
+      "type": "string",
+      "description": "Source file path relative to repo root. REQUIRED for source/white-box targets; omit for live black-box targets (use endpoint instead)."
+    },
+    "line": {
+      "type": "integer",
+      "description": "Line number of the sink. REQUIRED with file for source targets; omit for live targets.",
+      "minimum": 1
+    },
+    "endpoint": {
+      "type": "string",
+      "description": "Live target locator: method + path + parameter (e.g. 'GET /api/users?id='). REQUIRED for live black-box targets where file/line are unavailable."
+    },
     "sink": { "type": "string", "description": "The dangerous function or operation" },
     "entry_point": {
       "type": "string",

@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,11 +10,8 @@ import {
   getScratchpadRoot,
   scratchpad_checkpoint,
   scratchpad_clear,
-  scratchpad_clear_all,
-  scratchpad_finish,
   scratchpad_init,
   scratchpad_list,
-  scratchpad_list_runs,
   scratchpad_phase_done,
   scratchpad_read,
   scratchpad_resume,
@@ -38,7 +35,6 @@ describe("scratchpad", () => {
   it("init creates the directory structure and state.json", () => {
     const cp = scratchpad_init("run-1");
     assert.strictEqual(cp.run_id, "run-1");
-    assert.strictEqual(cp.done, false);
     assert.deepStrictEqual(cp.completed_phases, []);
 
     const runDir = getRunDir("run-1", tempDir);
@@ -80,6 +76,30 @@ describe("scratchpad", () => {
     assert.ok(path.startsWith(reconDir), `path ${path} escaped recon dir`);
     // Verify the content was actually written to the sanitized path.
     assert.strictEqual(scratchpad_read("run-1", "recon", "../../etc/passwd"), "evil");
+  });
+
+  it("run_id cannot traverse out of the scratchpad root (clear/write)", () => {
+    // Regression: sanitizeRunId — ScratchpadClear("..") previously deleted the
+    // project root; "../../x" wrote outside .scratchpad.
+    scratchpad_init("run-1");
+    assert.throws(() => scratchpad_clear(".."), /Invalid run_id/); // dot-only: rejected
+    assert.ok(
+      existsSync(join(tempDir, ".scratchpad", "run-1")),
+      "../ clear must not touch the run dir",
+    );
+
+    const path = scratchpad_write("../../evil", "recon", "x.json", "payload");
+    assert.ok(path.startsWith(tempDir), `write with traversal run_id escaped scratchpad: ${path}`);
+    assert.ok(!existsSync(join(tempDir, "..", "evil")), "no dir created outside root");
+  });
+
+  it("rejects run_ids that sanitize to dot-only", () => {
+    for (const id of [".", "..", "..."]) {
+      assert.throws(() => scratchpad_init(id), /Invalid run_id/);
+    }
+    // But separators elsewhere sanitize into a normal safe dir name.
+    scratchpad_init("https://target.example.com/api");
+    assert.ok(existsSync(join(tempDir, ".scratchpad", "https___target.example.com_api")));
   });
 
   it("list returns artifacts for a phase", () => {
@@ -167,32 +187,12 @@ describe("scratchpad", () => {
     assert.strictEqual(resume.next_phase, null);
   });
 
-  it("finish marks the run as done", () => {
-    scratchpad_init("run-1");
-    const cp = scratchpad_finish("run-1");
-    assert.strictEqual(cp.done, true);
-  });
-
   it("clear removes a single run without touching others", () => {
     scratchpad_init("run-1");
     scratchpad_init("run-2");
     scratchpad_clear("run-1");
-    const runs = scratchpad_list_runs();
+    const runs = readdirSync(getScratchpadRoot(tempDir));
     assert.deepStrictEqual(runs, ["run-2"]);
-  });
-
-  it("clear_all removes every run", () => {
-    scratchpad_init("run-1");
-    scratchpad_init("run-2");
-    scratchpad_clear_all();
-    assert.deepStrictEqual(scratchpad_list_runs(), []);
-    assert.ok(!existsSync(getScratchpadRoot(tempDir)));
-  });
-
-  it("list_runs returns all run directories sorted", () => {
-    scratchpad_init("run-b");
-    scratchpad_init("run-a");
-    assert.deepStrictEqual(scratchpad_list_runs(), ["run-a", "run-b"]);
   });
 
   it("state.json is valid JSON with the expected shape", () => {
@@ -202,6 +202,5 @@ describe("scratchpad", () => {
     const parsed = JSON.parse(raw);
     assert.strictEqual(parsed.run_id, "run-1");
     assert.ok(Array.isArray(parsed.completed_phases));
-    assert.strictEqual(parsed.done, false);
   });
 });

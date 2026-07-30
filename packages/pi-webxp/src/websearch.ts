@@ -6,7 +6,7 @@
  * - Tool: web_fetch — retrieve clean page markdown or article content.
  */
 
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -31,6 +31,7 @@ const STARTUP_RETRIES = 15;
 const REQUEST_TIMEOUT_MS = 30000;
 
 let daemonProcess: ChildProcess | null = null;
+let daemonSpawnError: Error | null = null;
 let startupPromise: Promise<boolean> | null = null;
 
 // Domain mapping for fetch endpoints
@@ -58,6 +59,27 @@ async function checkDaemonRunning(): Promise<boolean> {
   return false;
 }
 
+let resolvedDaemonBin: string | null = null;
+
+/**
+ * Pick the binary that runs the open-websearch daemon. open-websearch targets
+ * Node; when pi runs under Bun, process.execPath is the bun binary, which may
+ * not run a Node-oriented package. Prefer a real node binary: execPath when it
+ * IS node, else a PATH lookup (probed once with --version), else execPath as a
+ * last resort — the error handling in startDaemon surfaces the failure cleanly.
+ */
+function getDaemonBin(): string {
+  if (resolvedDaemonBin) return resolvedDaemonBin;
+  const execName = process.execPath.split(/[\\/]/).pop() ?? "";
+  if (execName.startsWith("node")) {
+    resolvedDaemonBin = process.execPath;
+  } else {
+    const probe = spawnSync("node", ["--version"], { stdio: "ignore" });
+    resolvedDaemonBin = probe.status === 0 ? "node" : process.execPath;
+  }
+  return resolvedDaemonBin;
+}
+
 function startDaemon(): void {
   if (shuttingDown) return;
   const scriptPath = getDaemonScriptPath();
@@ -67,7 +89,8 @@ function startDaemon(): void {
     );
   }
 
-  daemonProcess = spawn("node", [scriptPath, "serve", "--port", DAEMON_PORT], {
+  daemonSpawnError = null;
+  daemonProcess = spawn(getDaemonBin(), [scriptPath, "serve", "--port", DAEMON_PORT], {
     stdio: "ignore",
     env: { ...process.env, PORT: DAEMON_PORT },
     windowsHide: true,
@@ -75,6 +98,13 @@ function startDaemon(): void {
   });
   // Don't pin the event loop solely because the child is alive.
   daemonProcess.unref?.();
+
+  // Without this, a spawn failure (e.g. missing binary) throws an unhandled
+  // 'error' event and can take the whole host process down.
+  daemonProcess.on("error", (err) => {
+    daemonSpawnError = err;
+    daemonProcess = null;
+  });
 
   daemonProcess.on("exit", () => {
     daemonProcess = null;
@@ -93,9 +123,13 @@ async function ensureDaemonRunning(): Promise<boolean> {
     // have flipped shuttingDown while we were awaiting. Don't spawn a daemon
     // the shutdown just killed.
     if (shuttingDown) return false;
+    // startDaemon resets daemonSpawnError, so a call after a failed spawn
+    // retries cleanly; the error only blocks when the fresh spawn also failed.
     if (!daemonProcess) startDaemon();
+    if (daemonSpawnError) return false;
     for (let i = 0; i < STARTUP_RETRIES; i++) {
       if (shuttingDown) return false;
+      if (daemonSpawnError) return false;
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
       if (await checkDaemonRunning()) return true;
     }
@@ -420,7 +454,11 @@ export default function websearchExtension(pi: ExtensionAPI) {
       try {
         const running = await ensureDaemonRunning();
         if (!running) {
-          throw new Error("Unable to establish connection with local open-websearch daemon.");
+          throw new Error(
+            daemonSpawnError
+              ? `Unable to start open-websearch daemon: ${daemonSpawnError.message}`
+              : "Unable to establish connection with local open-websearch daemon.",
+          );
         }
 
         const res = await fetchWithRetry(
@@ -513,7 +551,11 @@ export default function websearchExtension(pi: ExtensionAPI) {
       try {
         const running = await ensureDaemonRunning();
         if (!running) {
-          throw new Error("Unable to establish connection with local open-websearch daemon.");
+          throw new Error(
+            daemonSpawnError
+              ? `Unable to start open-websearch daemon: ${daemonSpawnError.message}`
+              : "Unable to establish connection with local open-websearch daemon.",
+          );
         }
 
         if (!params.url) {

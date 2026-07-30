@@ -1,17 +1,13 @@
 #!/usr/bin/env node
 
 import { execSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync } from "node:fs";
 
 const RELEASE_TARGET = process.argv[2];
 const BUMP_TYPES = new Set(["major", "minor", "patch"]);
 const SEMVER_RE = /^\d+\.\d+\.\d+$/;
 
 if (!RELEASE_TARGET || (!BUMP_TYPES.has(RELEASE_TARGET) && !SEMVER_RE.test(RELEASE_TARGET))) {
-  console.error(
-    `error: invalid release target "${RELEASE_TARGET ?? ""}" — expected major|minor|patch or an x.y.z version`,
-  );
   process.exit(1);
 }
 
@@ -25,7 +21,6 @@ function run(cmd, options = {}) {
     });
   } catch (_e) {
     if (!options.ignoreError) {
-      console.error(`error: command failed: ${cmd}`);
       process.exit(1);
     }
     return null;
@@ -63,63 +58,15 @@ function commitIfStaged(message) {
   }
 }
 
+// Delegate the actual version writes to bump-version.js — one implementation,
+// no drift. It handles patch|minor|major and explicit x.y.z targets.
 function bumpOrSetVersion(target) {
-  const currentVersion = getVersion();
-  let newVersion;
-
-  if (BUMP_TYPES.has(target)) {
-    const parts = currentVersion.split(".").map(Number);
-    if (target === "major") {
-      parts[0] += 1;
-      parts[1] = 0;
-      parts[2] = 0;
-    } else if (target === "minor") {
-      parts[1] += 1;
-      parts[2] = 0;
-    } else if (target === "patch") {
-      parts[2] += 1;
-    }
-    newVersion = parts.join(".");
-  } else {
-    if (
-      target.localeCompare(currentVersion, undefined, { numeric: true, sensitivity: "base" }) <= 0
-    ) {
-      console.error(
-        `error: target version ${target} is not greater than current ${currentVersion}`,
-      );
-      process.exit(1);
-    }
-    newVersion = target;
-  }
-
-  const packagesDir = "packages";
-  const packages = readdirSync(packagesDir).filter((name) => {
-    try {
-      return statSync(join(packagesDir, name)).isDirectory();
-    } catch {
-      return false;
-    }
-  });
-
-  const targetPaths = [
-    "package.json",
-    ...packages.map((pkg) => join(packagesDir, pkg, "package.json")),
-  ];
-
-  for (const pkgPath of targetPaths) {
-    if (existsSync(pkgPath)) {
-      const data = JSON.parse(readFileSync(pkgPath, "utf-8"));
-      data.version = newVersion;
-      writeFileSync(pkgPath, `${JSON.stringify(data, null, 2)}\n`);
-    }
-  }
-
-  return newVersion;
+  run(`node scripts/bump-version.js ${target}`);
+  return getVersion();
 }
 
 const status = run("git status --porcelain", { silent: true });
 if (status?.trim()) {
-  console.error("error: working tree is dirty — commit or stash changes before releasing");
   process.exit(1);
 }
 run("npm test");

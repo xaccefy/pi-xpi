@@ -365,6 +365,32 @@ describe("pi-xtodo", () => {
     assert.ok(list.content[0].text.includes("[in_progress] #1 Live"));
   });
 
+  it("compact with a stale branch snapshot does not clobber newer memory state", async () => {
+    // Regression: replay used to overwrite memory with an older branch snapshot.
+    const t = pi.tools[0];
+    sessionManager.sessionId = "compact-stale-session";
+    const c1 = await t.execute("1", { action: "create", subject: "A" }, null, null, mockCtx);
+    ok(c1, "create A");
+    const c2 = await t.execute("2", { action: "create", subject: "B" }, null, null, mockCtx);
+    ok(c2, "create B");
+
+    // Branch only contains the STALE one-task snapshot (compaction dropped the newer one).
+    sessionManager.branch = [
+      { type: "message", message: { role: "toolResult", toolName: "todo", details: c1.details } },
+    ];
+    await pi.emit("session_compact", {}, mockCtx);
+
+    const c3 = await t.execute("3", { action: "create", subject: "C" }, null, null, mockCtx);
+    ok(c3, "create C after compact");
+    assert.ok(
+      c3.content[0].text.includes("#3"),
+      "id continues from memory (#3), not stale replay (#2)",
+    );
+    const list = await t.execute("4", { action: "list" }, null, null, mockCtx);
+    ok(list, "list after compact");
+    assert.ok(list.content[0].text.includes("#2 B"), "B survived compaction");
+  });
+
   it("rejects non-integer ids", async () => {
     const t = pi.tools[0];
     await t.execute("1", { action: "create", subject: "T" }, null, null, mockCtx);

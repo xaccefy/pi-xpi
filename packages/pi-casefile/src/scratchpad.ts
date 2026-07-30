@@ -47,8 +47,6 @@ export interface ScratchpadCheckpoint {
   phase_ids: Record<ScratchpadPhase, string[]>;
   /** Free-form summary per phase, set by checkpoint(). */
   phase_summaries: Record<ScratchpadPhase, string>;
-  /** Whether the run is fully complete. */
-  done: boolean;
 }
 
 export interface ScratchpadResume {
@@ -98,7 +96,9 @@ let scratchpadRootOverride: string | undefined;
 function detectWorkspaceRoot(): string {
   if (scratchpadRootOverride) return scratchpadRootOverride;
 
-  const envs = ["XPI_SCRATCHPAD_ROOT", "PI_WORKSPACE_ROOT", "GITHUB_WORKSPACE", "PWD"];
+  // PWD is deliberately excluded (shell-set, can be stale/forged); explicit
+  // overrides only, then walk up from the real cwd.
+  const envs = ["XPI_SCRATCHPAD_ROOT", "PI_WORKSPACE_ROOT", "GITHUB_WORKSPACE"];
   for (const e of envs) {
     const v = process.env[e];
     if (v) return resolve(v);
@@ -125,9 +125,24 @@ export function getScratchpadRoot(projectRoot?: string): string {
   return join(root, SCRATCHPAD_DIR);
 }
 
+/**
+ * Sanitize a run_id into a single safe directory name. Unlike artifact names,
+ * run_ids arrive from the agent and were never sanitized — `..`/`/` would let
+ * join() escape .scratchpad, turning ScratchpadClear("..") into a recursive
+ * delete of the project root. Same allowlist as artifact names, plus rejection
+ * of dot-only results (.", "..", or a sanitized empty string).
+ */
+function sanitizeRunId(runId: string): string {
+  const safe = runId.replace(/[^a-zA-Z0-9._-]/g, "_");
+  if (!safe || /^\.*$/.test(safe)) {
+    throw new Error(`Invalid run_id: "${runId}" — nothing left after sanitization`);
+  }
+  return safe;
+}
+
 /** The directory for a specific run. */
 export function getRunDir(runId: string, projectRoot?: string): string {
-  return join(getScratchpadRoot(projectRoot), runId);
+  return join(getScratchpadRoot(projectRoot), sanitizeRunId(runId));
 }
 
 /** The state.json path for a run. */
@@ -146,7 +161,6 @@ function emptyCheckpoint(runId: string, projectRoot: string): ScratchpadCheckpoi
     completed_phases: [],
     phase_ids: {} as Record<ScratchpadPhase, string[]>,
     phase_summaries: {} as Record<ScratchpadPhase, string>,
-    done: false,
   };
 }
 
@@ -322,38 +336,4 @@ export function scratchpad_clear(runId: string, projectRoot?: string): void {
   const root = projectRoot ?? detectWorkspaceRoot();
   const runDir = getRunDir(runId, root);
   if (existsSync(runDir)) rmSync(runDir, { recursive: true, force: true });
-}
-
-/**
- * Clear the entire scratchpad directory (all runs). Used by `--fresh` with no
- * run ID. Use with care.
- */
-export function scratchpad_clear_all(projectRoot?: string): void {
-  const root = projectRoot ?? detectWorkspaceRoot();
-  const dir = getScratchpadRoot(root);
-  if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
-}
-
-/**
- * List all run IDs in the scratchpad (for resume selection).
- */
-export function scratchpad_list_runs(projectRoot?: string): string[] {
-  const root = projectRoot ?? detectWorkspaceRoot();
-  const dir = getScratchpadRoot(root);
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir, { withFileTypes: true })
-    .filter((e) => e.isDirectory())
-    .map((e) => e.name)
-    .sort();
-}
-
-/**
- * Mark the run as fully done. Prevents resume from re-entering.
- */
-export function scratchpad_finish(runId: string, projectRoot?: string): ScratchpadCheckpoint {
-  const root = projectRoot ?? detectWorkspaceRoot();
-  const cp = readCheckpointRaw(runId, root) ?? scratchpad_init(runId, root);
-  cp.done = true;
-  writeCheckpointRaw(cp, root);
-  return cp;
 }

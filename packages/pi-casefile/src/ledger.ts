@@ -12,7 +12,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "./sqlite-compat/index.ts";
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -226,8 +226,14 @@ function stableShortId(input: string): string {
 }
 
 function detectWorkspaceRoot(): string {
-  const envs = ["CASEFILE_WORKSPACE_ROOT", "PI_WORKSPACE_ROOT", "GITHUB_WORKSPACE", "PWD"];
-  for (const e of envs) if (process.env[e]) return resolve(process.env[e]!);
+  // PWD is deliberately excluded: it is shell-set, can be stale or forged in
+  // spawned processes, and disagree with the real cwd. Explicit overrides only,
+  // then walk up from the actual cwd.
+  const envs = ["CASEFILE_WORKSPACE_ROOT", "PI_WORKSPACE_ROOT", "GITHUB_WORKSPACE"];
+  for (const e of envs) {
+    const v = process.env[e]?.trim();
+    if (v) return resolve(v);
+  }
 
   let curr = resolve(process.cwd());
   for (let i = 0; i < 20; i++) {
@@ -241,7 +247,10 @@ function detectWorkspaceRoot(): string {
 
 export function getCasefilePath(): string {
   if (ledgerPathOverride) return ledgerPathOverride;
-  if (process.env.PI_CASEFILE_PATH) return resolve(process.env.PI_CASEFILE_PATH.trim());
+  // Trim BEFORE the truthiness check: a whitespace-only value must not
+  // "pass" and resolve to the process cwd ("" resolves to cwd).
+  const envPath = process.env.PI_CASEFILE_PATH?.trim();
+  if (envPath) return resolve(envPath);
   return join(detectWorkspaceRoot(), ".pi", "casefile.db");
 }
 
@@ -622,19 +631,17 @@ function findDuplicateCaseInDb(
   const endpoint = normalizeMatchText(candidate.endpoint);
   const bugClass = normalizeMatchText(candidate.bugClass);
 
-  // Pre-filter by normalized title in SQL so we don't load the whole ledger into
-  // JS just to find a duplicate. normalizeMatchText lowercases + collapses
-  // whitespace, so we match against lower(title) with the same normalization.
-  // The full title/target/endpoint/bugClass match still runs in JS below to catch
-  // whitespace/case differences the SQL LIKE can't express exactly.
-  const sqlTitle = `%${title}%`;
+  // No SQL pre-filter: candidate rows are compared in JS against
+  // normalizeMatchText (lowercase + whitespace-collapse). SQLite's lower() is
+  // ASCII-only and LIKE can't collapse whitespace, so any SQL pre-filter would
+  // silently drop rows the JS comparator would call duplicates (e.g. stored
+  // "SQL  Injection" vs candidate "SQL Injection", or non-ASCII case variants).
+  // Case ledgers are small (hundreds of rows); a full non-killed scan is cheap.
   const rows = excludeId
     ? (db
-        .prepare("SELECT * FROM cases WHERE status != 'killed' AND id != ? AND lower(title) LIKE ?")
-        .all(excludeId, sqlTitle) as any[])
-    : (db
-        .prepare("SELECT * FROM cases WHERE status != 'killed' AND lower(title) LIKE ?")
-        .all(sqlTitle) as any[]);
+        .prepare("SELECT * FROM cases WHERE status != 'killed' AND id != ?")
+        .all(excludeId) as any[])
+    : (db.prepare("SELECT * FROM cases WHERE status != 'killed'").all() as any[]);
 
   for (const row of rows) {
     if (
@@ -922,7 +929,7 @@ export function promoteFindingResult(
   }
 
   const newEvidence =
-    (current.evidence ? current.evidence + "\n\n" : "") +
+    (current.evidence ? `${current.evidence}\n\n` : "") +
     `### PoC Execution Capture (${verification.ranAt})\n` +
     `- **Exit Code:** ${verification.exitCode}\n` +
     `- **Sandbox:** ${verification.sandbox ? "yes" : "no"}\n` +
@@ -1171,7 +1178,7 @@ function mapRowsWithLinks(db: DatabaseSync, rows: any[]): CaseRecord[] {
   const linkMap = new Map<string, { id: string; kind: string }[]>();
   for (const l of links) {
     if (!linkMap.has(l.source_id)) linkMap.set(l.source_id, []);
-    linkMap.get(l.source_id)!.push({ id: l.target_id, kind: l.kind });
+    linkMap.get(l.source_id)?.push({ id: l.target_id, kind: l.kind });
   }
   return rows.map((row) => mapRow(row, linkMap.get(row.id) ?? []));
 }
@@ -1323,14 +1330,14 @@ export function writeCaseReport(id: string): { path: string; record: CaseRecord 
     current.pocVerified
       ? mdSection(
           "PoC Verification Log",
-          `### PoC Run Verification\n- **Timestamp:** ${current.pocVerified.ranAt}\n- **Path:** \`${current.pocVerified.path}\`\n- **Sandbox:** ${current.pocVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.pocVerified.exitCode}\n\n#### Output\n\`\`\`\n${current.pocVerified.output ?? ""}\n\`\`\``,
+          `### PoC Run Verification\n- **Timestamp:** ${current.pocVerified.ranAt}\n- **Script:** \`${basename(current.pocVerified.path)}\`\n- **Sandbox:** ${current.pocVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.pocVerified.exitCode}\n\n#### Output\n\`\`\`\n${current.pocVerified.output ?? ""}\n\`\`\``,
         )
       : undefined,
     mdSection("Disconfirmation Attempt", current.disconfirmation),
     current.disconfirmationVerified
       ? mdSection(
           "Disconfirmation Verification Log",
-          `### Disconfirmation Run Verification\n- **Timestamp:** ${current.disconfirmationVerified.ranAt}\n- **Path:** \`${current.disconfirmationVerified.path}\`\n- **Sandbox:** ${current.disconfirmationVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.disconfirmationVerified.exitCode} (non-zero = finding survived the attempt to disprove)\n\n#### Output\n\`\`\`\n${current.disconfirmationVerified.output ?? ""}\n\`\`\``,
+          `### Disconfirmation Run Verification\n- **Timestamp:** ${current.disconfirmationVerified.ranAt}\n- **Script:** \`${basename(current.disconfirmationVerified.path)}\`\n- **Sandbox:** ${current.disconfirmationVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.disconfirmationVerified.exitCode} (non-zero = finding survived the attempt to disprove)\n\n#### Output\n\`\`\`\n${current.disconfirmationVerified.output ?? ""}\n\`\`\``,
         )
       : undefined,
     mdSection("Impact", current.impact),

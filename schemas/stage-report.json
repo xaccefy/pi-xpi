@@ -23,11 +23,19 @@
       "description": "All findings that survived validation",
       "items": {
         "type": "object",
-        "required": ["id", "vuln_class", "file", "severity", "status"],
+        "required": ["id", "vuln_class", "severity", "status"],
+        "anyOf": [{ "required": ["file"] }, { "required": ["endpoint"] }],
         "properties": {
           "id": { "type": "string", "description": "Case ID" },
           "vuln_class": { "type": "string", "description": "Vulnerability classification" },
-          "file": { "type": "string", "description": "Affected source file" },
+          "file": {
+            "type": "string",
+            "description": "Affected source file (source targets; use endpoint for live targets)"
+          },
+          "endpoint": {
+            "type": "string",
+            "description": "Affected endpoint, method + path + parameter (live targets; use file for source targets)"
+          },
           "severity": { "type": "string", "enum": ["info", "low", "medium", "high", "critical"] },
           "status": { "type": "string", "enum": ["confirmed", "reported"] },
           "poc_path": { "type": "string", "description": "Path to PoC script" },
@@ -69,7 +77,7 @@
       "patternProperties": {
         "^[a-z-]+$": {
           "type": "string",
-          "enum": ["COVERED", "SKIPPED", "NOT_FOUND"]
+          "enum": ["COVERED", "SKIPPED", "NOT_FOUND", "INCOMPLETE"]
         }
       }
     },
@@ -87,7 +95,7 @@
           "diff_summary": { "type": "string" },
           "re_attack_result": {
             "type": "string",
-            "description": "Result of fresh auditor verifying the fix"
+            "description": "Result of fresh tracer re-attack verifying the fix (must be UNREACHABLE)"
           }
         }
       }

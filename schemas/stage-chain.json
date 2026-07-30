@@ -27,7 +27,7 @@
             "minItems": 2,
             "description": "Case IDs in exploit order"
           },
-          "blocked_by": {
+          "blocked_by_controls": {
             "type": "array",
             "items": { "type": "string" },
             "description": "Production controls that would block this chain (empty if realistically exploitable)"

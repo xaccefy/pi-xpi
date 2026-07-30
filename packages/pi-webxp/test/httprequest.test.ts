@@ -12,7 +12,7 @@ describe("pi-webxp: http_request", () => {
     api = new MockExtensionAPI();
     piWebxp(api as any);
 
-    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    globalThis.fetch = (async (url: string | URL | Request, _init?: RequestInit) => {
       const urlStr = url.toString();
 
       if (urlStr.includes("/login")) {
@@ -411,5 +411,111 @@ describe("pi-webxp: http_request", () => {
     const text = (result as any).content[0].text;
     assert.ok(text.includes("application/json"), "Content-Type set to application/json");
     assert.ok(text.includes('"key":"value"'), "JSON body stringified");
+  });
+
+  // ── case-variant header handling ────────────────────────
+
+  it("merges jar cookies into a caller's capitalized Cookie header (no duplicate key)", async () => {
+    const tool = api.tools.find((t) => t.name === "http_request")!;
+    // Seed the jar.
+    await tool.execute("call-1", { url: "https://example.com/login" }, null, () => {}, {});
+
+    let sentHeaders: Record<string, string> = {};
+    const prevFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      sentHeaders = (init?.headers || {}) as Record<string, string>;
+      return prevFetch(_url as string, init);
+    }) as typeof fetch;
+
+    const result = await tool.execute(
+      "call-2",
+      {
+        url: "https://example.com/protected",
+        headers: { Cookie: "user_pref=dark" }, // capitalized variant
+      },
+      null,
+      () => {},
+      {},
+    );
+    globalThis.fetch = prevFetch;
+
+    assert.ok(!(result as any).isError, "request succeeded");
+    // Exactly one cookie header key, whatever its case.
+    const cookieKeys = Object.keys(sentHeaders).filter((k) => k.toLowerCase() === "cookie");
+    assert.strictEqual(
+      cookieKeys.length,
+      1,
+      `one cookie header, got keys: ${Object.keys(sentHeaders)}`,
+    );
+    const value = sentHeaders[cookieKeys[0]];
+    assert.ok(value.includes("session=abc123"), "jar cookie merged in");
+    assert.ok(value.includes("user_pref=dark"), "caller cookie preserved");
+  });
+
+  it("does not add a second content-type key when caller passed capitalized Content-Type", async () => {
+    const tool = api.tools.find((t) => t.name === "http_request")!;
+
+    let sentHeaders: Record<string, string> = {};
+    const prevFetch = globalThis.fetch;
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+      sentHeaders = (init?.headers || {}) as Record<string, string>;
+      return prevFetch(_url as string, init);
+    }) as typeof fetch;
+
+    await tool.execute(
+      "call-1",
+      {
+        url: "https://example.com/api",
+        method: "POST",
+        json: { a: 1 },
+        headers: { "Content-Type": "application/vnd.api+json" },
+      },
+      null,
+      () => {},
+      {},
+    );
+    globalThis.fetch = prevFetch;
+
+    const ctKeys = Object.keys(sentHeaders).filter((k) => k.toLowerCase() === "content-type");
+    assert.strictEqual(
+      ctKeys.length,
+      1,
+      `one content-type header, got keys: ${Object.keys(sentHeaders)}`,
+    );
+    assert.strictEqual(sentHeaders[ctKeys[0]], "application/vnd.api+json", "caller's value wins");
+  });
+
+  // ── TLS bypass ──────────────────────────────────────────
+
+  it("verifyTls=false does not silently re-verify (Bun: tls option set; Node w/o undici: loud error)", async () => {
+    const tool = api.tools.find((t) => t.name === "http_request")!;
+    const isBun = typeof (globalThis as any).Bun !== "undefined";
+
+    let sentInit: (RequestInit & { tls?: unknown; dispatcher?: unknown }) | undefined;
+    const prevFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      sentInit = init;
+      return prevFetch(url as string, init);
+    }) as typeof fetch;
+
+    const result = await tool.execute(
+      "call-1",
+      { url: "https://example.com/api", verifyTls: false },
+      null,
+      () => {},
+      {},
+    );
+    globalThis.fetch = prevFetch;
+
+    if (isBun) {
+      assert.ok(!(result as any).isError, "request succeeded");
+      assert.deepStrictEqual(sentInit?.tls, { rejectUnauthorized: false });
+    } else if (!(result as any).isError) {
+      assert.ok(sentInit && "dispatcher" in sentInit, "undici dispatcher attached");
+    } else {
+      // No undici available: must fail loudly, not silently verify.
+      const text = (result as any).content[0].text;
+      assert.ok(text.includes("TLS bypass is unavailable"), "loud failure message");
+    }
   });
 });

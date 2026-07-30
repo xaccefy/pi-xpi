@@ -81,6 +81,28 @@ describe("casefile sqlite ledger", () => {
     assert.strictEqual(readCasefile().length, 1);
   });
 
+  it("deduplicates when the STORED title has irregular whitespace or non-ASCII case", () => {
+    // Regression: the old SQL LIKE pre-filter compared the JS-normalized
+    // candidate against the raw DB title, so rows with extra whitespace or
+    // non-ASCII casing never reached the JS comparator and duplicates were
+    // created.
+    const first = addCaseResult({
+      title: "SQL  Éxploitation in Login",
+      target: "shop.example.test",
+      evidence: "probe",
+    });
+    assert.strictEqual(first.created, true);
+
+    const dupe = addCaseResult({
+      title: "SQL ÉXPLOITATION IN LOGIN",
+      target: "shop.example.test",
+      evidence: "probe again",
+    });
+    assert.strictEqual(dupe.created, false);
+    assert.strictEqual(dupe.record.id, first.record.id);
+    assert.strictEqual(readCasefile().length, 1);
+  });
+
   it("assertPromotable gates cheaply before any PoC run", () => {
     const record = addCase({
       title: "XSS candidate",
@@ -353,6 +375,13 @@ describe("casefile sqlite ledger", () => {
     assert.ok(
       report.includes("Attempted to access own export without auth"),
       "report must include the disconfirmation body",
+    );
+    // Path-leak guard: the report must show only the script basename, never the
+    // absolute filesystem path (which leaks the researcher's local layout).
+    assert.ok(report.includes("idor-poc.py"), "report must include the PoC script basename");
+    assert.ok(
+      !report.includes("/workspace/idor-poc.py"),
+      "report must NOT leak the absolute PoC path",
     );
   });
 

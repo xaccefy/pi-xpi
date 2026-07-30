@@ -168,6 +168,7 @@ describe("casefile extension", () => {
     const promoted = await executeTool(pi, "PromoteFinding", {
       id: record.id,
       poc_path: pocScriptPath,
+      verification_marker: "ok",
       local: true,
     });
     expect(promoted.details.record.status).toBe("confirmed");
@@ -193,6 +194,40 @@ describe("casefile extension", () => {
     const reportText = readFileSync(report.details.path, "utf8");
     expect(reportText).toContain("PoC Verification Log");
     expect(reportText).toContain("Output\n```\nok\n```");
+  });
+
+  test("PromoteFinding rejects a PoC that exits 0 but lacks the verification marker", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+
+    const added = await executeTool(pi, "CaseAdd", {
+      title: "Missing marker PoC",
+      target: "example-app",
+      bugClass: "xss",
+      evidence: "reflected input",
+    });
+    const id = added.details.record.id;
+    await executeTool(pi, "CaseUpdate", {
+      id,
+      status: "investigating",
+      confidence: "high",
+      severity: "medium",
+      poc: "send payload, check reflection",
+      impact: "script execution",
+      target: "example-app",
+      disconfirmation: "tried without payload; no reflection",
+    });
+
+    // PoC prints 'ok' but we require a marker that is NOT in the output.
+    const result = await executeTool(pi, "PromoteFinding", {
+      id,
+      poc_path: pocScriptPath,
+      verification_marker: "VULN_CONFIRMED_not_present",
+      local: true,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("verification marker");
+    expect(result.details.record.status).toBe("investigating");
   });
 
   test("returns the existing case when CaseAdd repeats the same title and scope", async () => {
@@ -365,6 +400,7 @@ describe("casefile extension", () => {
       await executeTool(pi, "PromoteFinding", {
         id: reported.details.record.id,
         poc_path: pocScriptPath,
+        verification_marker: "ok",
         local: true,
       });
       await executeTool(pi, "CaseReport", { id: reported.details.record.id });
@@ -479,6 +515,7 @@ describe("casefile extension", () => {
     await executeTool(pi, "PromoteFinding", {
       id: storedXss.details.record.id,
       poc_path: pocScriptPath,
+      verification_marker: "ok",
       local: true,
     });
 

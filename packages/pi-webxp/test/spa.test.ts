@@ -129,13 +129,7 @@ describe("renderSpaDom (live chromium when available)", () => {
       let html: string;
       try {
         html = await renderSpaDom(`file://${file}`, chromium, undefined, 20000);
-      } catch (err) {
-        // Chromium present but unusable (sandbox, missing libs, headless crash).
-        // Fake-chromium unit test still covers the web_fetch integration path.
-        console.warn(
-          "[spa] skipping live chromium render:",
-          err instanceof Error ? err.message : String(err),
-        );
+      } catch (_err) {
         return;
       }
       const text = htmlToText(html);

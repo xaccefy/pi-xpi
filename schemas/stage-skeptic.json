@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Stage Skeptic",
-  "description": "Adversarial disconfirmation verdict from the skeptic subagent. Runs between TRACE and VALIDATE for severity >= high. The skeptic independently re-reads source code and tries to disprove the finding.",
+  "description": "Adversarial disconfirmation verdict from the skeptic subagent. Runs between TRACE and VALIDATE for confidence == high (severity doesn't exist yet; it's assigned only after the PoC runs). The skeptic independently re-reads source — or re-probes live endpoints read-only — and tries to disprove the finding.",
   "type": "object",
   "required": ["finding_id", "verdict", "reasoning", "evidence_reviewed"],
   "properties": {
@@ -38,7 +38,8 @@
         "intended_behavior",
         "overstated_impact",
         "duplicate",
-        "test_artifact"
+        "test_artifact",
+        "out_of_scope"
       ],
       "description": "Why the finding is disproven (required when verdict is DISPROVEN)"
     }

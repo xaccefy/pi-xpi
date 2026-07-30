@@ -723,25 +723,27 @@ export default function registerTodo(pi: ExtensionAPI) {
     refreshWidget(ctx, sessionId);
   });
 
-  pi.on("session_compact", async (_event, ctx) => {
-    const sessionId = sid(ctx);
-    const state = sessions.get(sessionId);
-    if (state) {
-      const replayed = replayFromBranch(ctx);
-      if (replayed.nextId > 1) {
-        setSessionState(sessionId, replayed);
-      }
-    }
+  // After compaction/tree events the last surviving tool-result snapshot in
+  // the branch can be OLDER than memory (compaction drops the newer ones),
+  // so the branch is NOT unconditionally the source of truth here. Prefer the
+  // freshest local source (memory or disk — disk is written on every successful
+  // mutation) and only fall back to branch replay when no local state exists.
+  const settleState = (ctx: any, sessionId: string) => {
+    const replayed = replayFromBranch(ctx);
+    const mem = sessions.get(sessionId) ?? freshState();
+    const disk = restoreState(sessionId) ?? freshState();
+    const local = mem.nextId >= disk.nextId ? mem : disk;
+    const next = local.nextId > 1 ? local : replayed.nextId > 1 ? replayed : local;
+    setSessionState(sessionId, next);
     refreshWidget(ctx, sessionId);
+  };
+
+  pi.on("session_compact", async (_event, ctx) => {
+    settleState(ctx, sid(ctx));
   });
 
   pi.on("session_tree", async (_event, ctx) => {
-    const sessionId = sid(ctx);
-    const replayed = replayFromBranch(ctx);
-    if (replayed.nextId > 1) {
-      setSessionState(sessionId, replayed);
-    }
-    refreshWidget(ctx, sessionId);
+    settleState(ctx, sid(ctx));
   });
 
   pi.on("session_shutdown", async () => {

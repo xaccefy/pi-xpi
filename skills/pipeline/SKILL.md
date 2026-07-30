@@ -1,20 +1,41 @@
 ---
 name: pipeline
-description: Full pipeline orchestration skill for vulnerability discovery. Teaches the harness agent how to run stages with state tracking, schema validation, reachability trace, gapfill, and structured reporting.
+description: Vulnerability discovery pipeline — the REQUIRED workflow whenever the task is to find vulnerabilities, hunt bugs, run a bug-bounty hunt, pentest, or security-audit a target. You are the coordinator — run the stage machine with subagent orchestration, state tracking, schema validation, reachability trace, gapfill loop, and structured reporting.
 ---
 
 # Pipeline Orchestration Skill
 
+## Your Role: Coordinator
+
+**You are the pipeline coordinator.** You do NOT hunt, trace, or write PoCs yourself. You dispatch specialist subagents via the `subagent` tool and orchestrate their outputs.
+
+- Every HUNT, TRACE, SKEPTIC, VALIDATE, CHAIN, and PATCH stage is executed by a `subagent({agent: "...", task: "..."})` call — not by you inline.
+- You own: state tracking (casefile), scratchpad checkpoints, schema validation at stage boundaries, coverage aggregation, and the decision to advance/kill/retry each finding.
+- If you find yourself reading source code or probing endpoints directly, **stop** — that is the subagent's job. Your job is to dispatch, validate the output against the schema, and record the result.
+- The only stages you do yourself are RECON (see below) and REPORT (aggregate subagent outputs into the final report).
+
 ## Stage Machine
 
 ```
-RECON → HUNT → GAPFIL(loop) → TRACE → SKEPTIC → VALIDATE → CHAIN → REPORT
-  ↑___________________|                    |
-  └────── FEEDBACK ────┘                    ↓
-         (traces into new hunts)      FIX (optional)
+RECON(loop) → HUNT → GAPFIL(loop) → TRACE → SKEPTIC → VALIDATE → CHAIN → REPORT
+  ↑_______________|__________________|            |
+  └────────────── ROUNDS (re-hunt with new intel) ↓
+         (traces into new hunts)             FIX (optional)
 ```
 
-SKEPTIC runs between TRACE and VALIDATE, but only for findings at severity >= high. The skeptic independently re-reads source to disprove the finding. If the skeptic says DISPROVEN, the finding is killed directly — no tie-breaker.
+## ROUNDS: one pass is not enough
+
+Real bug-bounty hunting is iterative: what you learn in one pass (tech hints, error messages, timing behavior, new parameters, new surface from traces) makes the next pass sharper. After the first REPORT, do NOT stop. Start a new ROUND: go back to HUNT with the accumulated intel and re-hunt every class that is not COVERED, plus re-probe previously dry endpoints with the new tricks you learned.
+
+**Plateau stop condition** — stop when a full round produces ALL of:
+- zero new findings (hypotheses),
+- zero new reachable surface,
+- zero new techniques from exploit_search that apply,
+- and every class is COVERED, SKIPPED, or NOT_FOUND per the coverage rules.
+
+There is no hard round cap; plateau detection is the cap. If a round yields anything new, keep looping. Budget-conscious? Note in the report that the run stopped at round N for budget, not for plateau.
+
+SKEPTIC runs between TRACE and VALIDATE, but only for high-confidence findings (`confidence: high` — severity doesn't exist yet at this stage; the auditor sets confidence, the exploit agent sets severity after the PoC runs). The skeptic independently re-reads source to disprove the finding. If the skeptic says DISPROVEN, the finding is killed directly — no tie-breaker.
 
 Finish coverage (hunt + gapfill) before spending trace budget. Trace only the hypotheses that survived a complete hunt, then validate the reachable ones.
 
@@ -24,7 +45,7 @@ Each stage produces a structured output. The next stage validates it before star
 
 The pipeline assumes the target is **in scope** and the agent has the tools to probe it. Before dispatching the first auditor, verify:
 
-1. **Scope is defined.** Record the in-scope hosts/paths in the pipeline-run case `target` + `assumptions`. Every probe must hit a host in scope. If scope is ambiguous, ask the user — do not guess.
+1. **Scope is defined AND matches the instruction.** Read the program's scope table (CSV/JSON from the bounty program). Do NOT match on the identifier alone — read the `instruction` column. Many assets are in scope only for a *restricted* subset (e.g. "limited to content and configuration issues", "API only", "excluding X"). Record the in-scope hosts/paths **and the scope instruction** in the pipeline-run case `target` + `assumptions`. Every probe must hit a host in scope AND the finding must fall within the instruction's allowed category. If scope is ambiguous, ask the user — do not guess.
 2. **Auth is available (if needed).** If the target requires auth, the user must supply credentials/tokens. Store them in env vars (`TARGET_COOKIE`, `TARGET_TOKEN`). The pipeline cannot create accounts.
 3. **CLI tools are present.** Recon and probing rely on `http_request` (stateful HTTP, cookie persistence) plus CLI tools `httpx`, `ffuf`, `nuclei`, `subfinder`, `nmap`, `jq` via `bash`. If a CLI tool is missing, fall back to `http_request` + `grep` (slower). Check with `bash("command -v httpx ffuf nuclei")` at run start and record what's available.
 4. **OOB channel for blind classes.** Blind SQLi / blind SSRF / blind command injection can only be confirmed via an out-of-band callback. If no listener is running (`interactsh-client` or a `nc` listener), blind classes will be **un-confirmable** — record them as `INCOMPLETE` with `nextStep: "blocked: no OOB listener"`, don't kill them.
@@ -65,7 +86,7 @@ This gives you resume capability: on restart, `CaseList(tag: "pipeline")` shows 
 
 The casefile owns state transitions; the scratchpad owns artifacts. Agents write their intermediate outputs (recon maps, trace outputs, verification logs) to the scratchpad instead of stuffing everything into casefile text fields or relying on each other's output streams.
 
-**Directory layout** (created by `scratchpad_init`):
+**Directory layout** (created by `ScratchpadInit`):
 ```
 {project_root}/.scratchpad/{run_id}/
   recon/      — fingerprints, tech detection, surface maps
@@ -80,7 +101,9 @@ The casefile owns state transitions; the scratchpad owns artifacts. Agents write
   state.json  — checkpoint file with phase completion + key IDs
 ```
 
-**API:** see `packages/pi-casefile/src/scratchpad.ts` for the full API. Key functions: `scratchpad_init`, `scratchpad_write`, `scratchpad_read`, `scratchpad_checkpoint`, `scratchpad_resume`, `scratchpad_phase_done`, `scratchpad_clear`.
+**API (registered tools):** `ScratchpadInit`, `ScratchpadWrite`, `ScratchpadRead`, `ScratchpadCheckpoint`, `ScratchpadResume`, `ScratchpadPhaseDone`, `ScratchpadClear`. (The underlying module functions in `packages/pi-casefile/src/scratchpad.ts` are snake_case — always call the CamelCase tools.)
+
+Stage names vs scratchpad phase names: the pipeline stage is spelled GAPFILL in prose, but the scratchpad phase key is `gapfil` — `ScratchpadCheckpoint(run_id, "gapfil", ...)` fails validation with "gapfill". Phase enum: recon, hunt, gapfil, trace, skeptic, validate, chain, patch, report.
 
 **Rules:**
 - Agents write artifacts to scratchpad, not to each other's output files (prevents echo chamber).
@@ -90,9 +113,9 @@ The casefile owns state transitions; the scratchpad owns artifacts. Agents write
 
 ## Resume + Checkpoints
 
-After every phase: `scratchpad_checkpoint(run_id, "<phase>", { ids: [<case-ids>], summary: "<one-line>" })`.
+After every phase: `ScratchpadCheckpoint(run_id, "<phase>", { ids: [<case-ids>], summary: "<one-line>" })`.
 
-On pipeline start: `scratchpad_resume(run_id) ?? scratchpad_init(run_id)`. If resume returns a checkpoint, skip completed phases (check `scratchpad_phase_done` before each dispatch) and continue from `resume.next_phase`. `--fresh` clears the scratchpad via `scratchpad_clear(run_id)`.
+On pipeline start: `ScratchpadResume(run_id)` — if null, `ScratchpadInit(run_id)`. If resume returns a checkpoint, skip completed phases (check `ScratchpadPhaseDone` before each dispatch) and continue from the resumed next_phase. `--fresh` must call `ScratchpadClear(run_id)` FIRST and then `ScratchpadInit` — `ScratchpadInit` alone returns the old checkpoint untouched.
 
 ## Schema Validation at Stage Boundaries
 
@@ -102,7 +125,7 @@ Every stage output must conform to its schema before the next stage begins. Vali
 
 | Stage | Schema | Required Fields |
 |-------|--------|-----------------|
-| **HUNT** | `schemas/stage-finding.json` | vuln_class, file, line, sink, entry_point, confidence, evidence |
+| **HUNT** | `schemas/stage-finding.json` | vuln_class, sink, entry_point, confidence, evidence; file+line for source targets, endpoint for live targets |
 | **TRACE** | `schemas/stage-trace.json` | trace_result, entry_point, call_chain, defenses_checked, attacker_model |
 | **SKEPTIC** | `schemas/stage-skeptic.json` | finding_id, verdict, reasoning, evidence_reviewed |
 | **VALIDATE** | `schemas/stage-validation.json` | finding_id, status, technique_used, detection_method |
@@ -124,15 +147,33 @@ If the agent cannot produce valid output after 2 repair attempts:
 
 ## Agent Dispatch Patterns
 
+**These are commands to execute, not descriptions.** Each `subagent({...})` below is a real tool call you must make. Do not perform the stage's work yourself — dispatch the agent, then validate its output.
+
+### RECON: Build the entry-point inventory (iterative)
+
+RECON owns the run's coverage floor: hunts can only cover entry points recon found. Take it seriously — a shallow recon makes every later `NOT_FOUND` a lie.
+
+For a code target this is lightweight (map routes, handlers, parsers, sinks with `grep`/`find` yourself). For a **live target**, run a recon loop:
+
+1. Enumerate: subdomains (`subfinder`), live hosts (`httpx`), URLs (`katana`/`ffuf` crawling and fuzzing), JS files (mine them for routes and parameters).
+2. Fingerprint: tech stack, frameworks, versions — then `exploit_search` for known CVEs and class-specific techniques for that stack.
+3. Expand: every 4xx page, redirect, JS route, and API schema response is new surface — feed it back into enumeration. Repeat until expansion yields nothing new (recon plateau).
+4. Record **every discovered entry point** (URL, method, parameters, auth state) plus tech notes into the scratchpad: `ScratchpadWrite(run_id, "recon", "entry-points.md", ...)`.
+
+HUNT tasks must reference this inventory, and all coverage judgements are measured against it.
+
 ### HUNT: One agent per attack class
 
+Dispatch auditor subagents concurrently (one per attack class) using the `subagent` tool's parallel mode:
+
 ```
-Spawn multiple auditor agents concurrently, one per attack class:
-  subagent({agent: "auditor",
-    task: "Hunt for <class> vulnerabilities in <target/subsystem>. ..."})
+subagent({ tasks: [
+  { agent: "auditor", task: "Hunt for <class> vulnerabilities in <target/subsystem>. ..." },
+  { agent: "auditor", task: "Hunt for <class2> vulnerabilities in <target/subsystem>. ..." },
+]})
 ```
 
-Coverage rule: check at least 3 entry points per class. After all auditors return, aggregate coverage. Coverage is per-entry-point, not a single tri-state — a class is only `NOT_FOUND` when every entry point identified in recon was actually examined:
+Coverage rule: the auditor must examine **every entry point in the recon inventory that can carry this class's input** — the recon inventory defines the floor, not a fixed number. After all auditors return, aggregate coverage. Coverage is per-entry-point, not a single tri-state — a class is only `NOT_FOUND` when every entry point identified in recon was actually examined:
 ```
 COVERED:    class examined across all identified entry points (≥1 hypothesis OR each entry point ruled out with reason)
 INCOMPLETE: class examined partially — some entry points never checked (stays in gapfill)
@@ -143,25 +184,29 @@ A class with any unchecked entry point is `INCOMPLETE`, never `NOT_FOUND`. `INCO
 
 ### TRACE: One agent per finding
 
+For each hypothesis that survived hunt + gapfill, dispatch a tracer subagent:
+
 ```
-For each hypothesis that passed validation:
-  subagent({agent: "tracer",
-    task: "Trace whether attacker input reaches the sink at <file:line>. ..."})
+subagent({ agent: "tracer",
+  task: "Trace whether attacker input reaches the sink at <file:line>. ..." })
 ```
 
 Only findings with `TRACE RESULT: REACHABLE` advance to exploit.
 
-### SKEPTIC: One agent per high-severity traced finding (adversarial disconfirmation)
+**Live targets without source** — static reachability is impossible. The tracer's job becomes *dynamic reachability*: prove the endpoint exists, is reachable by an attacker at the claimed privilege level, and actually processes the input (reflected parameter, observable behavior change, error, timing delta). `TRACE RESULT: REACHABLE` then means "probed live and confirmed reachable", and `call_chain` holds the request/response evidence instead of a static chain. Findings for live targets use `endpoint` instead of `file`/`line` in the stage-finding schema — do not fail schema validation on missing file/line for live targets. The skeptic re-probes read-only to disprove instead of re-reading source.
 
-Runs for every REACHABLE finding with severity >= high. The skeptic independently re-reads source to disprove the finding — it does not trust the auditor's or tracer's summary.
+### SKEPTIC: One agent per high-confidence traced finding (adversarial disconfirmation)
+
+For every REACHABLE finding with `confidence: high` (severity is not assigned until VALIDATE), dispatch a skeptic subagent. The skeptic independently re-reads source to disprove the finding — it does not trust the auditor's or tracer's summary.
 
 ```
-For each REACHABLE finding with severity >= high:
-  subagent({agent: "skeptic",
-    task: "Disprove finding <case-id>. vuln_class=<class>, sink=<file:line>, entry_point=<entry>.
-           Trace result: REACHABLE via <call_chain>. Auditor evidence: <evidence>.
-           Read the source yourself. Try to disprove it. Output conforming to schemas/stage-skeptic.json.",
-    turnBudget: {maxTurns: 12, graceTurns: 2}})
+subagent({ agent: "skeptic",
+  task: "Disprove finding <case-id>. vuln_class=<class>, sink=<file:line>, entry_point=<entry>.
+         Trace result: REACHABLE via <call_chain>. Auditor evidence: <evidence>.
+         Target: <target>. Scope instruction: <scope_instruction from program scope table — verbatim, or 'unrestricted'>.
+         First verify the finding is in scope per the instruction. Then read the source yourself and try to disprove it.
+         Output conforming to schemas/stage-skeptic.json.",
+  turnBudget: { maxTurns: 12, graceTurns: 2 } })
 ```
 
 Validate skeptic output against `schemas/stage-skeptic.json`:
@@ -176,37 +221,37 @@ The skeptic's `disconfirmation_attempt` IS the case's disconfirmation record —
 
 ### VALIDATE: One agent per traced finding
 
+For each reachable finding, dispatch an exploit subagent to write and run a PoC:
+
 ```
-For each reachable finding:
-  subagent({agent: "exploit", task: "Phase 1: EXPLOIT"})
-  Run through PromoteFinding.
+subagent({ agent: "exploit", task: "Phase 1: EXPLOIT. Finding <case-id>. ..." })
 ```
+
+The exploit agent runs the PoC through `PromoteFinding` — you do not run it yourself. The case must be `investigating` with poc/evidence/impact/severity/target/disconfirmation on it before the gate accepts a run; the exploit agent is responsible for that CaseUpdate (keeping the skeptic's `disconfirmation` if present) before its first PromoteFinding call. Confirm the skeptic wrote the disconfirmation first; for non-skeptic findings the exploit agent writes its own.
 
 ### GAPFIL: Re-queue INCOMPLETE classes (targeted at the gap)
 
+For each attack class with "INCOMPLETE" coverage, read the class's checked/unchecked entry-point list from the pipeline-run case, then dispatch an auditor subagent targeting the unchecked entries:
+
 ```
-For each attack class with "INCOMPLETE" coverage:
-  Read the class's checked/unchecked entry-point list from the pipeline-run case.
-  subagent({agent: "auditor",
-    task: "Hunt for <class> in <target>. Previous hunts found nothing.
-             These entry points are ALREADY CHECKED — do not re-tread them: <checked list>.
-             These entry points are UNCHECKED — examine each one: <unchecked list>.
-             Use exploit_search for this specific class."})
+subagent({ agent: "auditor",
+  task: "Hunt for <class> in <target>. Previous hunts found nothing.
+           These entry points are ALREADY CHECKED — do not re-tread them: <checked list>.
+           These entry points are UNCHECKED — examine each one: <unchecked list>.
+           Use exploit_search for this specific class." })
 ```
 
-The loop terminates when every class is COVERED, SKIPPED, or NOT_FOUND (i.e. zero `INCOMPLETE` remain), or after 2 iterations as a safety cap. Do NOT freeze a class as `NOT_FOUND` while unchecked entry points remain — if the cap hits with `INCOMPLETE` classes, report them as `INCOMPLETE` in coverage, not `NOT_FOUND`.
+The loop terminates when every class is COVERED, SKIPPED, or NOT_FOUND (i.e. zero `INCOMPLETE` remain), or after 3 iterations as a safety cap. Do NOT freeze a class as `NOT_FOUND` while unchecked entry points remain — if the cap hits with `INCOMPLETE` classes, report them as `INCOMPLETE` in coverage, not `NOT_FOUND`.
 
 ### FEEDBACK: Convert traces into new hunt tasks
 
+For each TRACE that revealed a new attack surface (a subsystem touched by the call chain that wasn't previously audited), dispatch an auditor subagent:
+
 ```
-For each TRACE that revealed a new attack surface (a subsystem touched by the call chain
-that wasn't previously audited):
-  subagent({agent: "auditor", task: "Audit this subsystem: <subsystem>. The trace revealed it as untested attack surface."})
+subagent({ agent: "auditor", task: "Audit this subsystem: <subsystem>. The trace revealed it as untested attack surface." })
 ```
 
 ## Coverage Tracking
-
-Coverage is the pipeline's self-check. It answers: "what did we actually test vs what did we skip or miss?"
 
 After the hunt + gapfill stages, emit a coverage summary in the pipeline-run case. Each class line must list the entry points checked so gapfill can target the gaps:
 
@@ -231,13 +276,13 @@ Before running trace or validation, deduplicate hypotheses:
 
 ### CHAIN: One agent per pipeline run
 
-After all validations pass, spawn the chain analyst:
+After all validations pass, dispatch the chain analyst subagent:
 
 ```
-subagent({agent: "chain",
+subagent({ agent: "chain",
   task: "Analyze confirmed findings for pipeline run <pipeline-case-id>.
            Tag: <pipeline-tag>. Target: <target>.
-           Find exploit chains across ALL confirmed findings."})
+           Find exploit chains across ALL confirmed findings." })
 ```
 
 Validate chain output against `schemas/stage-chain.json`:
@@ -265,7 +310,7 @@ CaseUpdate(<pipeline-case-id>, {
 Target token budgets per stage (cumulative input+output):
 - HUNT: ~50K tokens per class
 - TRACE: ~20K per finding
-- SKEPTIC: ~15K per finding (only severity >= high)
+- SKEPTIC: ~15K per finding (only confidence == high)
 - VALIDATE: ~30K per finding (exploit phase)
 - CHAIN: ~20K total
 - PATCH: ~40K per finding
@@ -291,9 +336,10 @@ subagent({agent: "auditor",
 | chain | 8 | lightweight analysis |
 
 ## Non-negotiables
+- **No finding is confirmed until its target is verified in scope per the program's scope instruction** — not just the identifier. If the scope instruction restricts the asset to a subset (e.g. "CloudFront content/config only"), the finding must fall within that subset. Out-of-scope findings are killed, not confirmed.
 - No finding advances without passing its stage schema. If the output is malformed, send it back.
 - No finding is validated without a reachability trace showing REACHABLE.
-- A High/Critical finding is not validated until the skeptic stage runs — either the skeptic confirms it, or it's killed on DISPROVEN.
-- A finding is only `confirmed` with evidence + poc + impact + severity and a PoC that exited 0.
+- A high-confidence finding (`confidence: high`) is not validated until the skeptic stage runs — either the skeptic confirms it, or it's killed on DISPROVEN. **The skeptic must independently verify scope** — if the finding's target does not match the scope instruction, the skeptic outputs DISPROVEN with `disproval_reason: "out_of_scope"`, citing the scope instruction verbatim.
+- A finding is only `confirmed` with evidence + poc + impact + severity and a PoC that exited 0 **with the verification_marker present in the output**. The PoC must hit the real target (or a faithful replica of the real vulnerable code) — no mocks for the exploitation step. **Severity is derived from what the PoC output actually demonstrates — not from theoretical/hypothetical impact.** The auditor does NOT set severity (use `confidence` instead). The exploit agent sets severity only after the PoC exits 0, mapping it to the proven impact. The skeptic checks for inflation.
 - A patch isn't safe until a fresh tracer confirms the sink is no longer reachable.
 - Coverage must be tracked per class with entry-point lists. Only `INCOMPLETE` classes re-queue in gapfill; `NOT_FOUND` requires an empty UNCHECKED list.

@@ -56,6 +56,18 @@ function getSession(name: string): SessionState {
 
 // ── Cookie helpers ───────────────────────────────────────
 
+// Header names are case-insensitive; callers may pass "Cookie" while we
+// write "cookie". Find the caller's actual key so we merge into it instead
+// of creating a duplicate case-variant header.
+function findHeaderKey(headers: Record<string, string>, name: string): string | undefined {
+  const lower = name.toLowerCase();
+  return Object.keys(headers).find((k) => k.toLowerCase() === lower);
+}
+
+function hasHeader(headers: Record<string, string>, name: string): boolean {
+  return findHeaderKey(headers, name) !== undefined;
+}
+
 function injectCookieHeader(
   hostname: string,
   existing: Record<string, string>,
@@ -64,11 +76,12 @@ function injectCookieHeader(
   const sessionCookies = jar.cookies.get(hostname);
 
   if (!sessionCookies) return { ...existing };
-  if (!existing["cookie"]) return { ...existing, cookie: sessionCookies };
+  const cookieKey = findHeaderKey(existing, "cookie");
+  if (!cookieKey) return { ...existing, cookie: sessionCookies };
 
   // Merge: caller wins for duplicate keys; jar fills the rest.
   const merged = new Map<string, string>();
-  for (const pair of existing["cookie"].split(";")) {
+  for (const pair of existing[cookieKey].split(";")) {
     const eq = pair.indexOf("=");
     if (eq > 0) merged.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
   }
@@ -76,7 +89,7 @@ function injectCookieHeader(
     const eq = pair.indexOf("=");
     if (eq > 0) merged.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
   }
-  return { ...existing, cookie: [...merged].map(([k, v]) => `${k}=${v}`).join("; ") };
+  return { ...existing, [cookieKey]: [...merged].map(([k, v]) => `${k}=${v}`).join("; ") };
 }
 
 function storeResponseCookies(hostname: string, res: Response): void {
@@ -100,10 +113,13 @@ function storeResponseCookies(hostname: string, res: Response): void {
   jar.cookies.set(hostname, [...current].map(([k, v]) => `${k}=${v}`).join("; "));
 }
 
-// ── TLS bypass dispatcher ────────────────────────────────
+// ── TLS bypass ────────────────────────────────
 
-// For verifyTls=false, pass an undici Agent with rejectUnauthorized:false
-// as the dispatcher option. Bun's fetch honors it; Node's undici is the transport.
+// Bun: native fetch honors the non-standard `tls` option directly.
+// Node: global fetch is undici's, so pass an undici Agent with
+// rejectUnauthorized:false as the `dispatcher` option.
+const isBun = typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
+
 let cachedDispatcher: unknown = null;
 
 function getInsecureDispatcher(): unknown {
@@ -288,7 +304,7 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
           params.headers || {},
         );
 
-        if (params.contentType && !mergedHeaders["content-type"]) {
+        if (params.contentType && !hasHeader(mergedHeaders, "content-type")) {
           mergedHeaders["content-type"] = params.contentType;
         }
 
@@ -296,7 +312,7 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
         let body: string | undefined;
         if (params.json !== undefined) {
           body = JSON.stringify(params.json);
-          if (!mergedHeaders["content-type"]) {
+          if (!hasHeader(mergedHeaders, "content-type")) {
             mergedHeaders["content-type"] = "application/json";
           }
         } else if (params.body !== undefined && method !== "GET" && method !== "HEAD") {
@@ -314,8 +330,21 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
           fetchOptions.body = body;
         }
         if (!verifyTls) {
-          const dispatcher = getInsecureDispatcher();
-          if (dispatcher) {
+          if (isBun) {
+            (fetchOptions as RequestInit & { tls?: unknown }).tls = {
+              rejectUnauthorized: false,
+            };
+          } else {
+            const dispatcher = getInsecureDispatcher();
+            if (!dispatcher) {
+              // Fail loudly — silently re-verifying TLS on a request where the
+              // caller explicitly asked for a bypass is a dangerous surprise.
+              return errorResult(
+                "verifyTls=false requested but TLS bypass is unavailable: the 'undici' " +
+                  "package is not installed and this runtime can't disable verification " +
+                  "otherwise. No request was sent. Install undici or run under Bun.",
+              );
+            }
             fetchOptions.dispatcher = dispatcher;
           }
         }
@@ -354,7 +383,7 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
           text += `> ${k}: ${v}\n`;
         }
         if (body && method !== "GET" && method !== "HEAD") {
-          const bodyPreview = body.length > 200 ? body.slice(0, 200) + "..." : body;
+          const bodyPreview = body.length > 200 ? `${body.slice(0, 200)}...` : body;
           text += `> ${bodyPreview}\n`;
         }
         text += `\n< HTTP/1.1 ${res.status} ${res.statusText || ""}\n`;
