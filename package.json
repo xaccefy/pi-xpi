@@ -47,7 +47,7 @@
     "@xaccefy/pi-casefile": "*",
     "@xaccefy/pi-webxp": "*",
     "@xaccefy/pi-xtodo": "*",
-    "@sinclair/typebox": "^0.32.34"
+    "@sinclair/typebox": "^0.34.52"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.2",

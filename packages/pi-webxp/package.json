@@ -46,7 +46,7 @@
     ]
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.32.34",
+    "@sinclair/typebox": "^0.34.52",
     "@xaccefy/pi-shared": "*",
     "open-websearch": "^2.1.11",
     "undici": "^8.9.0"
