@@ -210,6 +210,6 @@ describe("pipeline_submit", () => {
     });
     assert.strictEqual(res.verdict, "accepted");
     const back = scratchpad_read("run-1", "skeptic", "skeptic_case_9.json");
-    assert.ok(back && back.includes("CONFIRMED"));
+    assert.ok(back?.includes("CONFIRMED"));
   });
 });
