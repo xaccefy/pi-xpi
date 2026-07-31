@@ -19,7 +19,7 @@ Every lead starts HYPOTHESIS. Nothing reaches CONFIRMED without a proven attacke
 
 ## Tool Reference
 
-**Casefile (state tracking):** CaseAdd, CaseUpdate, CaseGet, CaseList, CaseSearch, CaseLink, CaseUnlink, CaseReport, PromoteFinding
+**Casefile (state tracking):** CaseAdd, CaseUpdate, CaseGet, CaseList, CaseSearch, CaseLink, CaseUnlink, CaseReport, PromoteFinding, PipelineSubmit
 
 **Scratchpad (pipeline artifacts):** ScratchpadInit, ScratchpadResume, ScratchpadCheckpoint, ScratchpadWrite, ScratchpadRead, ScratchpadPhaseDone, ScratchpadClear
 

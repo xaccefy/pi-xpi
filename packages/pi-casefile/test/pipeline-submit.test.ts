@@ -1,6 +1,5 @@
 import assert from "node:assert";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -58,7 +57,11 @@ describe("pipeline_submit", () => {
   });
 
   it("returns repair with field-level errors for a missing required field", () => {
-    const res = pipeline_submit("run-1", "hunt", { ...VALID_HUNT, vuln_class: "xss", evidence: "" });
+    const res = pipeline_submit("run-1", "hunt", {
+      ...VALID_HUNT,
+      vuln_class: "xss",
+      evidence: "",
+    });
     assert.strictEqual(res.verdict, "repair");
     assert.ok(res.errors.some((e) => e.startsWith("evidence:")));
     assert.strictEqual(res.repair_attempt, 1);
@@ -179,7 +182,11 @@ describe("pipeline_submit", () => {
       line: 40,
     });
     assert.strictEqual(otherClass.verdict, "accepted");
-    const distant = pipeline_submit("run-1", "hunt", { ...VALID_HUNT, vuln_class: "ssti", line: 80 });
+    const distant = pipeline_submit("run-1", "hunt", {
+      ...VALID_HUNT,
+      vuln_class: "ssti",
+      line: 80,
+    });
     assert.strictEqual(distant.verdict, "accepted");
   });
 
@@ -199,6 +206,66 @@ describe("pipeline_submit", () => {
     assert.strictEqual(res.verdict, "repair");
     assert.ok(res.errors.some((e) => e.includes("severity")));
     assert.ok(res.errors.some((e) => e.includes("steps")));
+  });
+
+  it("prefilter catches __tests__ and e2e directories (segment-anchored)", () => {
+    for (const dir of ["__tests__", "e2e", "test-utils"]) {
+      const res = pipeline_submit("run-1", "hunt", {
+        ...VALID_HUNT,
+        vuln_class: "crypto-weakness",
+        file: `src/${dir}/widget.ts`,
+      });
+      assert.strictEqual(res.verdict, "rejected", `${dir} should be filtered`);
+    }
+  });
+
+  it("prefilter does NOT false-positive on segments like latest/attest", () => {
+    mkdirSync(join(tempDir, "src/latest"), { recursive: true });
+    writeFileSync(join(tempDir, "src/latest/widget.ts"), "// source\n");
+    const res = pipeline_submit("run-1", "hunt", {
+      ...VALID_HUNT,
+      vuln_class: "open-redirect",
+      file: "src/latest/widget.ts",
+    });
+    assert.strictEqual(res.verdict, "accepted");
+  });
+
+  it("containment filter rejects files resolving outside the project root", () => {
+    const res = pipeline_submit("run-1", "hunt", {
+      ...VALID_HUNT,
+      vuln_class: "information-disclosure",
+      file: "../outside/secret.ts",
+    });
+    assert.strictEqual(res.verdict, "rejected");
+    assert.ok(res.errors.some((e) => e.includes("containment filter")));
+  });
+
+  it("report stage requires coverage as an OBJECT (not array)", () => {
+    const asArray = pipeline_submit("run-1", "report", {
+      target: "t",
+      pipeline_status: "complete",
+      findings: [],
+      coverage: [],
+      summary: "s",
+    });
+    assert.strictEqual(asArray.verdict, "repair");
+    assert.ok(asArray.errors.some((e) => e.includes("coverage")));
+
+    const asObject = pipeline_submit("run-1", "report", {
+      target: "t",
+      pipeline_status: "complete",
+      findings: [],
+      coverage: { sqli: "NOT_FOUND" },
+      summary: "s",
+    });
+    assert.strictEqual(asObject.verdict, "accepted");
+  });
+
+  it("unparseable output also exhausts the repair budget", () => {
+    assert.strictEqual(pipeline_submit("run-1", "hunt", "not json{").verdict, "repair");
+    assert.strictEqual(pipeline_submit("run-1", "hunt", "not json{").verdict, "repair");
+    const third = pipeline_submit("run-1", "hunt", "not json{");
+    assert.strictEqual(third.verdict, "rejected");
   });
 
   it("accepted outputs land in the scratchpad phase dir (resume-safe)", () => {

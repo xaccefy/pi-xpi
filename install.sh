@@ -25,7 +25,7 @@ done
 # Copy agent definitions so pi-subagents discovers them.
 # A manifest tracks which agents XPI installed so agents removed from the repo
 # also get removed on the next install (e.g. harness.md was deleted when the
-# coordinator role moved into the pipeline skill). cp alone never deletes,
+# coordinator role moved into the cyberwf skill). cp alone never deletes,
 # which leaves stale agents with outdated stage machines installed.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AGENTS_DIR=~/.pi/agent/agents

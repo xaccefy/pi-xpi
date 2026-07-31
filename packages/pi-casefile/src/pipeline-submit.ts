@@ -19,24 +19,17 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
-  type ScratchpadPhase,
   getRunDir,
   getScratchpadRoot,
+  type ScratchpadPhase,
   scratchpad_write,
 } from "./scratchpad.ts";
 
 // ── Types ────────────────────────────────────────────────────────────
 
-export const SUBMIT_STAGES = [
-  "hunt",
-  "trace",
-  "skeptic",
-  "validate",
-  "chain",
-  "report",
-] as const;
+export const SUBMIT_STAGES = ["hunt", "trace", "skeptic", "validate", "chain", "report"] as const;
 export type SubmitStage = (typeof SUBMIT_STAGES)[number];
 
 export type SubmitVerdict = "accepted" | "repair" | "rejected";
@@ -60,7 +53,7 @@ type StageSpec = {
   /** Fields that must be present and non-empty. */
   required: {
     name: string;
-    type: "string" | "integer" | "array";
+    type: "string" | "integer" | "array" | "object";
     enum?: readonly string[];
     minItems?: number;
   }[];
@@ -115,10 +108,7 @@ const SPECS: Record<SubmitStage, StageSpec> = {
       { name: "evidence", type: "string" },
     ],
     // Source targets: file + line. Live targets: endpoint.
-    locatorXor: [
-      ["file", "line"],
-      ["endpoint"],
-    ],
+    locatorXor: [["file", "line"], ["endpoint"]],
   },
   // schemas/stage-trace.json
   trace: {
@@ -175,13 +165,22 @@ const SPECS: Record<SubmitStage, StageSpec> = {
       { name: "target", type: "string" },
       { name: "pipeline_status", type: "string", enum: ["complete", "partial", "aborted"] },
       { name: "findings", type: "array" },
-      { name: "coverage", type: "array" },
+      { name: "coverage", type: "object" }, // patternProperties object, not array
       { name: "summary", type: "string" },
     ],
   },
 };
 
 const MAX_REPAIR_ATTEMPTS = 2;
+
+// Segment-based test-path detection: matches "test", "__tests__", "specs",
+// "e2e", "test-utils", "fixtures", ... anchored per path segment so
+// "latest"/"contest"/"attest" do NOT match. A regex-only version missed
+// leading underscores ("__tests__").
+const TEST_SEGMENT_RE =
+  /^[._-]*(tests?|specs?|e2e|fixtures?|mocks?|stubs?|examples?|samples?|test[-_]?data|test[-_]?utils)[._-]*$/i;
+const TEST_FILE_RE =
+  /([._-](test|spec|mock|fixture|stub|example|sample)\.[a-z0-9]+$|^test[-_]utils\.[a-z0-9]+$)/i;
 
 /** Chain items: each must have title, severity, steps (≥2), narrative. */
 const CHAIN_SEVERITIES = ["low", "medium", "high", "critical"] as const;
@@ -194,9 +193,6 @@ const CHAIN_SEVERITIES = ["low", "medium", "high", "critical"] as const;
  * auditor can submit those under vuln_class "other"+bugClass documentation;
  * the gate errs on filtering noise.
  */
-const TEST_PATH_RE =
-  /(^|\/)(test|tests|__tests__|spec|specs|fixtures?|mocks?|stubs?|examples?|samples?|testdata|test_data|test-utils)\.?(?:-|_)?[^/]*\//i;
-const TEST_FILE_RE = /[._-](test|spec|mock|fixture|stub|example|sample)\.[a-z0-9]+$/i;
 
 /** Trivial dedup: same file + vuln_class + line within this tolerance. */
 const DEDUP_LINE_TOLERANCE = 10;
@@ -292,6 +288,11 @@ function validateStage(stage: SubmitStage, obj: Record<string, unknown>): string
         errors.push(`${field.name}: missing or empty string`);
         continue;
       }
+    } else if (field.type === "object") {
+      if (typeof v !== "object" || v === null || Array.isArray(v)) {
+        errors.push(`${field.name}: missing or not an object`);
+        continue;
+      }
     } else if (field.type === "integer") {
       if (typeof v !== "number" || !Number.isInteger(v)) {
         errors.push(`${field.name}: missing or not an integer`);
@@ -352,7 +353,8 @@ function validateStage(stage: SubmitStage, obj: Record<string, unknown>): string
       if (!Array.isArray(chain.steps) || chain.steps.length < 2) {
         errors.push(`chains[${i}].steps: needs at least 2 case IDs`);
       }
-      if (!isNonEmptyString(chain.narrative)) errors.push(`chains[${i}].narrative: missing or empty`);
+      if (!isNonEmptyString(chain.narrative))
+        errors.push(`chains[${i}].narrative: missing or empty`);
     });
   }
 
@@ -365,27 +367,35 @@ function prefilterHunt(obj: Record<string, unknown>): string | null {
   const file = typeof obj.file === "string" ? obj.file : undefined;
   if (!file) return null; // live target: endpoint locator, nothing to filter
   const normalized = file.replace(/^\.?\//, "");
-  if (TEST_PATH_RE.test(normalized) || TEST_FILE_RE.test(normalized)) {
+  const segments = normalized.split("/");
+  if (segments.some((s) => TEST_SEGMENT_RE.test(s)) || TEST_FILE_RE.test(normalized)) {
     return (
       `test-path filter: "${file}" matches test/fixture/mock paths — findings in ` +
       `test code are noise. If this is a deliberately-shipped test credential, ` +
       `re-submit documenting why it ships to production.`
     );
   }
-  const abs = isAbsolute(normalized) ? normalized : join(projectRoot(), normalized);
+  const root = projectRoot();
+  const abs = isAbsolute(normalized) ? resolve(normalized) : resolve(root, normalized);
+  // Containment: resolved path must stay inside the project, otherwise a
+  // "finding" can point at ../ or absolute files outside the target repo.
+  const rel = relative(root, abs);
+  if (rel.startsWith("..") || isAbsolute(rel)) {
+    return (
+      `containment filter: "${file}" resolves outside the project root (${root}). ` +
+      `Findings must reference files inside the target repository.`
+    );
+  }
   if (!existsSync(abs)) {
     return (
       `file-existence filter: "${file}" does not exist under the project root ` +
-      `(${projectRoot()}). Hallucinated paths are rejected outright.`
+      `(${root}). Hallucinated paths are rejected outright.`
     );
   }
   return null;
 }
 
-function dedupHunt(
-  state: SubmitState,
-  obj: Record<string, unknown>,
-): { duplicateOf?: string } {
+function dedupHunt(state: SubmitState, obj: Record<string, unknown>): { duplicateOf?: string } {
   const file = typeof obj.file === "string" ? obj.file.replace(/^\.?\//, "") : undefined;
   const vulnClass = typeof obj.vuln_class === "string" ? obj.vuln_class : undefined;
   const line = typeof obj.line === "number" ? obj.line : undefined;
@@ -416,21 +426,19 @@ const STAGE_TO_PHASE: Record<SubmitStage, ScratchpadPhase> = {
   report: "report",
 };
 
-export function pipeline_submit(
-  runId: string,
-  stage: SubmitStage,
-  output: unknown,
-): SubmitResult {
+export function pipeline_submit(runId: string, stage: SubmitStage, output: unknown): SubmitResult {
   const parsed = parseOutput(output);
   if (parsed.error || !parsed.obj) {
     const state = readState(runId);
     const key = `${stage}:unparseable`;
     state.repairs[key] = (state.repairs[key] ?? 0) + 1;
     const attempt = state.repairs[key];
+    // Persist before BOTH returns — otherwise unparseable output bypasses the
+    // repair budget forever (counter never hits disk on the rejected path).
+    writeState(runId, state);
     if (attempt > MAX_REPAIR_ATTEMPTS) {
       return { verdict: "rejected", stage, errors: [parsed.error ?? "unparseable"], key };
     }
-    writeState(runId, state);
     return {
       verdict: "repair",
       stage,

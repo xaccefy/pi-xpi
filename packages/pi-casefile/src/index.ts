@@ -44,8 +44,8 @@ import {
   updateCaseResult,
   writeCaseReport,
 } from "./ledger.ts";
+import { pipeline_submit, SUBMIT_STAGES, type SubmitStage } from "./pipeline-submit.ts";
 import { type PocRun, runPoc } from "./poc-runner.ts";
-import { SUBMIT_STAGES, type SubmitStage, pipeline_submit } from "./pipeline-submit.ts";
 import {
   type ScratchpadPhase,
   type ScratchpadResume,
@@ -1230,12 +1230,14 @@ export default function casefileExtension(pi: ExtensionAPI) {
     ],
     parameters: Type.Object(
       {
-        run_id: Type.String({ description: "Pipeline run identifier (same as the scratchpad run_id)" }),
+        run_id: Type.String({
+          description: "Pipeline run identifier (same as the scratchpad run_id)",
+        }),
         stage: Type.String({
           enum: [...SUBMIT_STAGES],
           description: "Pipeline stage: hunt | trace | skeptic | validate | chain | report",
         }),
-        output: Type.Union([Type.String(), Type.Record(Type.String(), Type.Unknown())], {
+        output: Type.Union([Type.String(), Type.Object({}, { additionalProperties: true })], {
           description: "The stage output as a JSON object or JSON string (code fences tolerated)",
         }),
       },
