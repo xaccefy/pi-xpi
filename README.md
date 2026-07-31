@@ -44,6 +44,7 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 | CaseGet / CaseList / CaseSearch | Browse cases |
 | CaseLink / CaseUnlink | Exploit chains |
 | CaseReport | Markdown report |
+| PipelineSubmit | Stage-output validation gate: schema check + pre-filter + repair budget — stage can't advance on invalid output |
 | ScratchpadInit / Resume / Checkpoint | Crash-recoverable artifact store for pipeline runs |
 | ScratchpadWrite / Read / PhaseDone / Clear | Write, read, and resume pipeline artifacts |
 | /casefile | Case dashboard |
@@ -57,7 +58,7 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 /xp on                                      # enable casefile cyber workflow in context
 ```
 
-Pi injects skill descriptions (`web-pentest`, `pipeline`) into every session; the agent reads the full skill file when the task matches (e.g. "find bugs in X", "bug bounty Y"). Run `/xp on` for the full attacker discipline with casefile tracking.
+Pi injects skill descriptions (`web-pentest`, `cyberwf`) into every session; the agent reads the full skill file when the task matches (e.g. "find bugs in X", "bug bounty Y"). Run `/xp on` for the full attacker discipline with casefile tracking.
 
 ## Skeptic + scratchpad
 
@@ -66,7 +67,7 @@ The pipeline has two mechanisms that keep findings honest:
 - **Skeptic stage** — before a high-confidence finding reaches validation, a dedicated skeptic subagent independently re-reads the source (or re-probes the live endpoint) and tries to *disprove* it. If the skeptic finds a concrete reason the finding is false (a missed defense, an unreachable entry point, self-only impact), the finding is killed on the spot — no tie-breaker.
 - **Scratchpad** — a crash-recoverable artifact store. Each pipeline phase writes its intermediate output (recon maps, trace outputs, verification logs) to `.scratchpad/{run_id}/` instead of stuffing everything into casefile text fields. If a run crashes mid-pipeline, resume picks up from the last checkpoint without re-running completed phases.
 
-See `skills/pipeline/SKILL.md` for the full stage machine and API.
+See `skills/cyberwf/SKILL.md` for the full stage machine and API.
 
 ## Code search (fff)
 
@@ -99,7 +100,7 @@ pi-xpi/
 │   └── pi-xtodo
 ├── schemas/                 # stage-finding, stage-trace, stage-skeptic, stage-validation, stage-chain, stage-report
 ├── scripts/                 # bump-version, release
-├── skills/                  # web-pentest, pipeline (auto-loaded)
+├── skills/                  # web-pentest, cyberwf (auto-loaded)
 ├── install.sh
 └── package.json
 ```

@@ -1,9 +1,9 @@
 /**
  * Casefile — offensive security case tracker for Pi.
  *
- * Tools: CaseAdd, CaseUpdate, PromoteFinding, CaseGet, CaseList, CaseSearch, CaseLink, CaseUnlink, CaseReport, ScratchpadInit, ScratchpadResume, ScratchpadCheckpoint, ScratchpadWrite, ScratchpadRead, ScratchpadPhaseDone, ScratchpadClear
+ * Tools: CaseAdd, CaseUpdate, PromoteFinding, CaseGet, CaseList, CaseSearch, CaseLink, CaseUnlink, CaseReport, PipelineSubmit, ScratchpadInit, ScratchpadResume, ScratchpadCheckpoint, ScratchpadWrite, ScratchpadRead, ScratchpadPhaseDone, ScratchpadClear
  * Command: /casefile — interactive dashboard
- * Event: before_agent_start — injects cyber workflow (+ active case list) once per user prompt
+ * Event: before_agent_start — injects cyber workflow once per session, refreshes the active case list per prompt
  */
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -45,6 +45,7 @@ import {
   writeCaseReport,
 } from "./ledger.ts";
 import { type PocRun, runPoc } from "./poc-runner.ts";
+import { SUBMIT_STAGES, type SubmitStage, pipeline_submit } from "./pipeline-submit.ts";
 import {
   type ScratchpadPhase,
   type ScratchpadResume,
@@ -511,9 +512,15 @@ function buildCaseListContext(records: CaseRecord[]): string {
   return lines.join("\n");
 }
 
-/** Always includes cyber workflow; attaches case list when active cases exist. */
-function buildAgentInjection(active: CaseRecord[]): string {
+/**
+ * Builds the per-prompt injection. The cyber workflow is session-scope data —
+ * it never changes — so the caller passes includeWorkflow=true exactly once
+ * per session; re-injecting it on every prompt is pure token cost. The active
+ * case list DOES change as cases are added, so it is refreshed every prompt.
+ */
+function buildAgentInjection(active: CaseRecord[], includeWorkflow: boolean): string {
   const caseList = buildCaseListContext(active);
+  if (!includeWorkflow) return caseList;
   // Workflow FIRST for prominence, then case list as reference data.
   return caseList ? `${STATIC_CYBER_WORKFLOW}\n\n${caseList}` : STATIC_CYBER_WORKFLOW;
 }
@@ -1207,6 +1214,78 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
   });
 
+  // ── Tool: PipelineSubmit ──
+
+  pi.registerTool({
+    name: "PipelineSubmit",
+    label: "Submit Stage Output",
+    description:
+      "Submit a pipeline stage's output (hunt, trace, skeptic, validate, chain, report) through the validation gate. Validates required fields against the stage spec (mirrors schemas/*.json), applies the deterministic pre-filter (test-path and file-existence filters on hunt findings, trivial dedup by file+class+line), and counts repair attempts (max 2, then rejected). A stage cannot advance on an invalid output — submit fixed output until accepted.",
+    promptSnippet: "Validate and submit a pipeline stage's output",
+    promptGuidelines: [
+      "Every stage output a subagent returns must go through PipelineSubmit before the next stage is dispatched. Do not eyeball schemas.",
+      "If the verdict is repair, fix the fields listed in errors and re-submit the same output. The repair budget is 2 attempts per finding — after that the submission is rejected and the stage is failed.",
+      "Unhandled skeptic output: an unparseable or schema-invalid skeptic response is UNDETERMINED, never DISPROVEN. A tracer error is UNREACHABLE. PipelineSubmit returns repair for these instead of accepting them.",
+      "Test-path findings and hallucinated files are rejected by the pre-filter, not repairable — the finding itself is noise.",
+    ],
+    parameters: Type.Object(
+      {
+        run_id: Type.String({ description: "Pipeline run identifier (same as the scratchpad run_id)" }),
+        stage: Type.String({
+          enum: [...SUBMIT_STAGES],
+          description: "Pipeline stage: hunt | trace | skeptic | validate | chain | report",
+        }),
+        output: Type.Union([Type.String(), Type.Record(Type.String(), Type.Unknown())], {
+          description: "The stage output as a JSON object or JSON string (code fences tolerated)",
+        }),
+      },
+      { additionalProperties: false },
+    ),
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const result = pipeline_submit(
+        params.run_id as string,
+        params.stage as SubmitStage,
+        params.output,
+      );
+      const statusLine =
+        result.verdict === "accepted"
+          ? `ACCEPTED (${params.stage}) — artifact: ${result.artifact}`
+          : result.verdict === "repair"
+            ? `REPAIR (attempt ${result.repair_attempt}/2) — fix these and re-submit:\n  - ${result.errors.join("\n  - ")}`
+            : `REJECTED — ${result.errors.join("\n")}`;
+      return {
+        content: [{ type: "text", text: statusLine }],
+        isError: result.verdict !== "accepted",
+        details: result as unknown as Record<string, unknown>,
+      };
+    },
+
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("PipelineSubmit ")) +
+          theme.fg("dim", `${args.stage ?? ""}`),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const details = result.details as { verdict?: string; repair_attempt?: number } | undefined;
+      if (details?.verdict === "accepted") {
+        return new Text(theme.fg("success", "✓ PipelineSubmit accepted"), 0, 0);
+      }
+      if (details?.verdict === "repair") {
+        return new Text(
+          theme.fg("warning", `↷ PipelineSubmit repair ${details.repair_attempt}/2`),
+          0,
+          0,
+        );
+      }
+      return new Text(theme.fg("error", "✗ PipelineSubmit rejected"), 0, 0);
+    },
+  });
+
   // ── Tool: ScratchpadInit ──
 
   pi.registerTool({
@@ -1599,13 +1678,22 @@ export default function casefileExtension(pi: ExtensionAPI) {
 
   // ── Event: Inject cyber workflow into system prompt ──
   // XP (offensive) mode is OFF by default so normal dev work stays quiet.
-  // Only when enabled do we inject the cyber workflow (and case list) into
-  // the system prompt each turn. Injecting into event.systemPrompt (not as a
-  // conversation message) makes the attacker mindset immediate and avoids
-  // session bloat from repeated message entries.
+  // When enabled, the cyber workflow is injected ONCE per session (first
+  // prompt); the active case list refreshes every prompt because it changes
+  // as cases are added. Injecting into event.systemPrompt (not as a
+  // conversation message) avoids session bloat from repeated message entries.
+  let workflowInjected = false;
 
   pi.on("before_agent_start", async (event) => {
     if (readXpMode() === "off") return;
+    // Skip subagent child processes: pi-subagents runs each child in its own
+    // pi process (PI_SUBAGENT_CHILD=1) with this extension loaded. Injecting
+    // the workflow + entire active-case ledger into every child dispatch is a
+    // token multiplier (N subagents × workflow + growing case list per turn) —
+    // workers get what they need via their task and tool guidelines.
+    if (process.env.PI_SUBAGENT_CHILD === "1") return;
+
+    const includeWorkflow = !workflowInjected;
 
     let active: CaseRecord[] = [];
     try {
@@ -1614,7 +1702,9 @@ export default function casefileExtension(pi: ExtensionAPI) {
       // No database yet — still inject workflow.
     }
 
-    const injection = buildAgentInjection(active);
+    const injection = buildAgentInjection(active, includeWorkflow);
+    if (!injection) return; // workflow already injected, no active cases
+    workflowInjected = true;
 
     // Inject workflow FIRST (before skills) so the attacker mindset is
     // prominent, not buried at the end of a long system prompt.

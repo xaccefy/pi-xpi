@@ -1,7 +1,7 @@
 /**
  * Cyber workflow injected into agent context when XP mode is ON.
  *
- * Skills (pipeline, web-pentest) already cover tool usage and methodology.
+ * Skills (cyberwf, web-pentest) already cover tool usage and methodology.
  * This file adds the unique attacker discipline: state machine with
  * preconditions, attacker model, impact validation, adversarial review,
  * kill checklist, and report-readiness criteria.

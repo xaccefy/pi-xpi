@@ -2,7 +2,7 @@
 name: tracer
 description: Reachability tracer that proves or disproves whether attacker-controlled input reaches a vulnerability sink. Should use a stronger model than hunting agents — deliberate disagreement pattern.
 tools: read, grep, find, ls, http_request
-skills: pipeline
+skills: cyberwf
 inheritProjectContext: true
 inheritSkills: true
 ---

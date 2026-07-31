@@ -2,7 +2,7 @@
 name: chain
 description: Exploit chain analyst that examines all confirmed findings from a pipeline run and identifies multi-step attack chains, re-ranks severity, and records chain relationships in the casefile.
 tools: read, grep, CaseList, CaseLink, CaseAdd, CaseGet, exploit_search
-skills: pipeline
+skills: cyberwf
 inheritProjectContext: true
 inheritSkills: true
 ---

@@ -105,6 +105,7 @@ describe("casefile extension", () => {
       "CaseSearch",
       "CaseUnlink",
       "CaseUpdate",
+      "PipelineSubmit",
       "PromoteFinding",
       "ScratchpadCheckpoint",
       "ScratchpadClear",
@@ -353,6 +354,60 @@ describe("casefile extension", () => {
       expect(result.systemPrompt).toContain("# Cyber Workflow");
       expect(result.systemPrompt).toContain("Evidence-First Doctrine");
       expect(result.systemPrompt).not.toContain("<casefile_context>");
+    } finally {
+      if (previous === undefined) delete process.env.PI_XP_MODE;
+      else process.env.PI_XP_MODE = previous;
+    }
+  });
+
+  test("XP mode on + subagent child process: before_agent_start injects nothing", async () => {
+    const previousXp = process.env.PI_XP_MODE;
+    const previousChild = process.env.PI_SUBAGENT_CHILD;
+    process.env.PI_XP_MODE = "on";
+    process.env.PI_SUBAGENT_CHILD = "1";
+    try {
+      const pi = createFakePi();
+      casefileExtension(pi as any);
+
+      const handler = pi.events.get("before_agent_start")?.[0];
+      expect(handler).toBeFunction();
+      const result = await handler({ systemPrompt: "existing prompt" });
+      expect(result).toBeUndefined();
+    } finally {
+      if (previousXp === undefined) delete process.env.PI_XP_MODE;
+      else process.env.PI_XP_MODE = previousXp;
+      if (previousChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+      else process.env.PI_SUBAGENT_CHILD = previousChild;
+    }
+  });
+
+  test("XP mode on: workflow injected once per session, case list refreshes per prompt", async () => {
+    const previous = process.env.PI_XP_MODE;
+    process.env.PI_XP_MODE = "on";
+    try {
+      const pi = createFakePi();
+      casefileExtension(pi as any);
+
+      const handler = pi.events.get("before_agent_start")?.[0];
+      expect(handler).toBeFunction();
+
+      // First prompt: workflow included.
+      const first = await handler({ systemPrompt: "p" });
+      expect(first.systemPrompt).toContain("# Cyber Workflow");
+
+      // Second prompt with empty ledger: no workflow, no injection at all.
+      const second = await handler({ systemPrompt: "p" });
+      expect(second).toBeUndefined();
+
+      // Third prompt after a case appears: case list refreshes, workflow NOT re-injected.
+      await executeTool(pi, "CaseAdd", {
+        title: "Mid session lead",
+        status: "hypothesis",
+      });
+      const third = await handler({ systemPrompt: "p" });
+      expect(third.systemPrompt).toContain("<casefile_context>");
+      expect(third.systemPrompt).toContain("Mid session lead");
+      expect(third.systemPrompt).not.toContain("# Cyber Workflow");
     } finally {
       if (previous === undefined) delete process.env.PI_XP_MODE;
       else process.env.PI_XP_MODE = previous;

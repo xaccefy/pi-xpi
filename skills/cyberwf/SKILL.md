@@ -1,5 +1,5 @@
 ---
-name: pipeline
+name: cyberwf
 description: Vulnerability discovery pipeline — the REQUIRED workflow whenever the task is to find vulnerabilities, hunt bugs, run a bug-bounty hunt, pentest, or security-audit a target. You are the coordinator — run the stage machine with subagent orchestration, state tracking, schema validation, reachability trace, gapfill loop, and structured reporting.
 ---
 
@@ -119,9 +119,9 @@ On pipeline start: `ScratchpadResume(run_id)` — if null, `ScratchpadInit(run_i
 
 ## Schema Validation at Stage Boundaries
 
-Every stage output must conform to its schema before the next stage begins. Validate by reading the schema file and checking each required field.
+Every stage output must pass the `PipelineSubmit` gate before the next stage begins. PipelineSubmit validates in code — required fields, enums, conditional requirements — and applies the deterministic pre-filter (test paths, hallucinated files, trivial dedup) on HUNT findings. Do NOT eyeball schemas yourself; the gate returns ACCEPTED, REPAIR (field-level errors, max 2 attempts per finding, then rejected), or REJECTED.
 
-### Stage Schemas (in `schemas/`):
+### Stage Schemas (in `schemas/` — enforced by PipelineSubmit):
 
 | Stage | Schema | Required Fields |
 |-------|--------|-----------------|
@@ -132,18 +132,20 @@ Every stage output must conform to its schema before the next stage begins. Vali
 | **CHAIN** | `schemas/stage-chain.json` | chains[], summary |
 | **REPORT** | `schemas/stage-report.json` | target, pipeline_status, findings, coverage, summary |
 
-**Validation procedure:**
+**Submission procedure:**
 ```
-1. Read the schema file: read("schemas/stage-finding.json")
-2. For each output, check every required field exists and has non-null content
-3. If missing or malformed → return to the stage agent with "Your output is missing: <fields>. Please fix."
-4. Re-validate after repair. Max 2 repair attempts per stage.
+1. Subagent returns → PipelineSubmit(run_id, stage, output)
+2. ACCEPTED  → advance, checkpoint, dispatch next stage
+3. REPAIR    → return to the stage agent with the EXACT field errors the gate listed; re-submit
+4. REJECTED  → repair budget exhausted or pre-filter hit (test path / hallucinated file / duplicate):
+               record the stage state as failed (or the finding as noise) in the pipeline-run case,
+               log the reason, decide: skip / different agent / abort
 ```
 
-If the agent cannot produce valid output after 2 repair attempts:
-- Record the stage state as `failed` in the pipeline-run case
-- Log the failure reason
-- Decide: skip to next stage? retry with different agent? abort?
+**Fail-closed rules (never bendy):**
+- An unparseable or schema-invalid SKEPTIC output is **UNDETERMINED**, never DISPROVEN: repair it or re-dispatch; only a schema-valid `verdict: DISPROVEN` kills the finding.
+- A TRACER that errors or fails validation counts as **UNREACHABLE** — the finding does not advance, it's not left indeterminate.
+- Attach `outputSchema` (the schema's JSON from `schemas/`) to every subagent dispatch so the runtime validates structure before you ever see the output.
 
 ## Agent Dispatch Patterns
 
@@ -168,8 +170,10 @@ Dispatch auditor subagents concurrently (one per attack class) using the `subage
 
 ```
 subagent({ tasks: [
-  { agent: "auditor", task: "Hunt for <class> vulnerabilities in <target/subsystem>. ..." },
-  { agent: "auditor", task: "Hunt for <class2> vulnerabilities in <target/subsystem>. ..." },
+  { agent: "auditor", task: "Hunt for <class> vulnerabilities in <target/subsystem>. ...",
+    outputSchema: <contents of schemas/stage-finding.json> },
+  { agent: "auditor", task: "Hunt for <class2> vulnerabilities in <target/subsystem>. ...",
+    outputSchema: <contents of schemas/stage-finding.json> },
 ]})
 ```
 
@@ -188,7 +192,8 @@ For each hypothesis that survived hunt + gapfill, dispatch a tracer subagent:
 
 ```
 subagent({ agent: "tracer",
-  task: "Trace whether attacker input reaches the sink at <file:line>. ..." })
+  task: "Trace whether attacker input reaches the sink at <file:line>. ...",
+  outputSchema: <contents of schemas/stage-trace.json> })
 ```
 
 Only findings with `TRACE RESULT: REACHABLE` advance to exploit.
@@ -206,7 +211,8 @@ subagent({ agent: "skeptic",
          Target: <target>. Scope instruction: <scope_instruction from program scope table — verbatim, or 'unrestricted'>.
          First verify the finding is in scope per the instruction. Then read the source yourself and try to disprove it.
          Output conforming to schemas/stage-skeptic.json.",
-  turnBudget: { maxTurns: 12, graceTurns: 2 } })
+  turnBudget: { maxTurns: 12, graceTurns: 2 },
+  outputSchema: <contents of schemas/stage-skeptic.json> })
 ```
 
 Validate skeptic output against `schemas/stage-skeptic.json`:
@@ -224,7 +230,8 @@ The skeptic's `disconfirmation_attempt` IS the case's disconfirmation record —
 For each reachable finding, dispatch an exploit subagent to write and run a PoC:
 
 ```
-subagent({ agent: "exploit", task: "Phase 1: EXPLOIT. Finding <case-id>. ..." })
+subagent({ agent: "exploit", task: "Phase 1: EXPLOIT. Finding <case-id>. ...",
+  outputSchema: <contents of schemas/stage-validation.json> })
 ```
 
 The exploit agent runs the PoC through `PromoteFinding` — you do not run it yourself. The case must be `investigating` with poc/evidence/impact/severity/target/disconfirmation on it before the gate accepts a run; the exploit agent is responsible for that CaseUpdate (keeping the skeptic's `disconfirmation` if present) before its first PromoteFinding call. Confirm the skeptic wrote the disconfirmation first; for non-skeptic findings the exploit agent writes its own.
@@ -282,7 +289,8 @@ After all validations pass, dispatch the chain analyst subagent:
 subagent({ agent: "chain",
   task: "Analyze confirmed findings for pipeline run <pipeline-case-id>.
            Tag: <pipeline-tag>. Target: <target>.
-           Find exploit chains across ALL confirmed findings." })
+           Find exploit chains across ALL confirmed findings.",
+  outputSchema: <contents of schemas/stage-chain.json> })
 ```
 
 Validate chain output against `schemas/stage-chain.json`:

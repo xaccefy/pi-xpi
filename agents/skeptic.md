@@ -2,7 +2,7 @@
 name: skeptic
 description: Adversarial disconfirmation subagent that independently re-reads source code (or re-probes live endpoints) to disprove a high-confidence finding before it reaches validation. Deliberate disagreement pattern — assumes the finding is wrong until proven otherwise.
 tools: read, grep, find, ls, http_request
-skills: pipeline
+skills: cyberwf
 inheritProjectContext: true
 inheritSkills: true
 ---
