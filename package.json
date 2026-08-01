@@ -41,7 +41,12 @@
   "pi": {
     "skills": [
       "./skills"
-    ]
+    ],
+    "subagents": {
+      "agents": [
+        "./agents"
+      ]
+    }
   },
   "dependencies": {
     "@sinclair/typebox": "0.34.52",
