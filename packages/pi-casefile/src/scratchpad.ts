@@ -150,6 +150,19 @@ export function getStatePath(runId: string, projectRoot?: string): string {
   return join(getRunDir(runId, projectRoot), "state.json");
 }
 
+/**
+ * Sanitize an artifact name into a safe filename. Same allowlist as run_ids,
+ * plus dot-only rejection: a name like `..` or `.` would otherwise let join()
+ * point at the phase/run directory itself (EISDIR crash on write/read).
+ */
+function sanitizeArtifactName(artifactName: string): string {
+  const safe = artifactName.replace(/[^a-zA-Z0-9._-]/g, "_");
+  if (!safe || /^\.+$/.test(safe)) {
+    throw new Error(`Invalid artifact name: "${artifactName}" — nothing left after sanitization`);
+  }
+  return safe;
+}
+
 function emptyCheckpoint(runId: string, projectRoot: string): ScratchpadCheckpoint {
   const now = new Date().toISOString();
   return {
@@ -229,8 +242,8 @@ export function scratchpad_write(
   const runDir = getRunDir(runId, root);
   ensureRunDirs(runDir);
 
-  // Sanitize artifact name: no path traversal.
-  const safeName = artifactName.replace(/[^a-zA-Z0-9._-]/g, "_");
+  // Sanitize artifact name: no path traversal, no dot-only escape.
+  const safeName = sanitizeArtifactName(artifactName);
   const dir = join(runDir, PHASE_DIRS[phase]);
   const filePath = join(dir, safeName);
   writeFileSync(filePath, content, "utf8");
@@ -247,7 +260,7 @@ export function scratchpad_read(
   projectRoot?: string,
 ): string | null {
   const root = projectRoot ?? detectWorkspaceRoot();
-  const safeName = artifactName.replace(/[^a-zA-Z0-9._-]/g, "_");
+  const safeName = sanitizeArtifactName(artifactName);
   const filePath = join(getRunDir(runId, root), PHASE_DIRS[phase], safeName);
   if (!existsSync(filePath)) return null;
   return readFileSync(filePath, "utf8");

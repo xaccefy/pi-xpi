@@ -672,6 +672,57 @@ describe("casefile sqlite ledger", () => {
     assert.ok(!existsSync(path), "report file not yet written (reporter writes it)");
   });
 
+  it("writeCaseContext surfaces a run whose artifacts name the case even when phase_ids are empty", () => {
+    const record = addCase({
+      title: "Gate-by-filename",
+      status: "investigating",
+      evidence: "Observed leak",
+      confidence: "medium",
+    });
+    updateCaseResult(record.id, {
+      confidence: "high",
+      severity: "medium",
+      poc: "/tmp/gate-poc.sh",
+      impact: "Token leak",
+      evidence: "Observed leak",
+      target: "example-app",
+      disconfirmation: "Tried to disprove; could not.",
+    });
+    promoteFindingResult(record.id, {
+      path: "/tmp/gate-poc.sh",
+      exitCode: 0,
+      ranAt: "2024-01-01T00:00:00Z",
+      sandbox: true,
+    });
+
+    // Run checkpointed with NO ids (recon/hunt often record none), but the
+    // artifact filename itself carries the case id — must still surface.
+    setScratchpadRoot(tempDir);
+    scratchpad_init("run-gate-2026", tempDir);
+    scratchpad_checkpoint(
+      "run-gate-2026",
+      "skeptic",
+      { ids: [], summary: "no ids recorded" },
+      tempDir,
+    );
+    scratchpad_write(
+      "run-gate-2026",
+      "skeptic",
+      `skeptic_${record.id}.json`,
+      JSON.stringify({ finding_id: record.id, verdict: "CONFIRMED" }),
+      tempDir,
+    );
+
+    const { contextPath } = writeCaseContext(record.id);
+    const context = readFileSync(contextPath, "utf8");
+    assert.ok(context.includes("## Pipeline Artifacts"), "pipeline artifacts section");
+    assert.ok(context.includes("run-gate-2026"), "run included despite empty phase_ids");
+    assert.ok(
+      context.includes(`skeptic_${record.id}.json`),
+      "artifact named after the case is surfaced",
+    );
+  });
+
   it("writeCaseContext rejects non-confirmed cases", () => {
     const hyp = addCase({ title: "Lead", status: "hypothesis", evidence: "x" });
     const inv = addCase({

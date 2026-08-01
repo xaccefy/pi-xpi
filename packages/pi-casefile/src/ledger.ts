@@ -1577,7 +1577,13 @@ function buildScratchpadSection(caseId: string): string {
     const resume = scratchpad_resume(entry.name);
     if (!resume) continue;
     const allIds = Object.values(resume.checkpoint.phase_ids ?? {}).flat() as string[];
-    if (!allIds.includes(caseId)) continue;
+    // Gate on the case id appearing in phase_ids OR in any artifact filename —
+    // checkpoint ids are often empty for recon/hunt, while artifact names like
+    // skeptic_case_<id>.json / trace_case_<id>.json are equally valid evidence.
+    const namedInArtifact = Object.values(resume.artifacts)
+      .flat()
+      .some((n) => n.includes(caseId));
+    if (!allIds.includes(caseId) && !namedInArtifact) continue;
 
     sections.push(`### Run: ${entry.name} (project root: ${resume.checkpoint.project_root})`);
     for (const phase of CONTEXT_PHASES) {

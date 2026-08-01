@@ -279,4 +279,38 @@ describe("pipeline_submit", () => {
     const back = scratchpad_read("run-1", "skeptic", "skeptic_case_9.json");
     assert.ok(back?.includes("CONFIRMED"));
   });
+
+  it('junk ids ("false") never merge distinct findings into one artifact or repair bucket', () => {
+    withRealFile({});
+    // Two DISTINCT findings that both claim finding_id "false" (observed in a
+    // real run: every submission keyed hunt:false). They must get distinct
+    // content-hash keys and distinct artifacts — no last-write-wins clobber.
+    const a = pipeline_submit("run-1", "hunt", {
+      ...VALID_HUNT,
+      vuln_class: "injection",
+      sink: "db.query(a)",
+      finding_id: "false",
+    });
+    const b = pipeline_submit("run-1", "hunt", {
+      ...VALID_HUNT,
+      vuln_class: "xss",
+      sink: "innerHTML(b)",
+      finding_id: "false",
+    });
+    assert.strictEqual(a.verdict, "accepted");
+    assert.strictEqual(b.verdict, "accepted");
+    assert.notStrictEqual(a.key, b.key, "distinct findings must not share a key");
+    assert.notStrictEqual(a.artifact, b.artifact, "distinct findings must not share an artifact");
+    assert.ok(a.artifact && !a.artifact.includes(":"), "artifact name sanitized (no colon)");
+    const aBack = scratchpad_read("run-1", "hunt", (a.artifact ?? "").split("/").pop() ?? "");
+    const bBack = scratchpad_read("run-1", "hunt", (b.artifact ?? "").split("/").pop() ?? "");
+    assert.ok(aBack?.includes("db.query(a)"), "first artifact content preserved");
+    assert.ok(bBack?.includes("innerHTML(b)"), "second artifact content preserved");
+
+    // Same junk id on a REJECTED (unparseable) submission no longer shares the
+    // repair budget with the accepted ones.
+    const bad = pipeline_submit("run-1", "hunt", "not json{");
+    assert.strictEqual(bad.repair_attempt, 1);
+    assert.strictEqual(bad.key, "hunt:unparseable");
+  });
 });

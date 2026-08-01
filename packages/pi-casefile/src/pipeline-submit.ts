@@ -251,11 +251,20 @@ function parseOutput(output: unknown): { obj?: Record<string, unknown>; error?: 
 }
 
 /** Stable repair-bucket key for a submission. */
+/** Placeholder-y ids that carry no identity (observed in the wild: every
+ * submission in a run keyed "false"). Trusting them makes distinct findings
+ * share one key — one artifact name, one repair-budget bucket — so the last
+ * write clobbers the rest. Fall back to the content hash instead. */
+const JUNK_ID_RE =
+  /^(false|true|null|none|undefined|n\/?a|na|unknown|missing|empty|todo|tbd|pending|not-set)$/i;
+
 function submissionKey(stage: SubmitStage, obj: Record<string, unknown>): string {
+  const candidate =
+    (typeof obj.finding_id === "string" && obj.finding_id.trim()) ||
+    (typeof obj.title === "string" && obj.title.trim()) ||
+    (typeof obj.id === "string" && obj.id.trim());
   const id =
-    (typeof obj.finding_id === "string" && obj.finding_id) ||
-    (typeof obj.title === "string" && obj.title) ||
-    (typeof obj.id === "string" && obj.id);
+    candidate && candidate.length >= 3 && !JUNK_ID_RE.test(candidate) ? candidate : undefined;
   const tail = id ?? createHash("sha1").update(JSON.stringify(obj)).digest("hex").slice(0, 8);
   return `${stage}:${tail}`;
 }

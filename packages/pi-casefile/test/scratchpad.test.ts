@@ -102,6 +102,20 @@ describe("scratchpad", () => {
     assert.ok(existsSync(join(tempDir, ".scratchpad", "https___target.example.com_api")));
   });
 
+  it("rejects dot-only artifact names on write and read (no EISDIR escape)", () => {
+    scratchpad_init("run-1");
+    assert.throws(() => scratchpad_write("run-1", "recon", "..", "x"), /Invalid artifact name/);
+    assert.throws(() => scratchpad_write("run-1", "recon", ".", "x"), /Invalid artifact name/);
+    assert.throws(() => scratchpad_read("run-1", "recon", ".."), /Invalid artifact name/);
+    // Sanitized-to-dot-only also rejected; nothing written.
+    assert.throws(() => scratchpad_write("run-1", "recon", "...", "x"), /Invalid artifact name/);
+    assert.strictEqual(
+      readdirSync(join(getRunDir("run-1"), "recon")).length,
+      0,
+      "no artifact written",
+    );
+  });
+
   it("list returns artifacts for a phase", () => {
     scratchpad_init("run-1");
     scratchpad_write("run-1", "trace", "a.json", "a");
