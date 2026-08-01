@@ -41,6 +41,20 @@ describe("readXpMode / writeXpMode", () => {
     expect(readXpMode("false", path)).toBe("off");
   });
 
+  it("supports lite mode via env and file", () => {
+    const path = tempStatePath();
+    expect(readXpMode("lite", path)).toBe("lite");
+    // env lite overrides an on/off file
+    writeFileSync(path, "on", "utf8");
+    expect(readXpMode("lite", path)).toBe("lite");
+    // file lite is read when env is unset
+    writeXpMode("lite", path);
+    expect(readFileSync(path, "utf8")).toBe("lite");
+    expect(readXpMode("", path)).toBe("lite");
+    // env on overrides a lite file
+    expect(readXpMode("on", path)).toBe("on");
+  });
+
   it("reads persisted file when env unset", () => {
     const path = tempStatePath();
     writeXpMode("on", path);
@@ -64,5 +78,14 @@ describe("parseXpModeArg", () => {
     expect(parseXpModeArg("", "off")).toBe("on");
     expect(parseXpModeArg("  ", "on")).toBe("off");
     expect(parseXpModeArg("nope", "off")).toBe("on");
+  });
+
+  it("accepts lite explicitly but never toggles into it", () => {
+    expect(parseXpModeArg("lite", "off")).toBe("lite");
+    expect(parseXpModeArg("LITE", "on")).toBe("lite");
+    expect(parseXpModeArg("lite", "lite")).toBe("lite");
+    // bare /xp from lite toggles to on (off is skipped: lite -> on -> off)
+    expect(parseXpModeArg("", "lite")).toBe("on");
+    expect(parseXpModeArg("", "on")).toBe("off");
   });
 });

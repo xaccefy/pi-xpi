@@ -11,6 +11,7 @@ dist/
 
 # Pi agent local data
 .pi/
+.pi-subagents/
 
 # Casefile local database
 .casefile/

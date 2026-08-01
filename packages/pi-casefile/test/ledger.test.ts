@@ -1,13 +1,13 @@
 import assert from "node:assert";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-
 import {
   addCaseResult,
   assertPromotable,
+  getCasefilePath,
   linkCasesResult,
   promoteFindingResult,
   readCasefile,
@@ -15,8 +15,14 @@ import {
   setCasefilePath,
   unlinkCasesResult,
   updateCaseResult,
-  writeCaseReport,
+  writeCaseContext,
 } from "../src/ledger.ts";
+import {
+  scratchpad_checkpoint,
+  scratchpad_init,
+  scratchpad_write,
+  setScratchpadRoot,
+} from "../src/scratchpad.ts";
 
 const addCase = (input: Parameters<typeof addCaseResult>[0]) => {
   const res = addCaseResult(input);
@@ -34,10 +40,45 @@ beforeEach(async () => {
 
 afterEach(async () => {
   setCasefilePath(undefined);
+  setScratchpadRoot(undefined);
   await rm(tempDir, { recursive: true, force: true });
 });
 
 describe("casefile sqlite ledger", () => {
+  it("whitespace-only PI_CASEFILE_PATH falls through to the default ledger path", () => {
+    // Regression: truthiness was checked on the raw env value, so "   " passed
+    // and resolve("") returned the process cwd (a directory) — every tool call
+    // then failed with "unable to open database file".
+    setCasefilePath(undefined);
+    const previous = process.env.PI_CASEFILE_PATH;
+    try {
+      process.env.PI_CASEFILE_PATH = "   ";
+      const p = getCasefilePath();
+      assert.ok(
+        p.endsWith(join(".pi", "casefile.db")),
+        `whitespace env must fall back to the workspace default, got: ${p}`,
+      );
+      assert.notEqual(p, process.cwd());
+    } finally {
+      if (previous === undefined) delete process.env.PI_CASEFILE_PATH;
+      else process.env.PI_CASEFILE_PATH = previous;
+      setCasefilePath(ledgerPath);
+    }
+  });
+
+  it("PI_CASEFILE_PATH is honored after trimming", () => {
+    setCasefilePath(undefined);
+    const previous = process.env.PI_CASEFILE_PATH;
+    try {
+      process.env.PI_CASEFILE_PATH = ` ${ledgerPath} `;
+      assert.strictEqual(getCasefilePath(), ledgerPath);
+    } finally {
+      if (previous === undefined) delete process.env.PI_CASEFILE_PATH;
+      else process.env.PI_CASEFILE_PATH = previous;
+      setCasefilePath(ledgerPath);
+    }
+  });
+
   it("adds cases with defaults and persists them in sqlite", () => {
     const record = addCase({
       title: " SSRF candidate ",
@@ -101,6 +142,180 @@ describe("casefile sqlite ledger", () => {
     assert.strictEqual(dupe.created, false);
     assert.strictEqual(dupe.record.id, first.record.id);
     assert.strictEqual(readCasefile().length, 1);
+  });
+
+  it("catches near-duplicates from parallel subagent phrasings (same target, overlapping title)", () => {
+    // Regression: parallel subagents phrase the same finding differently, so a
+    // 30-case run produced several re-writes of one bug. Calibrated against the
+    // real js-iam run: these share 4-6 significant tokens, distinct findings 1-2.
+    const first = addCaseResult({
+      title:
+        "IAM middleware: global userCache keyed only by email:service — cross-environment/tenant permission reuse",
+      target: "kiwicom/js-iam-middleware",
+      evidence: "probe",
+    });
+    assert.strictEqual(first.created, true);
+
+    const rephrased = addCaseResult({
+      title:
+        "userCache key omits iamURL/iamToken/tenant — cross-environment permission cache collision",
+      target: "kiwicom/js-iam-middleware",
+      evidence: "probe",
+    });
+    assert.strictEqual(rephrased.created, false);
+    assert.strictEqual(rephrased.record.id, first.record.id);
+    assert.match(rephrased.reason ?? "", /near-duplicate/i);
+
+    // A different bug (directive config) must pair against its OWN group, not
+    // the usercache case — only "cross" is shared between the two groups.
+    const directive = addCaseResult({
+      title:
+        "AuthorizationDirective static config contamination — last authorizationDirective() call wins for ALL schemas",
+      target: "kiwicom/js-iam-middleware",
+      evidence: "probe",
+    });
+    assert.strictEqual(directive.created, true);
+
+    const directiveRephrased = addCaseResult({
+      title:
+        "IAM middleware: AuthorizationDirective static config — second directive registration overwrites first (cross-schema authz contamination)",
+      target: "kiwicom/js-iam-middleware",
+      evidence: "probe",
+    });
+    assert.strictEqual(directiveRephrased.created, false);
+    assert.strictEqual(directiveRephrased.record.id, directive.record.id);
+    assert.match(directiveRephrased.reason ?? "", /near-duplicate/i);
+  });
+
+  it("does not near-merge distinct findings or different targets", () => {
+    const a = addCaseResult({
+      title: "Reflected XSS in search endpoint via q parameter",
+      target: "shop.example.test",
+      evidence: "probe",
+    });
+    assert.strictEqual(a.created, true);
+
+    // Same target, distinct bug: only 1-2 shared tokens — must be allowed.
+    const b = addCaseResult({
+      title: "CSRF on password change endpoint",
+      target: "shop.example.test",
+      evidence: "probe",
+    });
+    assert.strictEqual(b.created, true);
+
+    // Same bug + shared words, but different target: must be allowed.
+    const c = addCaseResult({
+      title:
+        "IAM middleware: global userCache keyed only by email:service — cross-environment/tenant permission reuse",
+      target: "another-target",
+      evidence: "probe",
+    });
+    assert.strictEqual(c.created, true);
+  });
+
+  it("update blocked when it would near-duplicate an existing case", () => {
+    addCaseResult({
+      title: "OAuth dev callback CSRF: no state param, no origin check",
+      target: "api.example.test",
+      evidence: "probe",
+    });
+    const second = addCaseResult({
+      title: "Rate limit missing on login endpoint",
+      target: "api.example.test",
+      evidence: "probe",
+    });
+    assert.strictEqual(second.created, true);
+
+    const res = updateCaseResult(second.record.id, {
+      title: "OAuth callback CSRF/race in generate-iap-token: missing state + first-callback-wins",
+      target: "api.example.test",
+    });
+    assert.strictEqual(res.changed, false);
+    assert.match(res.reason ?? "", /near-duplicate/i);
+  });
+
+  it("near-dup boundary: 2 shared tokens or stopword-only overlap does NOT fire; 3 fires", () => {
+    // Distinctive tokens only (stopwords are suppressed): alpha/bravo/… are
+    // made-up 5+ char words so the counts are exact.
+    const base = addCaseResult({
+      title: "alpha bravo charlie delta",
+      target: "boundary.test",
+      evidence: "probe",
+    });
+    assert.strictEqual(base.created, true);
+
+    // Exactly 2 shared distinctive tokens (alpha, bravo) → distinct finding.
+    const two = addCaseResult({
+      title: "alpha bravo echo foxtrot",
+      target: "boundary.test",
+      evidence: "probe",
+    });
+    assert.strictEqual(two.created, true);
+
+    // Exactly 3 shared (alpha, bravo, charlie) → near-duplicate.
+    const three = addCaseResult({
+      title: "alpha bravo charlie foxtrot",
+      target: "boundary.test",
+      evidence: "probe",
+    });
+    assert.strictEqual(three.created, false);
+    assert.match(three.reason ?? "", /near-duplicate/i);
+  });
+
+  it("near-dup does not fire on stopword-only overlap or empty targets", () => {
+    const first = addCaseResult({
+      title: "Remote code execution in image processing",
+      target: "app.test",
+      evidence: "probe",
+    });
+    assert.strictEqual(first.created, true);
+
+    // All shared words are suppressed stopwords (remote/code/execution/processing).
+    const stopwordOnly = addCaseResult({
+      title: "Remote code execution in PDF processing",
+      target: "app.test",
+      evidence: "probe",
+    });
+    assert.strictEqual(stopwordOnly.created, true);
+
+    // Same class words, but no target on either side → must not near-merge.
+    const noTarget = addCaseResult({
+      title: "Remote code execution in video processing",
+      target: "",
+      evidence: "probe",
+    });
+    assert.strictEqual(noTarget.created, true);
+  });
+
+  it("reported cases are excluded from the duplicate scan (follow-up case allowed)", () => {
+    const original = addCase({
+      title: "Stored XSS in chat",
+      status: "investigating",
+      evidence: "payload renders",
+      confidence: "high",
+      impact: "script execution",
+      severity: "high",
+      target: "chat.test",
+      poc: "repro",
+      disconfirmation: "tried, held",
+    });
+    promoteFindingResult(original.id, {
+      path: "/tmp/poc.sh",
+      exitCode: 0,
+      ranAt: "2024-01-01T00:00:00Z",
+      sandbox: true,
+    });
+    const { path } = writeCaseContext(original.id);
+    writeFileSync(path, "# Report\n", "utf8");
+    updateCaseResult(original.id, { status: "reported" });
+
+    // An exact duplicate of a REPORTED case is a new follow-up case, not a merge.
+    const followUp = addCaseResult({
+      title: "Stored XSS in chat",
+      target: "chat.test",
+      evidence: "recurred after patch",
+    });
+    assert.strictEqual(followUp.created, true);
   });
 
   it("assertPromotable gates cheaply before any PoC run", () => {
@@ -279,8 +494,10 @@ describe("casefile sqlite ledger", () => {
       ranAt: "2024-01-01T00:00:00Z",
       sandbox: true,
     });
-    // CaseReport writes reportPath before status can advance to reported.
-    writeCaseReport(live.id);
+    // CaseContext records reportPath; the report writer then creates the file
+    // (the confirmed→reported gate requires it on disk).
+    const { path } = writeCaseContext(live.id);
+    writeFileSync(path, "# Report\n", "utf8");
     updateCaseResult(live.id, { status: "reported" });
     assert.throws(
       () => updateCaseResult(live.id, { summary: "should not stick" }),
@@ -343,12 +560,14 @@ describe("casefile sqlite ledger", () => {
     assert.strictEqual(page.cases.length, 1);
   });
 
-  it("writeCaseReport includes the disconfirmation attempt and verification log", () => {
+  it("writeCaseContext includes the disconfirmation attempt and verification log", () => {
     const record = addCase({
       title: "IDOR with disconfirmation",
       status: "investigating",
       evidence: "Observed sequential IDs",
       confidence: "medium",
+      tags: ["pipeline-2026"],
+      nextStep: "Chain with the export endpoint",
     });
     updateCaseResult(record.id, {
       confidence: "high",
@@ -366,23 +585,107 @@ describe("casefile sqlite ledger", () => {
       ranAt: "2024-01-01T00:00:00Z",
       sandbox: true,
     });
-    const { path } = writeCaseReport(record.id);
-    const report = readFileSync(path, "utf8");
+
+    // A chain step, linked in, so the context records the chain relationship.
+    const chainStep = addCaseResult({
+      title: "Chain: export endpoint leaks session token",
+      status: "investigating",
+      evidence: "Observed token in export response",
+      confidence: "medium",
+    });
+    linkCasesResult(record.id, chainStep.record.id, "depends-on");
+    linkCasesResult(chainStep.record.id, record.id, "related");
+
+    // A scratchpad run that produced this case: recon map + trace output.
+    setScratchpadRoot(tempDir);
+    scratchpad_init("run-idor-2026", tempDir);
+    scratchpad_checkpoint(
+      "run-idor-2026",
+      "recon",
+      { ids: [record.id], summary: "surface mapped" },
+      tempDir,
+    );
+    scratchpad_write(
+      "run-idor-2026",
+      "recon",
+      "entry-points.md",
+      "# Entry points\n- GET /exports/{id} (unauth probe observed)",
+      tempDir,
+    );
+    // A SECOND run belonging to a different case must be excluded from the
+    // bundle, plus a corrupt-state run dir that must be skipped, not crash.
+    scratchpad_init("run-other-2026", tempDir);
+    scratchpad_checkpoint(
+      "run-other-2026",
+      "recon",
+      { ids: [chainStep.record.id], summary: "other surface" },
+      tempDir,
+    );
+    scratchpad_write(
+      "run-other-2026",
+      "recon",
+      "entry-points.md",
+      "# OTHER run — must NOT appear in this context",
+      tempDir,
+    );
+    const runDir = join(tempDir, ".scratchpad", "run-corrupt-2026");
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, "state.json"), "{ not json", "utf8");
+
+    const { path, contextPath } = writeCaseContext(record.id);
+    const context = readFileSync(contextPath, "utf8");
+    // The context bundle carries the full audit trail…
     assert.ok(
-      report.includes("## Disconfirmation Attempt"),
-      "report must include the disconfirmation text section",
+      context.includes("## Disconfirmation Attempt"),
+      "context must include the disconfirmation text section",
     );
     assert.ok(
-      report.includes("Attempted to access own export without auth"),
-      "report must include the disconfirmation body",
+      context.includes("Attempted to access own export without auth"),
+      "context must include the disconfirmation body",
     );
-    // Path-leak guard: the report must show only the script basename, never the
-    // absolute filesystem path (which leaks the researcher's local layout).
-    assert.ok(report.includes("idor-poc.py"), "report must include the PoC script basename");
+    // …the complete record (every field, incl. tags/nextStep/timestamps)…
+    assert.ok(context.includes("## Complete Case Record (all fields)"), "complete record section");
+    assert.ok(context.includes("pipeline-2026"), "tags in complete record");
+    assert.ok(context.includes("Chain with the export endpoint"), "nextStep in complete record");
+    // …linked cases in both directions…
+    assert.ok(context.includes("## Linked Cases"), "linked cases section");
+    assert.ok(context.includes(chainStep.record.id), "chain-step case id in links");
+    assert.ok(context.includes("depends-on"), "link kind in links");
+    // …and the pipeline artifacts from the scratchpad run…
+    assert.ok(context.includes("## Pipeline Artifacts"), "pipeline artifacts section");
+    assert.ok(context.includes("run-idor-2026"), "scratchpad run id in context");
+    assert.ok(context.includes("entry-points.md"), "recon artifact listed");
+    assert.ok(context.includes("GET /exports/{id}"), "recon artifact content included");
     assert.ok(
-      !report.includes("/workspace/idor-poc.py"),
-      "report must NOT leak the absolute PoC path",
+      !context.includes("run-other-2026"),
+      "other run's artifacts excluded (belongs to a different case)",
     );
+    assert.ok(!context.includes("OTHER run"), "other run's artifact content excluded");
+    // Path-leak guard: only the PoC basename, never the absolute path.
+    assert.ok(context.includes("idor-poc.py"), "context must include the PoC script basename");
+    assert.ok(
+      !context.includes("/workspace/idor-poc.py"),
+      "context must NOT leak the absolute PoC path",
+    );
+    // The report path is reserved for the reporter agent; the report file does
+    // not exist until the reporter writes it.
+    assert.ok(!existsSync(path), "report file not yet written (reporter writes it)");
+  });
+
+  it("writeCaseContext rejects non-confirmed cases", () => {
+    const hyp = addCase({ title: "Lead", status: "hypothesis", evidence: "x" });
+    const inv = addCase({
+      title: "Active",
+      status: "investigating",
+      evidence: "x",
+      confidence: "low",
+    });
+    assert.throws(() => writeCaseContext(hyp.id), /confirmed or reported/i);
+    assert.throws(() => writeCaseContext(inv.id), /confirmed or reported/i);
+
+    const killed = addCaseResult({ title: "Dead", status: "hypothesis", evidence: "x" });
+    updateCaseResult(killed.record.id, { status: "killed", assumptions: ["intended_behavior"] });
+    assert.throws(() => writeCaseContext(killed.record.id), /confirmed or reported/i);
   });
 
   it("demoting confirmed → investigating clears both pocVerified and disconfirmationVerified", () => {

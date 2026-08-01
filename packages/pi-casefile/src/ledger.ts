@@ -11,8 +11,14 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { type Dirent, existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
+import {
+  getScratchpadRoot,
+  type ScratchpadPhase,
+  scratchpad_read,
+  scratchpad_resume,
+} from "./scratchpad.ts";
 import { DatabaseSync } from "./sqlite-compat/index.ts";
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -119,9 +125,9 @@ export type CaseRecord = {
     output?: string;
     sandbox: boolean;
   };
-  /** ISO timestamp when CaseReport first wrote the markdown report. */
+  /** ISO timestamp when CaseContext first wrote the context bundle. */
   reportedAt?: string;
-  /** Path to the generated markdown report (set only by writeCaseReport). */
+  /** Path to the final report file (set by writeCaseContext; the reporter agent writes the file). */
   reportPath?: string;
   /** Flat list of linked case IDs (back-compat; derived from linkedCases). */
   linkedCaseIds: string[];
@@ -486,10 +492,13 @@ function validateCase(record: CaseRecord): void {
       "Killed cases require evidence, next step, blockers, or assumptions explaining why",
     );
   }
-  // A case becomes REPORTED only via CaseReport, which records reportPath. Require it
-  // here so validation stays consistent with the confirmed→reported transition gate.
-  if (record.status === "reported" && !record.reportPath) {
-    throw new Error("Reported cases require a generated report (run CaseReport first)");
+  // A case becomes REPORTED only after the report FILE exists on disk (the
+  // report writer writes it at the path CaseContext recorded). Require both
+  // here so validation stays consistent with the confirmed→reported gate.
+  if (record.status === "reported" && (!record.reportPath || !existsSync(record.reportPath))) {
+    throw new Error(
+      "Reported cases require the report file on disk; run CaseContext then have the report writer create it",
+    );
   }
 }
 
@@ -541,8 +550,8 @@ function validateTransition(
     },
     confirmed: {
       reported: (_, current) =>
-        !current?.reportPath
-          ? "confirmed → reported requires a report; run CaseReport first"
+        !current?.reportPath || !existsSync(current.reportPath)
+          ? "confirmed → reported requires the report file on disk; run CaseContext, then have the report writer create it"
           : null,
       investigating: () => null,
     },
@@ -623,7 +632,7 @@ function findDuplicateCaseInDb(
   db: DatabaseSync,
   candidate: Pick<CaseRecord, "title" | "target" | "endpoint" | "bugClass">,
   excludeId?: string,
-): CaseRecord | undefined {
+): { record: CaseRecord; near: boolean } | undefined {
   const title = normalizeMatchText(candidate.title);
   if (!title) return undefined;
 
@@ -636,12 +645,14 @@ function findDuplicateCaseInDb(
   // ASCII-only and LIKE can't collapse whitespace, so any SQL pre-filter would
   // silently drop rows the JS comparator would call duplicates (e.g. stored
   // "SQL  Injection" vs candidate "SQL Injection", or non-ASCII case variants).
-  // Case ledgers are small (hundreds of rows); a full non-killed scan is cheap.
+  // Case ledgers are small (hundreds of rows); a full scan of live rows is cheap.
+  // Reported rows are excluded: they are terminal — an exact/near duplicate of a
+  // reported case is a NEW follow-up case, not a merge target.
   const rows = excludeId
     ? (db
-        .prepare("SELECT * FROM cases WHERE status != 'killed' AND id != ?")
+        .prepare("SELECT * FROM cases WHERE status NOT IN ('killed', 'reported') AND id != ?")
         .all(excludeId) as any[])
-    : (db.prepare("SELECT * FROM cases WHERE status != 'killed'").all() as any[]);
+    : (db.prepare("SELECT * FROM cases WHERE status NOT IN ('killed', 'reported')").all() as any[]);
 
   for (const row of rows) {
     if (
@@ -650,16 +661,210 @@ function findDuplicateCaseInDb(
       normalizeMatchText(row.endpoint as string) === endpoint &&
       normalizeMatchText(row.bugClass as string) === bugClass
     ) {
-      const links = db
-        .prepare("SELECT target_id, kind FROM case_links WHERE source_id = ?")
-        .all(row.id) as { target_id: string; kind: string }[];
-      return mapRow(
-        row,
-        links.map((l) => ({ id: l.target_id, kind: l.kind })),
-      );
+      return { record: rowToRecord(db, row), near: false };
     }
   }
+
+  // Near-duplicate gate: parallel subagents re-phrase the same finding
+  // (different prefixes, order, or extra detail), so exact normalized titles
+  // miss most duplicates. When BOTH sides have the same non-empty target and
+  // the titles share enough significant tokens (≥5-char words, stopwords
+  // excluded), treat it as the same case — the agent should CaseUpdate the
+  // existing case instead of creating a 31st near-identical one. Calibrated
+  // against a real 30-case run: true near-dups shared 3–6 distinctive tokens.
+  // The non-empty-target requirement is deliberate: with no target, titles
+  // share only generic class vocabulary ("remote code execution in image vs
+  // PDF processing") and near-dup would false-merge distinct findings.
+  const candidateTokens = new Set(significantTitleTokens(title));
+  if (target && candidateTokens.size >= 3) {
+    for (const row of rows) {
+      const rowTarget = normalizeMatchText(row.target as string);
+      if (!rowTarget || rowTarget !== target) continue;
+      const shared = countSharedTokens(
+        candidateTokens,
+        significantTitleTokens(row.title as string),
+      );
+      if (shared >= NEAR_DUP_MIN_SHARED_TOKENS) {
+        return { record: rowToRecord(db, row), near: true };
+      }
+    }
+  }
+
   return undefined;
+}
+
+// ── Near-duplicate title comparison ───────────────────────────────────
+// Subagent titles phrase the same finding differently, so dedup must survive
+// re-wording. Tokens are ≥5-char words from the lowercased, punctuation-split
+// title, minus a small stopword set ("middleware", "pipeline", …). Two cases
+// with the same target that share ≥3 significant tokens are near-duplicates.
+
+const NEAR_DUP_MIN_SHARED_TOKENS = 3;
+
+const TITLE_STOPWORDS = new Set([
+  // structural / workflow words
+  "middleware",
+  "middlewares",
+  "pipeline",
+  "finding",
+  "findings",
+  "vulnerability",
+  "vulnerabilities",
+  "issue",
+  "issues",
+  "result",
+  "results",
+  "causes",
+  "cause",
+  "leads",
+  "lead",
+  // connective / generic
+  "allows",
+  "allow",
+  "using",
+  "without",
+  "because",
+  "through",
+  "within",
+  "across",
+  "via",
+  "with",
+  "after",
+  "before",
+  "from",
+  "into",
+  "that",
+  "this",
+  "there",
+  "their",
+  "when",
+  "where",
+  "which",
+  "what",
+  "does",
+  "doesn",
+  "has",
+  "have",
+  "been",
+  "being",
+  "not",
+  "only",
+  "other",
+  "another",
+  "more",
+  "most",
+  "some",
+  "any",
+  "and",
+  "the",
+  "for",
+  "are",
+  "was",
+  "were",
+  "but",
+  "can",
+  "could",
+  "would",
+  "should",
+  "might",
+  // generic security-report vocabulary — class and filler words that appear in
+  // nearly every finding title; suppressing them makes the gate count only the
+  // distinctive subject (the trigger/location), which is what separates
+  // re-phrasings of one bug from different bugs in the same class.
+  "endpoint",
+  "endpoints",
+  "arbitrary",
+  "file",
+  "files",
+  "folder",
+  "folders",
+  "execution",
+  "execute",
+  "processing",
+  "process",
+  "remote",
+  "stored",
+  "blind",
+  "boolean",
+  "based",
+  "account",
+  "accounts",
+  "takeover",
+  "admin",
+  "administrator",
+  "administrators",
+  "request",
+  "requests",
+  "response",
+  "responses",
+  "parameter",
+  "parameters",
+  "input",
+  "inputs",
+  "value",
+  "values",
+  "user",
+  "users",
+  "data",
+  "access",
+  "page",
+  "pages",
+  "report",
+  "reports",
+  "code",
+  "script",
+  "scripts",
+  "injection",
+  "injections",
+  "leak",
+  "leaks",
+  "leaking",
+  "expose",
+  "exposes",
+  "exposed",
+  "exposure",
+  "disclose",
+  "discloses",
+  "disclosed",
+  "disclosure",
+  "bypass",
+  "bypasses",
+  "bypassing",
+  "bypassed",
+]);
+
+/** Significant (≥5-char, non-stopword) unique tokens of a title. */
+function significantTitleTokens(title: string): string[] {
+  const words = (title ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .split(" ")
+    .filter(Boolean);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const w of words) {
+    if (w.length >= 5 && !TITLE_STOPWORDS.has(w) && !seen.has(w)) {
+      seen.add(w);
+      out.push(w);
+    }
+  }
+  return out;
+}
+
+function countSharedTokens(a: Set<string>, b: string[]): number {
+  let n = 0;
+  for (const t of b) if (a.has(t)) n++;
+  return n;
+}
+
+function rowToRecord(db: DatabaseSync, row: any): CaseRecord {
+  const links = db
+    .prepare("SELECT target_id, kind FROM case_links WHERE source_id = ?")
+    .all(row.id) as { target_id: string; kind: string }[];
+  return mapRow(
+    row,
+    links.map((l) => ({ id: l.target_id, kind: l.kind })),
+  );
 }
 
 // ── SQLite Mutation Actions ───────────────────────────────────────────
@@ -749,9 +954,11 @@ export function addCaseResult(input: CaseInput): CaseAddResult {
   const duplicate = findDuplicateCaseInDb(db, record);
   if (duplicate) {
     return {
-      record: duplicate,
+      record: duplicate.record,
       created: false,
-      reason: `Duplicate case exists: ${duplicate.id}`,
+      reason: duplicate.near
+        ? `Near-duplicate of existing case ${duplicate.record.id} (same target, overlapping title) — continue with that case via CaseUpdate`
+        : `Duplicate case exists: ${duplicate.record.id}`,
     };
   }
 
@@ -860,7 +1067,9 @@ export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResu
     return {
       record: current,
       changed: false,
-      reason: `Update would create a duplicate of case ${duplicate.id}`,
+      reason: duplicate.near
+        ? `Update would near-duplicate case ${duplicate.record.id} (same target, overlapping title)`
+        : `Update would create a duplicate of case ${duplicate.record.id}`,
     };
   }
 
@@ -1283,16 +1492,123 @@ function mdSection(title: string, body?: string): string {
   return `## ${title}\n\n${body?.trim() || "Not recorded."}\n`;
 }
 
-export function writeCaseReport(id: string): { path: string; record: CaseRecord } {
+// ── Context bundle completeness ──────────────────────────────────────
+// The case context is the reporter agent's ONLY window into the run. It must
+// carry the full audit trail: every case field (including the investigation
+// trail in evidence/assumptions and the failed disconfirmation attempts), the
+// linked cases in BOTH directions (chains AND killed dead-ends), and the
+// pipeline artifacts (recon entry points, traces, skeptic verdicts, PoC logs)
+// from any scratchpad run that produced this case.
+
+const CONTEXT_PHASES: ScratchpadPhase[] = [
+  "recon",
+  "hunt",
+  "gapfil",
+  "trace",
+  "skeptic",
+  "validate",
+  "chain",
+  "patch",
+  "report",
+];
+
+/** Per-artifact content cap for the context bundle (generous; artifacts are small). */
+const MAX_ARTIFACT_CHARS = 100_000;
+
+function buildCompleteRecord(current: CaseRecord): string {
+  const rows: string[] = [];
+  for (const [k, v] of Object.entries(current)) {
+    if (v === undefined || v === null || v === "") continue;
+    let display = typeof v === "object" ? JSON.stringify(v, null, 2) : String(v);
+    // Path-leak guard: the verification objects carry the researcher's local
+    // PoC/disconfirmation script paths — show basenames only (the dedicated
+    // log sections below already render them as basenames).
+    if ((k === "pocVerified" || k === "disconfirmationVerified") && v && typeof v === "object") {
+      const redacted = {
+        ...(v as Record<string, unknown>),
+        path: basename((v as { path?: string }).path ?? ""),
+      };
+      display = JSON.stringify(redacted, null, 2);
+    }
+    rows.push(`- **${k}:** ${display.replace(/\n/g, "\n  ")}`);
+  }
+  return rows.join("\n");
+}
+
+/** All links touching this case, both directions, with the neighbor's state. */
+function buildCaseLinks(db: DatabaseSync, id: string): string {
+  const outgoing = db
+    .prepare("SELECT target_id, kind FROM case_links WHERE source_id = ?")
+    .all(id) as { target_id: string; kind: string }[];
+  const incoming = db
+    .prepare("SELECT source_id, kind FROM case_links WHERE target_id = ?")
+    .all(id) as { source_id: string; kind: string }[];
+  const lines: string[] = [];
+  for (const l of outgoing) {
+    const t = getCaseById(l.target_id);
+    lines.push(`- → ${l.target_id} [${l.kind}] ${t?.title ?? "?"} (${t?.status ?? "?"})`);
+  }
+  for (const l of incoming) {
+    const t = getCaseById(l.source_id);
+    lines.push(`- ← ${l.source_id} [${l.kind}] ${t?.title ?? "?"} (${t?.status ?? "?"})`);
+  }
+  return lines.length ? lines.join("\n") : "None.";
+}
+
+/**
+ * Pipeline artifacts from every scratchpad run whose checkpoint lists this
+ * case id — recon entry points, per-finding traces, skeptic verdicts, PoC
+ * logs, chain analysis. Missing runs/artifacts are stated, not silently
+ * dropped, so the reporter knows what was never recorded.
+ */
+function buildScratchpadSection(caseId: string): string {
+  const root = getScratchpadRoot();
+  if (!existsSync(root)) return "No scratchpad found (no pipeline run artifacts recorded).";
+  let entries: Dirent[] = [];
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return "Scratchpad root unreadable.";
+  }
+
+  const sections: string[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const resume = scratchpad_resume(entry.name);
+    if (!resume) continue;
+    const allIds = Object.values(resume.checkpoint.phase_ids ?? {}).flat() as string[];
+    if (!allIds.includes(caseId)) continue;
+
+    sections.push(`### Run: ${entry.name} (project root: ${resume.checkpoint.project_root})`);
+    for (const phase of CONTEXT_PHASES) {
+      const names = resume.artifacts[phase];
+      if (!names?.length) continue;
+      sections.push(`#### ${phase}/`);
+      for (const name of names) {
+        const content = scratchpad_read(entry.name, phase, name) ?? "(unreadable)";
+        const clipped =
+          content.length > MAX_ARTIFACT_CHARS
+            ? `${content.slice(0, MAX_ARTIFACT_CHARS)}\n… [truncated ${content.length - MAX_ARTIFACT_CHARS} chars]`
+            : content;
+        sections.push(`\`${name}\`:\n\`\`\`\n${clipped}\n\`\`\``);
+      }
+    }
+  }
+
+  return sections.length
+    ? sections.join("\n")
+    : "No scratchpad run found containing this case id (manual/CTF run without pipeline artifacts).";
+}
+
+export function writeCaseContext(id: string): {
+  path: string;
+  contextPath: string;
+  record: CaseRecord;
+} {
   const current = getCaseById(id);
   if (!current) throw new Error(`Case not found: ${id}`);
   if (current.status !== "confirmed" && current.status !== "reported") {
-    throw new Error("Case reports require a confirmed or reported case");
-  }
-
-  // Reported cases are terminal artifacts — return the existing report path if present.
-  if (current.status === "reported" && current.reportPath && existsSync(current.reportPath)) {
-    return { path: current.reportPath, record: current };
+    throw new Error("Case context requires a confirmed or reported case");
   }
 
   const db = getDb();
@@ -1307,7 +1623,16 @@ export function writeCaseReport(id: string): { path: string; record: CaseRecord 
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-+|-+$/g, "")
       .slice(0, 70) || "case";
-  const reportPath = join(reportDir, `${slug}-${current.id}.md`);
+  // The final report path: the reporter agent writes the polished report here.
+  // A previously recorded reportPath is kept stable across calls (the report
+  // file may already exist at it); otherwise derive the default.
+  const reportPath = current.reportPath ?? join(reportDir, `${slug}-${current.id}.md`);
+  // The context bundle: raw material for the report writer (evidence, logs,
+  // verification, timeline). Never cleaned up — it is the audit trail.
+  // ALWAYS regenerated fresh — serving a stored/derived bundle would silently
+  // return stale or fabricated content (e.g. legacy cases reported before the
+  // context bundle existed).
+  const contextPath = join(reportDir, `${slug}-${current.id}.context.md`);
   const references = current.references?.length
     ? current.references.map((r) => `- ${r}`).join("\n")
     : undefined;
@@ -1316,6 +1641,11 @@ export function writeCaseReport(id: string): { path: string; record: CaseRecord 
     : undefined;
   const body = [
     `# ${current.title}`,
+    "",
+    "> CASE CONTEXT — raw material for the report writer (reporter agent). Do not ship this file.",
+    `> Final report target: \`${basename(reportPath)}\` (write the polished report there).`,
+    `> Case ID: ${current.id} — strip ALL case IDs and local paths from the final report.`,
+    "",
     `**Severity:** ${current.severity ?? "Not assessed"}`,
     `**Status:** ${current.status}`,
     `**Confidence:** ${current.confidence}`,
@@ -1344,11 +1674,20 @@ export function writeCaseReport(id: string): { path: string; record: CaseRecord 
     mdSection("Remediation", current.remediation),
     mdSection("Assumptions and Uncertainty", assumptions),
     mdSection("References", references),
+    mdSection("Complete Case Record (all fields)", buildCompleteRecord(current)),
+    mdSection(
+      "Linked Cases (both directions, incl. killed dead-ends)",
+      buildCaseLinks(db, current.id),
+    ),
+    mdSection(
+      "Pipeline Artifacts (scratchpad: recon, traces, skeptic, logs)",
+      buildScratchpadSection(current.id),
+    ),
   ]
     .filter(Boolean)
     .join("\n");
 
-  writeFileSync(reportPath, body, "utf8");
+  writeFileSync(contextPath, body, "utf8");
 
   const next: CaseRecord = {
     ...current,
@@ -1357,11 +1696,11 @@ export function writeCaseReport(id: string): { path: string; record: CaseRecord 
     updatedAt: new Date().toISOString(),
   };
 
-  // Enforce the same field invariants as every other write path. writeCaseReport
+  // Enforce the same field invariants as every other write path. writeCaseContext
   // never changes status (confirmed stays confirmed; the caller flips to reported
   // via CaseUpdate, which runs validateTransition), but it does set reportPath —
   // validateCase ensures the resulting record is internally consistent.
   validateCase(next);
   upsertCase(db, next);
-  return { path: reportPath, record: next };
+  return { path: reportPath, contextPath, record: next };
 }

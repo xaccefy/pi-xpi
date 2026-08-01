@@ -15,7 +15,7 @@ Use Casefile to maintain durable security investigation state across agent turns
 3. Promote cases with CaseUpdate only after materially new evidence, proof, impact, blockers, remediation, or status changes.
 4. Mark `confirmed` only via PromoteFinding after a real PoC exit 0 (evidence, impact, severity, poc required).
 5. Use CaseLink and CaseUnlink for exploit chains. Do not edit linked case IDs directly.
-6. Use CaseReport only for confirmed or already reported cases, then CaseUpdate status=`reported`.
+6. Use CaseContext only for confirmed or already reported cases: it writes the full context bundle (complete record, verification logs, links, pipeline artifacts) and records the report path. Then have the report written (reporter agent in the full pipeline; yourself in lite mode) and CaseUpdate status=`reported`.
 7. Use `killed` for disproven, duplicate, or dead-end leads, and include evidence, blockers, next step, or assumptions explaining why.
 
 ## State machine
@@ -40,4 +40,4 @@ hypothesis → investigating → confirmed → reported
 - `CaseSearch`: search all fields or a scoped field.
 - `CaseLink`: bidirectionally link two cases.
 - `CaseUnlink`: remove a bidirectional case link.
-- `CaseReport`: write a markdown report for a confirmed or reported case.
+- `CaseContext`: write the case context bundle (complete record, PoC/disconfirmation logs, links, pipeline artifacts) for a confirmed or reported case and record the report path for the report writer.

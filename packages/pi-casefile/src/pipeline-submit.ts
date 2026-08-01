@@ -86,17 +86,6 @@ const VULN_CLASSES = [
   "other",
 ] as const;
 
-const KILL_REASONS = [
-  "unreachable",
-  "framework_protection",
-  "input_validation_blocks",
-  "requires_privilege_attacker_lacks",
-  "poc_failed_3x",
-  "no_real_impact",
-  "intended_behavior",
-  "duplicate",
-] as const;
-
 const SPECS: Record<SubmitStage, StageSpec> = {
   // schemas/stage-finding.json
   hunt: {

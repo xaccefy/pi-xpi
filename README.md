@@ -21,7 +21,7 @@ pi install npm:@xaccefy/pi-xpi
 | Variable | Package | Purpose |
 |----------|---------|---------|
 | `PREVIEW_IS_API_KEY` | webxp | Required for `exploit_search` ([preview.is](https://preview.is)) |
-| `PI_XP_MODE` | casefile | `on` / `off` — force casefile cyber-workflow injection |
+| `PI_XP_MODE` | casefile | `on` / `lite` / `off` — force casefile cyber-workflow injection (lite = single-agent, no subagent dispatch) |
 | `PI_CASEFILE_PATH` | casefile | Override SQLite ledger path |
 | `PI_WEBSEARCH_PORT` | webxp | open-websearch daemon port (default `3210`) |
 | `PI_CHROMIUM_PATH` | webxp | Chromium binary for SPA re-render in `web_fetch` |
@@ -43,12 +43,12 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 | CaseAdd / CaseUpdate / PromoteFinding | Ledger + hard PoC gate to confirm |
 | CaseGet / CaseList / CaseSearch | Browse cases |
 | CaseLink / CaseUnlink | Exploit chains |
-| CaseReport | Markdown report |
+| CaseContext | Case context bundle (complete record + artifacts) for the report writer |
 | PipelineSubmit | Stage-output validation gate: schema check + pre-filter + repair budget — stage can't advance on invalid output |
 | ScratchpadInit / Resume / Checkpoint | Crash-recoverable artifact store for pipeline runs |
 | ScratchpadWrite / Read / PhaseDone / Clear | Write, read, and resume pipeline artifacts |
 | /casefile | Case dashboard |
-| /xp | Toggle casefile **XP mode** (cyber workflow injection; **default OFF**) |
+| /xp | Toggle casefile **XP mode** (cyber workflow injection; `on` = subagent pipeline, `lite` = single-agent, **default OFF**) |
 | todo / /todos | Multi-step task lists |
 | fff (`ffgrep` / `fffind`) | Frecency-ranked file + content search; in `override` mode transparently upgrades pi's built-in `grep`/`find`. Installed by `install.sh`. |
 
@@ -56,15 +56,17 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 
 ```
 /xp on                                      # enable casefile cyber workflow in context
+/xp lite                                    # single-agent variant — no subagent dispatch
 ```
 
-Pi injects skill descriptions (`web-pentest`, `cyberwf`) into every session; the agent reads the full skill file when the task matches (e.g. "find bugs in X", "bug bounty Y"). Run `/xp on` for the full attacker discipline with casefile tracking.
+Pi injects skill descriptions (`web-pentest`, `cyberwf`) into every session; the agent reads the full skill file when the task matches (e.g. "find bugs in X", "bug bounty Y"). Run `/xp on` for the full attacker discipline with casefile tracking, or `/xp lite` for the same discipline done by the main agent alone (CTF / single-shot engagements).
 
 ## Skeptic + scratchpad
 
 The pipeline has two mechanisms that keep findings honest:
 
 - **Skeptic stage** — before a high-confidence finding reaches validation, a dedicated skeptic subagent independently re-reads the source (or re-probes the live endpoint) and tries to *disprove* it. If the skeptic finds a concrete reason the finding is false (a missed defense, an unreachable entry point, self-only impact), the finding is killed on the spot — no tie-breaker.
+- **Design & runtime check** — before CONFIRMED, every finding must survive a search for the design decision: docs/README, git history, changelog, and whether the runtime/framework version already mitigates the path. Documented intent → kill `intended_behavior`; runtime already blocks it → kill `framework_protection`; neither → the search notes become the non-intentionality evidence the report needs.
 - **Scratchpad** — a crash-recoverable artifact store. Each pipeline phase writes its intermediate output (recon maps, trace outputs, verification logs) to `.scratchpad/{run_id}/` instead of stuffing everything into casefile text fields. If a run crashes mid-pipeline, resume picks up from the last checkpoint without re-running completed phases.
 
 See `skills/cyberwf/SKILL.md` for the full stage machine and API.

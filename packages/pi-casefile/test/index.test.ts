@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { setCasefilePath } from "../src/ledger.ts";
+import { setScratchpadRoot } from "../src/scratchpad.ts";
+import { STATIC_CYBER_WORKFLOW, STATIC_CYBER_WORKFLOW_LITE } from "../src/workflow.ts";
 
 mock.module("@earendil-works/pi-ai", () => ({
   StringEnum: (values: readonly string[]) => ({ enum: values }),
@@ -79,14 +81,20 @@ async function executeTool(pi: FakePi, name: string, params: Record<string, unkn
 beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), "casefile-index-test-"));
   setCasefilePath(join(tempDir, "casefile.db"));
+  setScratchpadRoot(tempDir);
   pocScriptPath = join(tempDir, "poc.sh");
   writeFileSync(pocScriptPath, "#!/bin/sh\nprintf 'ok'", "utf8");
   process.env.PI_POC_ROOT = tempDir;
+  // Hermeticity: the before_agent_start handler skips injection when
+  // PI_SUBAGENT_CHILD=1 (the harness sets it when running inside pi-subagents);
+  // without this, the whole XP-mode suite fails under subagent execution.
+  delete process.env.PI_SUBAGENT_CHILD;
   casefileExtension = (await import("../src/index.ts")).default;
 });
 
 afterEach(async () => {
   setCasefilePath(undefined);
+  setScratchpadRoot(undefined);
   delete process.env.PI_POC_ROOT;
   await rm(tempDir, { recursive: true, force: true });
 });
@@ -98,10 +106,10 @@ describe("casefile extension", () => {
 
     expect([...pi.tools.keys()].sort()).toEqual([
       "CaseAdd",
+      "CaseContext",
       "CaseGet",
       "CaseLink",
       "CaseList",
-      "CaseReport",
       "CaseSearch",
       "CaseUnlink",
       "CaseUpdate",
@@ -189,12 +197,17 @@ describe("casefile extension", () => {
     expect(searched.details.total).toBe(1);
     expect(searched.details.cases[0].id).toBe(record.id);
 
-    const report = await executeTool(pi, "CaseReport", { id: record.id });
+    const report = await executeTool(pi, "CaseContext", { id: record.id });
     expect(report.details.path).toMatch(/sensitive-file-disclosure-case_[a-f0-9]{10}\.md$/);
+    expect(report.details.contextPath).toMatch(/\.context\.md$/);
 
-    const reportText = readFileSync(report.details.path, "utf8");
-    expect(reportText).toContain("PoC Verification Log");
-    expect(reportText).toContain("Output\n```\nok\n```");
+    // Rich content (verification logs, links, complete record) lives in the
+    // context bundle; the report path is reserved for the reporter agent.
+    const contextText = readFileSync(report.details.contextPath, "utf8");
+    expect(contextText).toContain("PoC Verification Log");
+    expect(contextText).toContain("Output\n```\nok\n```");
+    expect(contextText).toContain("Complete Case Record");
+    expect(contextText).toContain("Linked Cases");
   });
 
   test("PromoteFinding rejects a PoC that exits 0 but lacks the verification marker", async () => {
@@ -338,6 +351,28 @@ describe("casefile extension", () => {
     }
   });
 
+  test("XP mode lite: injects the single-agent workflow, not the full pipeline", async () => {
+    const previous = process.env.PI_XP_MODE;
+    process.env.PI_XP_MODE = "lite";
+    try {
+      const pi = createFakePi();
+      casefileExtension(pi as any);
+
+      const handler = pi.events.get("before_agent_start")?.[0];
+      expect(handler).toBeFunction();
+      const event = { systemPrompt: "existing prompt" };
+      const result = await handler(event);
+
+      expect(result.systemPrompt).toContain("existing prompt");
+      expect(result.systemPrompt).toContain("# Cyber Workflow — LITE (Single-Agent)");
+      expect(result.systemPrompt).toContain("Do NOT dispatch subagents");
+      expect(result.systemPrompt).not.toContain("Evidence-First Doctrine");
+    } finally {
+      if (previous === undefined) delete process.env.PI_XP_MODE;
+      else process.env.PI_XP_MODE = previous;
+    }
+  });
+
   test("XP mode on: injects cyber workflow even with an empty ledger", async () => {
     const previous = process.env.PI_XP_MODE;
     process.env.PI_XP_MODE = "on";
@@ -458,7 +493,9 @@ describe("casefile extension", () => {
         verification_marker: "ok",
         local: true,
       });
-      await executeTool(pi, "CaseReport", { id: reported.details.record.id });
+      const ctxResult = await executeTool(pi, "CaseContext", { id: reported.details.record.id });
+      // The reporter agent writes the report file before the case flips to reported.
+      writeFileSync(ctxResult.details.path, "# Report\nrepro\n", "utf8");
       await executeTool(pi, "CaseUpdate", {
         id: reported.details.record.id,
         status: "reported",
@@ -519,6 +556,60 @@ describe("casefile extension", () => {
     }
   });
 
+  test("injects at most 20 active cases, P0 first, with +N more hint", async () => {
+    const previous = process.env.PI_XP_MODE;
+    process.env.PI_XP_MODE = "on";
+    try {
+      const pi = createFakePi();
+      casefileExtension(pi as any);
+
+      // 21 hypotheses: one P0, twenty P4 — the cap must drop exactly one.
+      const ids: string[] = [];
+      let p0Id = "";
+      for (let i = 0; i < 21; i++) {
+        const res = await executeTool(pi, "CaseAdd", {
+          title: `Coverage candidate number ${i}`,
+          status: "hypothesis",
+          evidence: "probe",
+          priority: i === 0 ? "P0" : "P4",
+        });
+        ids.push(res.details.record.id);
+        if (i === 0) p0Id = res.details.record.id;
+      }
+
+      const handler = pi.events.get("before_agent_start")?.[0];
+      const result = await handler({ systemPrompt: "" });
+      const ctx = result.systemPrompt;
+
+      expect(ctx).toContain("Active security cases: 21 total");
+      expect(ctx).toContain("+1 more cases — use CaseList for the rest.");
+
+      // Exactly 20 of the 21 ids are injected (the cap dropped one).
+      const present = ids.filter((id) => ctx.includes(id));
+      expect(present.length).toBe(20);
+
+      // Priority sort: the P0 case is the FIRST listed case row.
+      const firstRowStart = ctx.indexOf("  - case_");
+      const firstRow = ctx.slice(firstRowStart, ctx.indexOf("\n", firstRowStart));
+      expect(firstRow).toContain(p0Id);
+    } finally {
+      if (previous === undefined) delete process.env.PI_XP_MODE;
+      else process.env.PI_XP_MODE = previous;
+    }
+  });
+
+  test("workflow constants carry the new gates and the renamed tool (no stale CaseReport)", () => {
+    // The injected text is the operative contract; dropping a gate or the
+    // renamed tool silently passes the injection tests, so pin the markers.
+    expect(STATIC_CYBER_WORKFLOW).toContain("Design & Runtime Check");
+    expect(STATIC_CYBER_WORKFLOW).toContain("CaseContext");
+    expect(STATIC_CYBER_WORKFLOW).not.toContain("CaseReport");
+    expect(STATIC_CYBER_WORKFLOW).toContain('agent: "reporter"');
+    expect(STATIC_CYBER_WORKFLOW_LITE).toContain("Report style checklist");
+    expect(STATIC_CYBER_WORKFLOW_LITE).toContain("CaseContext");
+    expect(STATIC_CYBER_WORKFLOW_LITE).not.toContain("CaseReport");
+  });
+
   test("/xp command toggles mode and gates injection", async () => {
     const previous = process.env.PI_XP_MODE;
     delete process.env.PI_XP_MODE;
@@ -545,6 +636,35 @@ describe("casefile extension", () => {
 
       await pi.commands.get("xp").handler("off", ctx);
       expect(await handler()).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.PI_XP_MODE;
+      else process.env.PI_XP_MODE = previous;
+    }
+  });
+
+  test("/xp lite sets lite mode and injects the lite workflow", async () => {
+    const previous = process.env.PI_XP_MODE;
+    delete process.env.PI_XP_MODE;
+    try {
+      const pi = createFakePi();
+      casefileExtension(pi as any);
+      const notifications: string[] = [];
+      const ctx = {
+        hasUI: false,
+        ui: {
+          notify: (message: string) => notifications.push(message),
+          setStatus: () => {},
+        },
+      };
+
+      await pi.commands.get("xp").handler("lite", ctx);
+      expect(notifications.some((n) => n.includes("LITE"))).toBe(true);
+
+      const handler = pi.events.get("before_agent_start")?.[0];
+      expect(handler).toBeFunction();
+      const result = await handler({ systemPrompt: "" });
+      expect(result.systemPrompt).toContain("# Cyber Workflow — LITE (Single-Agent)");
+      expect(result.systemPrompt).not.toContain("Evidence-First Doctrine");
     } finally {
       if (previous === undefined) delete process.env.PI_XP_MODE;
       else process.env.PI_XP_MODE = previous;

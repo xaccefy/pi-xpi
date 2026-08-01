@@ -19,7 +19,6 @@ try {
   }
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: Standard SQLite API returns any
 export interface StatementSync {
   run(...args: unknown[]): { lastInsertRowid: number; changes: number };
   // biome-ignore lint/suspicious/noExplicitAny: Standard SQLite API returns any
