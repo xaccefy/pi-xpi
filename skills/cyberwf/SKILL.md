@@ -1,6 +1,6 @@
 ---
 name: cyberwf
-description: Vulnerability discovery pipeline — the REQUIRED workflow whenever the task is to find vulnerabilities, hunt bugs, run a bug-bounty hunt, pentest, or security-audit a target. You are the coordinator — run the stage machine with subagent orchestration, state tracking, schema validation, reachability trace, gapfill loop, and structured reporting.
+description: Vulnerability discovery pipeline — the REQUIRED workflow whenever the task is to find vulnerabilities, hunt bugs, run a bug-bounty hunt, pentest, or security-audit a target. You are the coordinator — run the stage machine with subagent orchestration, state tracking, schema validation, reachability trace, gapfill loop, and structured reporting. READ THIS FILE BEFORE ANY WORK — it contains the mandatory dispatch protocol and the recon→hunt gate.
 ---
 
 # Pipeline Orchestration Skill
@@ -115,6 +115,8 @@ RECON owns the coverage floor: hunts can only cover what recon found. Shallow re
 4. Record **every entry point** (URL, method, params, auth state) + tech notes: `ScratchpadWrite(run_id, "recon", "entry-points.md", ...)`.
 
 HUNT tasks reference this inventory; all coverage judgements are measured against it.
+
+**HARD GATE — RECON → HUNT:** inventory recorded → STOP all inline reading/probing. Your very next tool call MUST be a HUNT \`subagent({ tasks: [...] })\` dispatch, one auditor per attack class. Mapping a sink, reading a handler, or probing an endpoint beyond the recon inventory is HUNT work — stop, note it as a hunt task, and dispatch. Recon that bleeds into hunting is a pipeline violation, not progress.
 
 ### HUNT: One agent per attack class (parallel)
 
