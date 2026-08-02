@@ -101,6 +101,8 @@ Every stage output must pass the `PipelineSubmit` gate before the next stage. It
 - A TRACER that errors or fails validation = **UNREACHABLE** — the finding does not advance.
 - Attach `outputSchema` (the schema JSON from `schemas/`) to every subagent dispatch.
 
+**Subagent crash handling (mandatory):** a subagent that dies (SIGABRT, OOM, timeout, process error) is a RETRY, not a verdict. Re-dispatch the same task ONCE with a stronger model (`subagent({agent: ..., model: "<stronger>", task: ...})` — repetition-loop runs are a known failure mode on cheap models). If it crashes again, record `blocked: <agent> crashed` in the pipeline-run case and continue with the next stage — never silently drop the stage.
+
 ## Agent Dispatch Patterns
 
 **These are commands to execute, not descriptions.** Each `subagent({...})` is a real tool call. Dispatch, then validate the output.

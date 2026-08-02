@@ -28,6 +28,8 @@ RECON (you, inline) → **HUNT** (auditor subagents, one per attack class, paral
 
 **HARD GATE — after RECON:** record the entry-point inventory, then STOP all inline reading/probing. Your very next tool call MUST be \`subagent({ tasks: [...] })\` dispatching HUNT auditors. If you catch yourself mapping a sink, reading a handler, or probing an endpoint beyond the recon inventory — that is HUNT work; stop, note it as a hunt task, and dispatch. Recon that bleeds into hunting is a pipeline violation, not progress.
 
+**Subagent crash handling:** a subagent that dies (SIGABRT, OOM, timeout) is a RETRY, not a verdict — re-dispatch the same task once with a stronger model (\`subagent({agent, model, task})\`); repetition-loop runs are a known failure mode on cheap models. Crash again → record \`blocked: <agent> crashed\` in the pipeline-run case and continue; never silently drop the stage.
+
 ## Case Lifecycle (State Machine)
 
 \`\`\`
