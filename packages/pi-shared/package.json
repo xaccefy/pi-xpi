@@ -1,6 +1,6 @@
 {
   "name": "@xaccefy/pi-shared",
-  "version": "0.7.6",
+  "version": "0.8.0",
   "description": "Shared utilities for XPI packages — bounded TTL/LRU cache with singleflight, abortable sleep",
   "keywords": [
     "pi-package",
