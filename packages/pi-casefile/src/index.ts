@@ -1487,6 +1487,11 @@ export default function casefileExtension(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       const next = parseXpModeArg(args ?? "", readXpMode());
       writeXpMode(next);
+      // Re-enabling after a mid-session /xp off must re-inject the workflow
+      // on the next prompt — otherwise workflowInjected (module-level, set on
+      // first enable) stays true and the workflow never comes back until the
+      // process restarts.
+      if (next !== "off") workflowInjected = false;
       ctx.ui.notify(
         `Casefile XP mode: ${next.toUpperCase()} (takes effect on the next prompt)`,
         next === "on" ? "info" : "warning",

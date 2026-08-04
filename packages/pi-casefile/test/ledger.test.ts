@@ -798,6 +798,50 @@ describe("casefile sqlite ledger", () => {
     assert.ok(adminCells.some((cell) => cell.class === "xss" && cell.scope === "local"));
   });
 
+  it("hydrates coverage/evidence rows to camelCase (testedBy, createdAt) on every read path", () => {
+    const c = addCase({ title: "Hydration case" });
+    recordCoverageResult(c.id, {
+      asset: "a1",
+      class: "sqli",
+      scope: "wide",
+      note: "first verdict",
+      testedBy: "agent-1",
+    });
+    // A newer wide verdict for the same class must supersede the older one
+    // when propagated (createdAt comparison needs the mapped field).
+    recordCoverageResult(c.id, {
+      asset: "a2",
+      class: "sqli",
+      scope: "wide",
+      note: "NEWER verdict",
+      testedBy: "agent-2",
+    });
+    recordCoverageResult(c.id, { asset: "a3", class: "xss", scope: "local", note: "none" });
+    addEvidenceItemResult(c.id, { role: "observation", summary: "obs" });
+
+    const summary = coverageSummary(c.id);
+    const wide = summary.byAsset["a1"]![0];
+    assert.strictEqual(wide.testedBy, "agent-1");
+    assert.ok(wide.createdAt, "coverage cell createdAt hydrated");
+    // Latest wide verdict wins (not the first recorded one).
+    const a3sqli = summary.byAsset["a3"]!.find((cell) => cell.class === "sqli")!;
+    assert.match(a3sqli.note, /NEWER verdict/);
+
+    // Batch reads attach items to their case (fetchItemMap keyed on caseId).
+    const viaBatch = readCasefile().find((r) => r.id === c.id)!;
+    assert.strictEqual(viaBatch.coverageItems.length, 3);
+    // addCase helper injects an observation fixture + the one we added.
+    assert.strictEqual(viaBatch.evidenceItems.length, 2);
+    const ev = viaBatch.evidenceItems.find((e) => e.summary === "obs")!;
+    assert.strictEqual(ev.caseId, c.id);
+    assert.ok(ev.createdAt);
+
+    // Single-case read hydrates too.
+    const viaSingle = getCaseById(c.id)!;
+    assert.strictEqual(viaSingle.coverageItems[0].testedBy, "agent-1");
+    assert.ok(viaSingle.evidenceItems[0].artifactPath === undefined);
+  });
+
   it("suggests exploit chains from cases", () => {
     const cred = addCase({
       title: "Leaked API key in repo",
@@ -833,6 +877,56 @@ describe("casefile sqlite ledger", () => {
     });
     const xssSuggestions = suggestChains(other.id).filter((s) => s.pattern === "xss_csrf");
     assert.strictEqual(xssSuggestions.length, 0);
+  });
+
+  it("does not pair unrelated targets whose names overlap as substrings", () => {
+    // Regression: sameAssetOrRelated used a bare substring check, so
+    // "myshop.io".includes("shop.io") paired two unrelated targets as one
+    // asset and suggested a credential+endpoint chain between them.
+    const cred = addCase({
+      title: "Leaked API key in repo",
+      status: "investigating",
+      evidence: "Key in public repo",
+      confidence: "high",
+      impact: "credential exposure",
+      severity: "high",
+      target: "shop.io",
+    });
+    const endpoint = addCase({
+      title: "Admin login endpoint",
+      status: "investigating",
+      evidence: "Login accepts credentials",
+      confidence: "high",
+      impact: "auth",
+      severity: "medium",
+      target: "myshop.io",
+    });
+    assert.strictEqual(suggestChains().length, 0, "no chain across unrelated targets");
+
+    // Subdomain relation still pairs (label-boundary aware).
+    const subCred = addCase({
+      title: "Leaked token",
+      status: "investigating",
+      evidence: "Token in docs",
+      confidence: "high",
+      target: "api.example-app.com",
+    });
+    const subEndpoint = addCase({
+      title: "Admin panel",
+      status: "investigating",
+      evidence: "Login accepts credentials",
+      confidence: "high",
+      target: "example-app.com",
+    });
+    const pair = suggestChains().filter((s) => s.sourceId === subCred.id);
+    assert.ok(
+      pair.some((s) => s.targetId === subEndpoint.id),
+      "subdomain targets still pair",
+    );
+    assert.strictEqual(
+      pair.some((s) => s.targetId === cred.id || s.targetId === endpoint.id),
+      false,
+    );
   });
 
   it("rejects field mutations on killed and reported cases", () => {

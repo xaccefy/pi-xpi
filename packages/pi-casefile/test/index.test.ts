@@ -626,6 +626,41 @@ describe("casefile extension", () => {
     }
   });
 
+  test("XP toggle off→on mid-session re-injects the workflow", async () => {
+    const previous = process.env.PI_XP_MODE;
+    delete process.env.PI_XP_MODE;
+    try {
+      const pi = createFakePi();
+      casefileExtension(pi as any);
+
+      const handler = pi.events.get("before_agent_start")?.[0];
+      const xpCmd = pi.commands.get("xp");
+      const notify = () => undefined;
+
+      // Default off: nothing injected.
+      expect(await handler({ systemPrompt: "p" })).toBeUndefined();
+
+      // /xp on → workflow injected.
+      await xpCmd.handler("on", { ui: { notify } });
+      const on1 = await handler({ systemPrompt: "p" });
+      expect(on1.systemPrompt).toContain("# Cyber Workflow");
+
+      // /xp off → nothing injected.
+      await xpCmd.handler("off", { ui: { notify } });
+      expect(await handler({ systemPrompt: "p" })).toBeUndefined();
+
+      // /xp on again → workflow must come back (regression: workflowInjected
+      // stayed true from the first enable, so re-enabling silently never
+      // re-injected the workflow until process restart).
+      await xpCmd.handler("on", { ui: { notify } });
+      const on2 = await handler({ systemPrompt: "p" });
+      expect(on2.systemPrompt).toContain("# Cyber Workflow");
+    } finally {
+      if (previous === undefined) delete process.env.PI_XP_MODE;
+      else process.env.PI_XP_MODE = previous;
+    }
+  });
+
   test("XP mode on: workflow injected once per session, case list refreshes per prompt", async () => {
     const previous = process.env.PI_XP_MODE;
     process.env.PI_XP_MODE = "on";

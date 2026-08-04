@@ -147,14 +147,12 @@ async function ensureDaemonRunning(): Promise<boolean> {
 
 async function stopDaemon(): Promise<void> {
   shuttingDown = true;
-  // Wait for any in-flight startup so we don't kill then re-spawn.
-  if (startupPromise) {
-    try {
-      await startupPromise;
-    } catch {
-      // ignore
-    }
-  }
+  // Do NOT await an in-flight startup: the startup loop can run up to
+  // STARTUP_RETRIES × POLL_INTERVAL (~5s) against a slow/booting daemon, and
+  // session_shutdown must not block that long. No kill-then-respawn race
+  // exists: startDaemon() runs exactly once, synchronously, before the poll
+  // loop, and the loop checks shuttingDown at every await boundary — it
+  // self-terminates on the next wake-up.
   if (daemonProcess) {
     try {
       daemonProcess.kill();

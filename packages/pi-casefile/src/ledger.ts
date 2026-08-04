@@ -530,6 +530,32 @@ function mapRow(
   };
 }
 
+/** Map raw snake_case DB rows to their camelCase item types. */
+function mapEvidenceRow(row: any): EvidenceItem {
+  return {
+    id: row.id,
+    caseId: row.case_id,
+    role: row.role,
+    artifactPath: row.artifact_path ?? undefined,
+    sha256: row.sha256 ?? undefined,
+    summary: row.summary,
+    createdAt: row.created_at,
+  };
+}
+
+function mapCoverageRow(row: any): CoverageItem {
+  return {
+    id: row.id,
+    caseId: row.case_id,
+    asset: row.asset,
+    class: row.class,
+    scope: row.scope,
+    note: row.note,
+    testedBy: row.tested_by ?? undefined,
+    createdAt: row.created_at,
+  };
+}
+
 /** Batch-fetch per-case item tables (evidence / coverage) for a set of ids. */
 function fetchItemMap<T extends { caseId: string }>(
   db: DatabaseSync,
@@ -540,12 +566,14 @@ function fetchItemMap<T extends { caseId: string }>(
   const placeholders = ids.map(() => "?").join(",");
   const rows = db
     .prepare(`SELECT * FROM ${table} WHERE case_id IN (${placeholders}) ORDER BY created_at`)
-    .all(...ids) as T[];
+    .all(...ids) as any[];
+  const mapRow = table === "evidence_items" ? mapEvidenceRow : mapCoverageRow;
   const map = new Map<string, T[]>();
   for (const row of rows) {
-    const bucket = map.get(row.caseId);
-    if (bucket) bucket.push(row);
-    else map.set(row.caseId, [row]);
+    const item = mapRow(row) as unknown as T;
+    const bucket = map.get(item.caseId);
+    if (bucket) bucket.push(item);
+    else map.set(item.caseId, [item]);
   }
   return map;
 }
@@ -603,12 +631,16 @@ export function getCaseById(id: string): CaseRecord | undefined {
 
   const linkStmt = db.prepare("SELECT target_id, kind FROM case_links WHERE source_id = ?");
   const links = linkStmt.all(id) as { target_id: string; kind: string }[];
-  const evidence = db
-    .prepare("SELECT * FROM evidence_items WHERE case_id = ? ORDER BY created_at")
-    .all(id) as EvidenceItem[];
-  const coverage = db
-    .prepare("SELECT * FROM coverage_items WHERE case_id = ? ORDER BY created_at")
-    .all(id) as CoverageItem[];
+  const evidence = (
+    db
+      .prepare("SELECT * FROM evidence_items WHERE case_id = ? ORDER BY created_at")
+      .all(id) as any[]
+  ).map(mapEvidenceRow);
+  const coverage = (
+    db
+      .prepare("SELECT * FROM coverage_items WHERE case_id = ? ORDER BY created_at")
+      .all(id) as any[]
+  ).map(mapCoverageRow);
 
   return mapRow(
     row,
@@ -1238,9 +1270,11 @@ export function addEvidenceItemResult(
 
 export function listEvidenceItems(caseId: string): EvidenceItem[] {
   const db = getDb();
-  return db
-    .prepare("SELECT * FROM evidence_items WHERE case_id = ? ORDER BY created_at")
-    .all(caseId) as EvidenceItem[];
+  return (
+    db
+      .prepare("SELECT * FROM evidence_items WHERE case_id = ? ORDER BY created_at")
+      .all(caseId) as any[]
+  ).map(mapEvidenceRow);
 }
 
 // ── Coverage items ──────────────────────────────────────────────────
@@ -1311,9 +1345,11 @@ export function recordCoverageResult(
 
 export function listCoverage(caseId: string): CoverageItem[] {
   const db = getDb();
-  return db
-    .prepare("SELECT * FROM coverage_items WHERE case_id = ? ORDER BY created_at")
-    .all(caseId) as CoverageItem[];
+  return (
+    db
+      .prepare("SELECT * FROM coverage_items WHERE case_id = ? ORDER BY created_at")
+      .all(caseId) as any[]
+  ).map(mapCoverageRow);
 }
 
 export type CoverageSummary = {
@@ -1699,13 +1735,26 @@ function hasChainClass(c: CaseRecord, re: RegExp): boolean {
   return re.test(chainText(c));
 }
 
+/** Reduce a target string to a bare hostname (strip scheme, port, path). */
+function normalizeTargetHost(target: string): string {
+  let h = target
+    .toLowerCase()
+    .trim()
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//, "");
+  h = h.split("?")[0].split("/")[0].split(":")[0];
+  return h.trim();
+}
+
 /** Same asset or related (same eTLD+1) — chains only pair cases on one target. */
 function sameAssetOrRelated(a: CaseRecord, b: CaseRecord): boolean {
-  const ta = (a.target ?? "").toLowerCase().trim();
-  const tb = (b.target ?? "").toLowerCase().trim();
+  const ta = normalizeTargetHost(a.target ?? "");
+  const tb = normalizeTargetHost(b.target ?? "");
   if (!ta || !tb) return false;
   if (ta === tb) return true;
-  if (ta.includes(tb) || tb.includes(ta)) return true;
+  // Subdomain relation requires a label boundary: "api.example.com" vs
+  // "example.com" pair, but "myshop.io" vs "shop.io" do NOT — a bare
+  // substring check pairs unrelated targets whose names merely overlap.
+  if (ta.endsWith(`.${tb}`) || tb.endsWith(`.${ta}`)) return true;
   return eTLDPlus1(ta) === eTLDPlus1(tb);
 }
 
@@ -2122,6 +2171,17 @@ export function formatCaseDetail(record: CaseRecord): string {
       display = (val as { id: string; kind: string }[])
         .map((l) => `${l.id} (${l.kind})`)
         .join(", ");
+    } else if (key === "evidenceItems") {
+      display = (val as EvidenceItem[])
+        .map(
+          (e) =>
+            `[${e.role}] ${e.summary}${e.artifactPath ? ` — \`${e.artifactPath}\` sha256:\`${e.sha256?.slice(0, 12) ?? "?"}\`` : ""} (${e.createdAt})`,
+        )
+        .join("\n");
+    } else if (key === "coverageItems") {
+      display = (val as CoverageItem[])
+        .map((c) => `[${c.scope}] ${c.asset} × ${c.class} — ${c.note}`)
+        .join("\n");
     } else if (Array.isArray(val)) {
       display = val.join(", ");
     } else if (typeof val === "object") {
