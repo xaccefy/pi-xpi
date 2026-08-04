@@ -44,21 +44,30 @@ hypothesis → investigating → confirmed → reported
 ```
 
 - **investigating** needs `evidence` + `confidence`
-- **confirmed** only by running the PoC (`PromoteFinding`, exit 0) — you can't just set status to confirmed
+- **confirmed** only by running the PoC (`PromoteFinding`, exit 0 + verification marker in output) — you can't just set status to confirmed. Promotion additionally requires an EvidenceAdd `observation` item (the initial signal) — the ledger rejects a `confirmed` with no evidence chain.
+- **Live findings (`local:true`) also require `control_path`**: the same PoC run against a control lacking the vuln must NOT print the marker. The harness checks the control output itself — an unconditional-marker or mock-target PoC is blocked. The control run is stored as `controlVerified`. A control or disconfirmation script that **crashes** (killed / timeout / spawn error — no completion marker) is blocked too: a crash is not a clean control verdict and not a survived disproof. This applies at the ledger level, not just the tool: a local (sandbox:false) promotion without `controlVerification` is rejected by `promoteFindingResult` itself.
+- **New cases require `disproveIf`** — falsification conditions (what would disprove this hypothesis). A hypothesis that can't say what kills it isn't one yet.
+- **A kill must be justified**: either an EvidenceAdd `refutation` item, or a kill-reason token (intended_behavior, duplicate, framework_protection, out_of_scope, skeptic-disproven, no_attack_path, ...) in assumptions/nextStep. Bare `status: "killed"` is rejected.
 - **reported** needs `CaseContext` first (records the report path; the report writer produces the final file)
 - **killed** / **reported** are final (no more edits)
 
-There is **no** `impact_proof` field. Put proof in `impact` or `evidence`.
+## Evidence items
+
+`EvidenceAdd` records role-typed, artifact-backed evidence (observation / reproduction / impact / refutation / cleanup). Artifacts are stored as basename + SHA-256 — the full path is never persisted. The PoC gate auto-records the `reproduction` item (the PoC file, hashed) at promotion, so a confirmed case always traces back to a real artifact. `cleanup` items track engagement cleanup; record and confirm them before REPORT for sanctioned engagements (advisory — not yet a hard gate).
 
 ## Tools
 
 | Tool | Use |
 |------|-----|
-| `CaseAdd` | Open a case (`title` required; start as `hypothesis` or `investigating`) |
+| `CaseAdd` | Open a case (`title` + `disproveIf` required; start as `hypothesis` or `investigating`) |
 | `CaseUpdate` | Evidence, impact, severity, status (not direct confirm) |
-| `PromoteFinding` | Run on-disk PoC (Docker sandbox by default; `local:true` for host) → confirm on exit 0 |
+| `EvidenceAdd` | Role-typed, hashed evidence item on a case (refutation justifies kills; cleanup tracks cleanup) |
+| `PromoteFinding` | Run on-disk PoC (Docker sandbox by default; `local:true` for host) → confirm on exit 0 + marker; `control_path` required for live findings |
 | `CaseGet` / `CaseList` / `CaseSearch` | Read / filter / search |
 | `CaseLink` / `CaseUnlink` | Bidirectional exploit chains |
+| `ChainSuggest` | Scan cases for exploitable chain combinations (credential+endpoint→ATO, redirect+OAuth→token theft, XSS+state-change→CSRF, IDOR+user-data, SSTI→RCE, race+payment, info-disclosure+SSRF), ranked by confidence |
+| `CoverageAdd` | Record a tested (asset × attack-class) cell — `scope: wide` (deployment-wide verdict, applies to every later asset) or `local`; both found and clean results count |
+| `CoverageReport` | Render the machine-checkable coverage matrix (which classes are tested where; plateau claims must match it) |
 | `CaseContext` | Context bundle for a confirmed/reported case (full record, logs, links, artifacts) + report path |
 
 Commands: `/casefile` (dashboard), `/xp` (XP mode).

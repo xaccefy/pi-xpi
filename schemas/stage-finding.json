@@ -4,7 +4,7 @@
   "description": "A vulnerability finding produced by the auditor/hunter stage. Must pass validation before advancing to exploit.",
   "type": "object",
   "required": ["vuln_class", "sink", "entry_point", "confidence", "evidence"],
-  "anyOf": [
+  "oneOf": [
     { "required": ["file", "line"], "description": "Source/white-box target locator" },
     { "required": ["endpoint"], "description": "Live black-box target locator" }
   ],

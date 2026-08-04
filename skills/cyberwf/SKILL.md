@@ -29,6 +29,8 @@ What one pass learns (tech hints, error messages, timing, new parameters, new su
 
 **Plateau stop** — stop when a full round yields: zero new hypotheses, zero new reachable surface, zero new applicable techniques from exploit_search, and every class is COVERED/SKIPPED/NOT_FOUND. No hard round cap; plateau is the cap. Budget-constrained? Note "stopped at round N for budget" in the report.
 
+**Stall rule (deferred, not killed)** — a hypothesis or attack class that survives 3 rounds with no new signal, no new surface, and no new techniques is not dead, it's stalled: CaseUpdate the pipeline-run (or finding) case to `status: "blocked"` with `blockers: ["deferred after 3 rounds — revisit when: <exact condition>"]`. The revisit condition must name a concrete trigger (new endpoint, new creds, new CVE, tool installed). Stalled ≠ killed: do not kill leads that merely lack a path today.
+
 SKEPTIC runs between TRACE and VALIDATE, only for `confidence: high` (severity doesn't exist yet — the auditor sets confidence, the exploit agent sets severity after the PoC). DISPROVEN → killed directly, no tie-breaker.
 
 Finish coverage (hunt + gapfill) before spending trace budget. Each stage emits structured output; the next stage validates it first; failure → retry with repair guidance.
@@ -48,7 +50,7 @@ Missing prerequisite → record it in the pipeline-run case; ask the user or sco
 Track pipeline state in a dedicated pipeline-run case:
 
 ```
-CaseAdd(title: "Pipeline: <target> <timestamp>", status: hypothesis, bugClass: "pipeline-run", target: "<target>", tags: ["pipeline"])
+CaseAdd(title: "Pipeline: <target> <timestamp>", status: hypothesis, bugClass: "pipeline-run", target: "<target>", tags: ["pipeline"], disproveIf: ["run completes with zero findings and zero new surface", "authorization withdrawn"])  # disproveIf is REQUIRED on every new case
 ```
 
 Per-stage progress via `CaseUpdate`:
@@ -166,6 +168,9 @@ subagent({ agent: "skeptic",
          tools (NO bash — you have none; if git history must be checked, note it and the exploit agent verifies commits),
          and whether the runtime/framework version already mitigates the path. Intended behavior → DISPROVEN intended_behavior;
          runtime already blocks it → DISPROVEN framework_protection; neither found → say so in disconfirmation_attempt.
+         ALSO audit the PoC script the exploit agent wrote (before it runs): read it for unconditional verification-marker
+         prints, trivially-true checks (accepting any 200, grepping always-present strings), hardcoded expected values,
+         and local mocks of the target. Report the audit in disconfirmation_attempt.
          Output conforming to schemas/stage-skeptic.json.",
   turnBudget: { maxTurns: 12, graceTurns: 2 },
   outputSchema: <contents of schemas/stage-skeptic.json> })
@@ -188,6 +193,10 @@ subagent({ agent: "exploit", task: "Phase 1: EXPLOIT. Finding <case-id>. ...",
 
 The exploit agent runs the PoC through `PromoteFinding` (you do not). The case must be `investigating` with poc/evidence/impact/severity/target/disconfirmation before the gate accepts a run — the exploit agent does that CaseUpdate (keeping the skeptic's `disconfirmation` if present) before its first PromoteFinding call. Non-skeptic findings: the exploit agent writes its own disconfirmation.
 
+**Evidence chain closure (before PromoteFinding):** promotion now REQUIRES an `observation` evidence item (EvidenceAdd role=observation — the initial signal, artifact-backed) in addition to the reproduction item the gate auto-writes. If the case lacks one, the ledger rejects promotion with "Evidence chain incomplete". Record the observation (probe response, source snippet, log line) when the case is first created or when it reaches investigating — not at the last minute.
+
+**Anti-cheat control gate (PromoteFinding):** live findings (`local: true`) REQUIRE `control_path` — a script that runs the SAME PoC against a control lacking the vuln (patched replica, second account, baseline endpoint). The harness blocks promotion if the verification_marker appears in the control run's output; the result is stored as `controlVerified` on the case and rendered in the context bundle. This is what proves the marker is target-dependent, not an unconditional print. Record observation/refutation/impact artifacts via EvidenceAdd (role-typed, hashed). The harness ALSO blocks when the control or disconfirmation script crashes (killed/timeout/spawn error — no completion marker): a crash is not a clean control verdict and not a survived disproof; fix the script and retry.
+
 **Design & runtime check (VALIDATE, before promoting):** the case must carry the non-intentionality evidence — the skeptic's disconfirmation includes the docs/git-history/runtime search. For non-skeptic findings, the exploit agent searches docs, git history, and runtime/framework docs before promoting: documented intent → kill `intended_behavior`; runtime mitigates → kill `framework_protection`; neither → keep the notes in `disconfirmation` as non-intentionality proof.
 
 ### GAPFIL: Re-queue INCOMPLETE classes
@@ -203,6 +212,8 @@ subagent({ agent: "auditor",
 ```
 
 Loop terminates when zero `INCOMPLETE` remain, or after 3 iterations (safety cap). Never freeze a class as `NOT_FOUND` while entry points are unchecked — report `INCOMPLETE` if the cap hits.
+
+**Coverage is machine-checked (not prose):** as each class finishes on an asset, record it with `CoverageAdd(case_id, asset, class, scope: wide|local, note)` — for BOTH outcomes (a clean result is a coverage cell too). `scope: wide` when the verdict is deployment-wide: recorded once, applies to every asset of the deployment, do NOT re-test per asset. Before claiming the plateau ("every class COVERED/SKIPPED/NOT_FOUND"), run `CoverageReport(case_id)` and make the claim match the matrix. A class with no cell recorded is untested — GAPFIL must still cover it.
 
 ### FEEDBACK: Convert traces into new hunt tasks
 

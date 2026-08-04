@@ -7,7 +7,7 @@
  */
 
 import { Type } from "@sinclair/typebox";
-import { TtlLruCache } from "./cache.ts";
+import { TtlLruCache } from "@xaccefy/pi-shared";
 
 const CONTEXT7_API = "https://context7.com/api";
 const STEP_TIMEOUT_MS = 20_000;

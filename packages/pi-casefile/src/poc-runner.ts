@@ -1,7 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
+
+import { findWorkspaceRoot } from "./scratchpad.ts";
 
 export type PocRun = {
   path: string;
@@ -9,20 +11,24 @@ export type PocRun = {
   output: string;
   ranAt: string;
   sandbox: boolean;
+  /**
+   * True iff the script actually ran to completion. False when the process
+   * could not start (spawn error), was killed by a signal, or timed out —
+   * a crash is NOT a verdict, and callers must not treat it as one.
+   */
+  completed: boolean;
 };
 
 export type PocLanguage = {
   /** Docker image used when running inside the sandbox. */
   image: string;
   /** Shell command to run an interpreted PoC. {{file}} is replaced with the source path. */
-  run?: string;
-  /** Shell command to build and run a compiled PoC. {{file}}, {{bin}}, {{class}} replaced. */
-  buildRun?: string;
+  run: string;
   /** Files that, when present in the project root, identify this project type. */
   projectMarkers?: string[];
 };
 
-/** Minimal built-in defaults. Users can override/extend via env. */
+/** Built-in interpreted languages. Compiled languages are unsupported on purpose. */
 const BUILTIN_LANGUAGES: Record<string, PocLanguage> = {
   python: {
     image: "python:3.12-slim",
@@ -40,7 +46,7 @@ const BUILTIN_LANGUAGES: Record<string, PocLanguage> = {
   },
 };
 
-/** Extension to language key. Unknown extensions can be supplied by the user. */
+/** Extension to language key. Unknown extensions need a shebang or PI_POC_DEFAULT_LANGUAGE. */
 const EXTENSION_MAP: Record<string, string> = {
   ".py": "python",
   ".js": "node",
@@ -54,58 +60,21 @@ const EXTENSION_MAP: Record<string, string> = {
 
 const OUTPUT_MAX_CHARS = 4000;
 const TIMEOUT_MS = 30_000;
+/** Completion sentinel echoed after the PoC command inside the sandbox shell. */
+function makeSentinel(): string {
+  return `__PI_POC_DONE_${Math.random().toString(36).slice(2, 12)}__`;
+}
 /** First-use image downloads are slow — pull outside the run timeout. */
 const PULL_TIMEOUT_MS = 300_000;
 const MAX_BUFFER = 8 * 1024 * 1024;
 
 function getProjectRoot(): string {
-  const envRoot = process.env.PI_POC_ROOT?.trim();
-  if (envRoot) return resolve(envRoot);
-
-  let curr = resolve(process.cwd());
-  for (let i = 0; i < 20; i++) {
-    if (existsSync(join(curr, ".git"))) return curr;
-    const parent = dirname(curr);
-    if (parent === curr) break;
-    curr = parent;
-  }
-  return resolve(process.cwd());
+  return findWorkspaceRoot(["PI_POC_ROOT"], [".git"]);
 }
 
-function loadLanguages(): Record<string, PocLanguage> {
-  const languages = { ...BUILTIN_LANGUAGES };
-
-  // Project-level overrides: .pi/poc-languages.json at the workspace root.
-  try {
-    const filePath = join(getProjectRoot(), ".pi", "poc-languages.json");
-    if (existsSync(filePath)) {
-      const extra = JSON.parse(readFileSync(filePath, "utf8")) as Record<string, PocLanguage>;
-      for (const [key, lang] of Object.entries(extra)) {
-        if (lang?.image) languages[key] = lang;
-      }
-    }
-  } catch {
-    // Malformed project config is ignored.
-  }
-
-  const envOverride = process.env.PI_POC_LANGUAGES?.trim();
-  if (envOverride) {
-    try {
-      const extra = JSON.parse(envOverride) as Record<string, PocLanguage>;
-      for (const [key, lang] of Object.entries(extra)) {
-        if (lang?.image) languages[key] = lang;
-      }
-    } catch {
-      // Malformed env JSON is ignored.
-    }
-  }
-
-  return languages;
-}
-
-function detectProjectType(languages: Record<string, PocLanguage>): string | undefined {
+function detectProjectType(): string | undefined {
   const root = getProjectRoot();
-  for (const [key, lang] of Object.entries(languages)) {
+  for (const [key, lang] of Object.entries(BUILTIN_LANGUAGES)) {
     for (const marker of lang.projectMarkers ?? []) {
       if (existsSync(join(root, marker))) return key;
     }
@@ -130,60 +99,49 @@ function parseShebang(pocPath: string): string | undefined {
   }
 }
 
-function interpreterToLanguage(
-  interpreter: string,
-  languages: Record<string, PocLanguage>,
-): string | undefined {
+function interpreterToLanguage(interpreter: string): string | undefined {
   const bin = basename(interpreter).toLowerCase();
-  for (const [key, lang] of Object.entries(languages)) {
-    if (lang.run) {
-      const runBin = lang.run.split(" ")[0].toLowerCase();
-      if (runBin === bin) return key;
-    }
-    if (lang.buildRun) {
-      const buildBin = lang.buildRun.split(" ")[0].toLowerCase();
-      if (buildBin === bin) return key;
-    }
+  for (const [key, lang] of Object.entries(BUILTIN_LANGUAGES)) {
+    if (lang.run.split(" ")[0].toLowerCase() === bin) return key;
   }
   return undefined;
 }
 
 function resolveLanguage(pocPath: string): { key: string; language: PocLanguage } {
-  const languages = loadLanguages();
   const ext = extname(pocPath).toLowerCase();
   const extKey = EXTENSION_MAP[ext];
 
   // 1. Shebang overrides everything.
   const shebang = parseShebang(pocPath);
   if (shebang) {
-    const shebangKey = interpreterToLanguage(shebang, languages);
-    if (shebangKey) return { key: shebangKey, language: languages[shebangKey] };
+    const shebangKey = interpreterToLanguage(shebang);
+    if (shebangKey) return { key: shebangKey, language: BUILTIN_LANGUAGES[shebangKey] };
   }
 
   // 2. Extension-based language (prefer the PoC file itself over ambient project markers).
   // A .py PoC in a Node monorepo must still run under python, not node.
-  if (extKey && languages[extKey]) {
-    return { key: extKey, language: languages[extKey] };
+  if (extKey && BUILTIN_LANGUAGES[extKey]) {
+    return { key: extKey, language: BUILTIN_LANGUAGES[extKey] };
   }
 
   // 3. Project type detection only when the extension is unknown/unmapped.
-  const projectType = detectProjectType(languages);
-  if (projectType && languages[projectType]) {
-    return { key: projectType, language: languages[projectType] };
+  const projectType = detectProjectType();
+  if (projectType && BUILTIN_LANGUAGES[projectType]) {
+    return { key: projectType, language: BUILTIN_LANGUAGES[projectType] };
   }
 
   // 4. Unknown extension: allow env override specifying a single language key.
   const envDefault = process.env.PI_POC_DEFAULT_LANGUAGE?.trim();
-  if (envDefault && languages[envDefault]) {
-    return { key: envDefault, language: languages[envDefault] };
+  if (envDefault && BUILTIN_LANGUAGES[envDefault]) {
+    return { key: envDefault, language: BUILTIN_LANGUAGES[envDefault] };
   }
 
-  const supported = Object.keys(languages).sort().join(", ");
+  const supported = Object.keys(BUILTIN_LANGUAGES).sort().join(", ");
   throw new Error(
     `Cannot determine PoC language for "${pocPath}". ` +
       `Detected extension: "${ext || "none"}". ` +
-      `Supported/adapted languages: ${supported}. ` +
-      `Add a shebang, use a known extension, or set PI_POC_DEFAULT_LANGUAGE or PI_POC_LANGUAGES.`,
+      `Supported languages: ${supported}. ` +
+      `Add a shebang, use a known extension, or set PI_POC_DEFAULT_LANGUAGE.`,
   );
 }
 
@@ -281,20 +239,12 @@ function shq(s: string): string {
 }
 
 function renderCommand(template: string, pocPath: string, inSandbox: boolean): string {
-  const sourceName = basename(pocPath);
-  const className = sourceName.replace(/\.[^.]+$/i, "");
   // In the sandbox the template runs under `sh -c`, and the PoC basename is
-  // agent-controlled — single-quote every substitution so a hostile filename
+  // agent-controlled — single-quote the substitution so a hostile filename
   // (e.g. `$(curl evil).py`) cannot inject shell into the container entrypoint.
   // Local mode uses no shell (args passed verbatim), so quoting stays off there.
-  const targetPath = inSandbox ? shq(`/workspace/${sourceName}`) : pocPath;
-  const binPath = inSandbox ? shq("/workspace/poc") : join(dirname(pocPath), "poc");
-  const cls = inSandbox ? shq(className) : className;
-
-  return template
-    .replace(/{{file}}/g, targetPath)
-    .replace(/{{bin}}/g, binPath)
-    .replace(/{{class}}/g, cls);
+  const targetPath = inSandbox ? shq(`/workspace/${basename(pocPath)}`) : pocPath;
+  return template.replace(/{{file}}/g, targetPath);
 }
 
 /**
@@ -360,22 +310,23 @@ function runSandboxed(pocPath: string, language: PocLanguage): PocRun {
         output: `[sandbox image error] ${(e as Error).message}`,
         ranAt,
         sandbox: true,
+        completed: false,
       };
     }
     copyFileSync(pocPath, `${workspaceDir}/${sourceName}`);
 
-    let command: string;
-    if (language.buildRun) {
-      command = renderCommand(language.buildRun, pocPath, true);
-    } else if (language.run) {
-      command = renderCommand(language.run, pocPath, true);
-    } else {
-      throw new Error("Language config has no run or buildRun command");
-    }
+    const command = renderCommand(language.run, pocPath, true);
+
+    // Completion sentinel: wrap the command so the shell echoes a unique token
+    // AFTER the PoC exits, preserving its exit code. If the container is
+    // killed, times out, or the run never starts, the sentinel is absent —
+    // callers can then tell "script ran and failed" from "script crashed".
+    const sentinel = makeSentinel();
+    const wrapped = `${command}; rc=$?; echo '${sentinel}'; exit $rc`;
 
     const result = spawnSync(
       "docker",
-      buildDockerArgs(language.image, command, workspaceDir, containerName),
+      buildDockerArgs(language.image, wrapped, workspaceDir, containerName),
       {
         encoding: "utf8",
         timeout: TIMEOUT_MS,
@@ -384,13 +335,16 @@ function runSandboxed(pocPath: string, language: PocLanguage): PocRun {
     );
 
     const spawnErr = result.error ? `\n[spawn error] ${result.error.message}` : "";
-    const output = sanitizeOutput((result.stdout ?? "") + (result.stderr ?? "") + spawnErr);
+    const raw = (result.stdout ?? "") + (result.stderr ?? "") + spawnErr;
+    const completed = raw.includes(sentinel);
+    const output = sanitizeOutput(raw.replace(sentinel, ""));
     return {
       path: pocPath,
       exitCode: spawnExitCode(result),
       output,
       ranAt,
       sandbox: true,
+      completed,
     };
   } finally {
     // Best-effort: remove any container still running after a timeout/kill.
@@ -410,31 +364,15 @@ function runSandboxed(pocPath: string, language: PocLanguage): PocRun {
 function runLocal(pocPath: string, language: PocLanguage): PocRun {
   const ranAt = new Date().toISOString();
 
-  if (language.buildRun) {
-    throw new Error(
-      "Compiled PoC languages require the Docker sandbox. " +
-        "Run PromoteFinding with local:false or use an interpreted PoC.",
-    );
-  }
-
-  if (!language.run) {
-    throw new Error("Language config has no run command");
-  }
-
   // The run template is `<interpreter> [flags...] {{file}}`. Split the static
-  // template on whitespace FIRST (the template is trusted config, not user input),
-  // then render placeholders within each token. Passing the tokens to spawnSync
-  // with NO shell keeps a space-containing PoC path as one arg and keeps extra
-  // flags (e.g. `node --experimental-vm-modules {{file}}`) as separate args.
+  // template on whitespace FIRST (builtins only, not user input), then render
+  // placeholders within each token. Passing the tokens to spawnSync with NO
+  // shell keeps a space-containing PoC path as one arg and keeps extra flags
+  // (e.g. `node --experimental-vm-modules {{file}}`) as separate args.
   // Splitting after rendering would re-split a space-containing path.
   const tokens = language.run.trim().split(/\s+/).filter(Boolean);
   const interpreter = tokens.shift() ?? language.run.trim();
-  const args = tokens.map((tok) =>
-    tok
-      .replace(/{{file}}/g, pocPath)
-      .replace(/{{bin}}/g, join(dirname(pocPath), "poc"))
-      .replace(/{{class}}/g, basename(pocPath).replace(/\.[^.]+$/i, "")),
-  );
+  const args = tokens.map((tok) => renderCommand(tok, pocPath, false));
 
   const result = spawnSync(interpreter, args, {
     encoding: "utf8",
@@ -442,7 +380,12 @@ function runLocal(pocPath: string, language: PocLanguage): PocRun {
     maxBuffer: MAX_BUFFER,
   });
 
+  // Local runs stay shell-free (space-containing paths stay single args), so
+  // there is no sentinel echo: "completed" is derived from the spawn result.
+  // A spawn error (interpreter missing) or a signal kill (timeout, SIGKILL)
+  // means the script never ran to completion — fail closed on those.
   const spawnErr = result.error ? `\n[spawn error] ${result.error.message}` : "";
+  const completed = !result.error && result.signal === null;
   const output = sanitizeOutput((result.stdout ?? "") + (result.stderr ?? "") + spawnErr);
   return {
     path: pocPath,
@@ -450,6 +393,7 @@ function runLocal(pocPath: string, language: PocLanguage): PocRun {
     output,
     ranAt,
     sandbox: false,
+    completed,
   };
 }
 
@@ -460,11 +404,7 @@ function runLocal(pocPath: string, language: PocLanguage): PocRun {
  * 1. Shebang line in the PoC file.
  * 2. File extension (a .py PoC in a Node repo still runs under python).
  * 3. Project type markers in the workspace root (e.g., package.json, requirements.txt).
- * 4. PI_POC_DEFAULT_LANGUAGE environment variable.
- *
- * Users can extend or override language definitions via:
- * - `.pi/poc-languages.json` in the project root.
- * - `PI_POC_LANGUAGES` environment variable (JSON object).
+ * 4. PI_POC_DEFAULT_LANGUAGE environment variable (a built-in language key).
  *
  * Security:
  * - PoC paths must be absolute and under the project workspace by default.

@@ -11,11 +11,20 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { type Dirent, existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import {
+  type Dirent,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import {
+  findWorkspaceRoot,
   getScratchpadRoot,
-  type ScratchpadPhase,
+  PHASE_ORDER,
   scratchpad_read,
   scratchpad_resume,
 } from "./scratchpad.ts";
@@ -41,6 +50,65 @@ export type CaseSeverity = (typeof SEVERITY_VALUES)[number];
 
 export const PRIORITY_VALUES = ["P0", "P1", "P2", "P3", "P4"] as const;
 export type CasePriority = (typeof PRIORITY_VALUES)[number];
+
+/** Cap on hashed evidence artifacts (10 MiB) — keeps readFileSync bounded. */
+const EVIDENCE_ARTIFACT_MAX_BYTES = 10 * 1024 * 1024;
+
+/** Role-typed evidence roles (Black-cat style). cleanup = engagement cleanup item. */
+export const EVIDENCE_ROLE_VALUES = [
+  "observation",
+  "reproduction",
+  "impact",
+  "refutation",
+  "cleanup",
+] as const;
+export type EvidenceRole = (typeof EVIDENCE_ROLE_VALUES)[number];
+
+/**
+ * One artifact-backed evidence record. The case's `evidence` prose is a
+ * summary; the load-bearing chain is these items: role + artifact SHA-256.
+ * A confirmed finding must trace back to a reproduction item recorded by the
+ * PoC gate itself (not agent prose).
+ */
+export type EvidenceItem = {
+  id: string;
+  caseId: string;
+  role: EvidenceRole;
+  /** Basename of the artifact backing this evidence (path-leak guard: full path never stored). */
+  artifactPath?: string;
+  /** SHA-256 of the artifact file. */
+  sha256?: string;
+  summary: string;
+  createdAt: string;
+};
+
+/**
+ * Coverage scope of a tested verdict:
+ * - `wide` — the verdict is a property of the whole deployment/account/host,
+ *   recorded ONCE and applied to every asset of that deployment (do NOT
+ *   re-test per asset; a wide cell covers all assets in the case).
+ * - `local` — specific to this one asset (endpoint, resource, service).
+ */
+export const COVERAGE_SCOPE_VALUES = ["wide", "local"] as const;
+export type CoverageScope = (typeof COVERAGE_SCOPE_VALUES)[number];
+
+/**
+ * One tested (asset × attack-class) cell. The note's existence marks the cell
+ * tested — for both outcomes (found or clean). Clean results are just as
+ * load-bearing: they are what make "every class is COVERED" machine-checkable.
+ */
+export type CoverageItem = {
+  id: string;
+  caseId: string;
+  asset: string;
+  /** Attack class tested (e.g. sql-injection, xss, idor, ssti, ...). */
+  class: string;
+  scope: CoverageScope;
+  /** Short note: techniques tried · result · key gap (injected into later context). */
+  note: string;
+  testedBy?: string;
+  createdAt: string;
+};
 
 /** Typed relationship kinds for CaseLink. Input values accepted by the tool. */
 export const LINK_KIND_VALUES = [
@@ -107,6 +175,8 @@ export type CaseRecord = {
   tags?: string[];
   /** Explicit assumptions or unknowns to avoid overstating exploitability. */
   assumptions?: string[];
+  /** Falsification conditions — what would disprove this hypothesis (required on new cases). */
+  disproveIf?: string[];
   /** Agent's documented attempt to disprove the finding (required before CONFIRMED). */
   disconfirmation?: string;
   /** Verification of an on-disk PoC run (set only by promoteFindingResult). */
@@ -125,12 +195,22 @@ export type CaseRecord = {
     output?: string;
     sandbox: boolean;
   };
+  /** Verification of a control-target run (set only by promoteFindingResult; anti-cheat gate). */
+  controlVerified?: {
+    path: string;
+    exitCode: number;
+    ranAt: string;
+    output?: string;
+    sandbox: boolean;
+  };
   /** ISO timestamp when CaseContext first wrote the context bundle. */
   reportedAt?: string;
   /** Path to the final report file (set by writeCaseContext; the reporter agent writes the file). */
   reportPath?: string;
-  /** Flat list of linked case IDs (back-compat; derived from linkedCases). */
-  linkedCaseIds: string[];
+  /** Role-typed, artifact-backed evidence items (separate table). */
+  evidenceItems: EvidenceItem[];
+  /** Tested (asset × attack-class) coverage cells (separate table). */
+  coverageItems: CoverageItem[];
   /** Linked cases with their relationship kind, from this case's perspective. */
   linkedCases: { id: string; kind: string }[];
   createdAt: string;
@@ -156,14 +236,16 @@ export type CaseInput = {
   blockers?: string[];
   tags?: string[];
   assumptions?: string[];
+  /** Falsification conditions — what would disprove this hypothesis (required on new cases). */
+  disproveIf?: string[];
   /** Agent's documented attempt to disprove the finding (required before CONFIRMED). */
   disconfirmation?: string;
 };
 
 type NormalizedCaseInput = Partial<CaseInput> & {
-  linkedCaseIds?: string[];
   pocVerified?: CaseRecord["pocVerified"];
   disconfirmationVerified?: CaseRecord["disconfirmationVerified"];
+  controlVerified?: CaseRecord["controlVerified"];
   reportedAt?: string;
   reportPath?: string;
 };
@@ -234,21 +316,12 @@ function stableShortId(input: string): string {
 function detectWorkspaceRoot(): string {
   // PWD is deliberately excluded: it is shell-set, can be stale or forged in
   // spawned processes, and disagree with the real cwd. Explicit overrides only,
-  // then walk up from the actual cwd.
-  const envs = ["CASEFILE_WORKSPACE_ROOT", "PI_WORKSPACE_ROOT", "GITHUB_WORKSPACE"];
-  for (const e of envs) {
-    const v = process.env[e]?.trim();
-    if (v) return resolve(v);
-  }
-
-  let curr = resolve(process.cwd());
-  for (let i = 0; i < 20; i++) {
-    if (existsSync(join(curr, ".git"))) return curr;
-    const parent = dirname(curr);
-    if (parent === curr) break;
-    curr = parent;
-  }
-  return resolve(process.cwd());
+  // then walk up from the actual cwd (.git only — the ledger predates its
+  // package.json, unlike the scratchpad).
+  return findWorkspaceRoot(
+    ["CASEFILE_WORKSPACE_ROOT", "PI_WORKSPACE_ROOT", "GITHUB_WORKSPACE"],
+    [".git"],
+  );
 }
 
 export function getCasefilePath(): string {
@@ -347,6 +420,43 @@ function getDb(): DatabaseSync {
   if (!caseCols.some((c) => c.name === "disconfirmation_verified_json")) {
     db.exec("ALTER TABLE cases ADD COLUMN disconfirmation_verified_json TEXT");
   }
+  if (!caseCols.some((c) => c.name === "disprove_if_json")) {
+    db.exec("ALTER TABLE cases ADD COLUMN disprove_if_json TEXT");
+  }
+  if (!caseCols.some((c) => c.name === "control_verified_json")) {
+    db.exec("ALTER TABLE cases ADD COLUMN control_verified_json TEXT");
+  }
+
+  // Role-typed, artifact-backed evidence items (Black-cat style evidence chain).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS evidence_items (
+      id TEXT PRIMARY KEY,
+      case_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      artifact_path TEXT,
+      sha256 TEXT,
+      summary TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (case_id) REFERENCES cases(id) ON DELETE CASCADE
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_evidence_items_case ON evidence_items(case_id)`);
+
+  // Coverage matrix: tested (asset × attack-class) cells with wide/local scope.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS coverage_items (
+      id TEXT PRIMARY KEY,
+      case_id TEXT NOT NULL,
+      asset TEXT NOT NULL,
+      class TEXT NOT NULL,
+      scope TEXT NOT NULL CHECK (scope IN ('wide', 'local')),
+      note TEXT NOT NULL,
+      tested_by TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (case_id) REFERENCES cases(id) ON DELETE CASCADE
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_coverage_items_case ON coverage_items(case_id)`);
 
   // Indexes
   db.exec(`CREATE INDEX IF NOT EXISTS idx_cases_status ON cases(status)`);
@@ -359,7 +469,12 @@ function getDb(): DatabaseSync {
 }
 
 // Helper to map DB row to CaseRecord
-function mapRow(row: any, linkedCases: { id: string; kind: string }[] = []): CaseRecord {
+function mapRow(
+  row: any,
+  linkedCases: { id: string; kind: string }[] = [],
+  evidenceItems: EvidenceItem[] = [],
+  coverageItems: CoverageItem[] = [],
+): CaseRecord {
   /** Safely parse a JSON column; returns [] for arrays, undefined for objects. */
   const safeParseArray = (raw: unknown): string[] => {
     if (!raw) return [];
@@ -400,16 +515,39 @@ function mapRow(row: any, linkedCases: { id: string; kind: string }[] = []): Cas
     blockers: safeParseArray(row.blockers_json),
     tags: safeParseArray(row.tags_json),
     assumptions: safeParseArray(row.assumptions_json),
+    disproveIf: safeParseArray(row.disprove_if_json),
     disconfirmation: row.disconfirmation || undefined,
     pocVerified: safeParseObject(row.poc_verified_json),
     disconfirmationVerified: safeParseObject(row.disconfirmation_verified_json),
+    controlVerified: safeParseObject(row.control_verified_json),
     reportedAt: row.reported_at || undefined,
     reportPath: row.report_path || undefined,
+    evidenceItems,
+    coverageItems,
     linkedCases,
-    linkedCaseIds: linkedCases.map((l) => l.id),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+/** Batch-fetch per-case item tables (evidence / coverage) for a set of ids. */
+function fetchItemMap<T extends { caseId: string }>(
+  db: DatabaseSync,
+  table: "evidence_items" | "coverage_items",
+  ids: string[],
+): Map<string, T[]> {
+  if (ids.length === 0) return new Map();
+  const placeholders = ids.map(() => "?").join(",");
+  const rows = db
+    .prepare(`SELECT * FROM ${table} WHERE case_id IN (${placeholders}) ORDER BY created_at`)
+    .all(...ids) as T[];
+  const map = new Map<string, T[]>();
+  for (const row of rows) {
+    const bucket = map.get(row.caseId);
+    if (bucket) bucket.push(row);
+    else map.set(row.caseId, [row]);
+  }
+  return map;
 }
 
 // ── Read operations ──────────────────────────────────────────────────
@@ -431,7 +569,17 @@ export function readCasefile(): CaseRecord[] {
     linkMap.get(link.source_id)?.push({ id: link.target_id, kind: link.kind });
   }
 
-  return rows.map((row: any) => mapRow(row, linkMap.get(row.id) ?? []));
+  const ids = rows.map((r: any) => r.id);
+  const evidenceMap = fetchItemMap<EvidenceItem>(db, "evidence_items", ids);
+  const coverageMap = fetchItemMap<CoverageItem>(db, "coverage_items", ids);
+  return rows.map((row: any) =>
+    mapRow(
+      row,
+      linkMap.get(row.id) ?? [],
+      evidenceMap.get(row.id) ?? [],
+      coverageMap.get(row.id) ?? [],
+    ),
+  );
 }
 
 /**
@@ -455,10 +603,18 @@ export function getCaseById(id: string): CaseRecord | undefined {
 
   const linkStmt = db.prepare("SELECT target_id, kind FROM case_links WHERE source_id = ?");
   const links = linkStmt.all(id) as { target_id: string; kind: string }[];
+  const evidence = db
+    .prepare("SELECT * FROM evidence_items WHERE case_id = ? ORDER BY created_at")
+    .all(id) as EvidenceItem[];
+  const coverage = db
+    .prepare("SELECT * FROM coverage_items WHERE case_id = ? ORDER BY created_at")
+    .all(id) as CoverageItem[];
 
   return mapRow(
     row,
     links.map((l) => ({ id: l.target_id, kind: l.kind })),
+    evidence,
+    coverage,
   );
 }
 
@@ -466,6 +622,15 @@ export function getCaseById(id: string): CaseRecord | undefined {
 
 function validateCase(record: CaseRecord): void {
   if (!record.title.trim()) throw new Error("Case title cannot be empty");
+  // Falsification conditions are load-bearing: they are required at creation
+  // and must not be erasable later (CaseUpdate({ disproveIf: [] }) would wipe
+  // the hypothesis's falsifiability). Re-check on every write.
+  if (record.status !== "reported" && !(record.disproveIf ?? []).some((d) => d.trim())) {
+    throw new Error(
+      "Cases require disproveIf — falsification conditions (what would disprove this hypothesis). " +
+        "They cannot be cleared once set.",
+    );
+  }
   // Keep this gate in lockstep with promoteFindingResult: a case may only be
   // CONFIRMED when it has evidence, a PoC, demonstrated impact, and a severity.
   if (
@@ -502,6 +667,28 @@ function validateCase(record: CaseRecord): void {
   }
 }
 
+/**
+ * Kill-reason vocabulary — a kill must name one of these (or carry refutation
+ * evidence). Single source of truth: the ledger gate AND the injected workflow
+ * text (workflow.ts imports this) must not drift apart.
+ */
+export const KILL_REASON_VALUES = [
+  "intended_behavior",
+  "duplicate",
+  "framework_protection",
+  "exploit_unreliable",
+  "insufficient_impact",
+  "environmental_issue",
+  "not_applicable",
+  "out_of_scope",
+  "skeptic-disproven",
+  "no_attack_path",
+  "refuted",
+] as const;
+export type KillReason = (typeof KILL_REASON_VALUES)[number];
+
+const KILL_REASON_PATTERN = new RegExp(`\\b(${KILL_REASON_VALUES.join("|")})\\b`, "i");
+
 function validateTransition(
   from: CaseStatus,
   to: CaseStatus,
@@ -521,8 +708,27 @@ function validateTransition(
     );
   }
 
-  if (to === "killed") return;
   if (to === "blocked") return;
+
+  if (to === "killed") {
+    // Black-cat rule: a kill must be justified. Valid iff (a) a refutation
+    // evidence item exists for this case, or (b) the update states a kill
+    // reason from the KILLED catalog vocabulary (matches workflow.ts).
+    const items = current ? listEvidenceItems(current.id) : [];
+    if (!items.some((e) => e.role === "refutation")) {
+      const text = [update.nextStep, (update.assumptions ?? []).join(" "), update.evidence]
+        .filter(Boolean)
+        .join(" ");
+      if (!KILL_REASON_PATTERN.test(text)) {
+        throw new Error(
+          "Cannot kill without justification: add refutation evidence (EvidenceAdd role=refutation) " +
+            "or state a kill reason in assumptions/nextStep (intended_behavior, duplicate, " +
+            "framework_protection, out_of_scope, skeptic-disproven, no_attack_path, ...)",
+        );
+      }
+    }
+    return;
+  }
 
   type Rule = (u: CaseUpdate, current?: CaseRecord) => string | null;
 
@@ -577,6 +783,14 @@ function validateNewCaseInput(input: CaseInput): void {
       "New cases must start as hypothesis or investigating; promote with CaseUpdate after validation",
     );
   }
+  // Black-cat style falsification: a hypothesis that cannot name what would
+  // disprove it is not a hypothesis yet. Required at creation (update later).
+  if (!input.disproveIf?.length || !input.disproveIf.some((d) => d.trim())) {
+    throw new Error(
+      "New cases require disproveIf — falsification conditions (what would disprove this hypothesis). " +
+        "Update them later via CaseUpdate if the picture changes.",
+    );
+  }
   if (input.status === "investigating") {
     if (!input.evidence) {
       throw new Error("New investigating cases require evidence (source→sink trace)");
@@ -613,16 +827,19 @@ function buildRecord(input: NormalizedCaseInput, existing?: CaseRecord): CaseRec
     blockers: normalizeList(input.blockers ?? existing?.blockers),
     tags: normalizeList(input.tags ?? existing?.tags),
     assumptions: normalizeList(input.assumptions ?? existing?.assumptions),
+    disproveIf: normalizeList(input.disproveIf ?? existing?.disproveIf),
     pocVerified: input.pocVerified ?? existing?.pocVerified,
     disconfirmation:
       input.disconfirmation !== undefined
         ? normalizeText(input.disconfirmation)
         : existing?.disconfirmation,
     disconfirmationVerified: input.disconfirmationVerified ?? existing?.disconfirmationVerified,
+    controlVerified: input.controlVerified ?? existing?.controlVerified,
     reportedAt: input.reportedAt ?? existing?.reportedAt,
     reportPath: input.reportPath ?? existing?.reportPath,
+    evidenceItems: existing?.evidenceItems ?? [],
+    coverageItems: existing?.coverageItems ?? [],
     linkedCases: existing?.linkedCases ?? [],
-    linkedCaseIds: existing?.linkedCaseIds ?? [],
     createdAt: existing?.createdAt ?? timestamp,
     updatedAt: timestamp,
   };
@@ -877,13 +1094,13 @@ function upsertCase(db: DatabaseSync, record: CaseRecord) {
       id, title, status, confidence, severity, priority, target, endpoint, bugClass,
       summary, evidence, impact, nextStep, poc, remediation,
       references_json, blockers_json, tags_json, assumptions_json, poc_verified_json,
-      disconfirmation, disconfirmation_verified_json,
+      disconfirmation, disconfirmation_verified_json, disprove_if_json, control_verified_json,
       reported_at, report_path, created_at, updated_at
     ) VALUES (
       ?, ?, ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?, ?,
-      ?, ?,
+      ?, ?, ?, ?,
       ?, ?, ?, ?
     )
     ON CONFLICT(id) DO UPDATE SET
@@ -908,6 +1125,8 @@ function upsertCase(db: DatabaseSync, record: CaseRecord) {
       poc_verified_json = excluded.poc_verified_json,
       disconfirmation = excluded.disconfirmation,
       disconfirmation_verified_json = excluded.disconfirmation_verified_json,
+      disprove_if_json = excluded.disprove_if_json,
+      control_verified_json = excluded.control_verified_json,
       reported_at = excluded.reported_at,
       report_path = excluded.report_path,
       created_at = excluded.created_at,
@@ -937,11 +1156,213 @@ function upsertCase(db: DatabaseSync, record: CaseRecord) {
     record.pocVerified ? JSON.stringify(record.pocVerified) : null,
     record.disconfirmation || null,
     record.disconfirmationVerified ? JSON.stringify(record.disconfirmationVerified) : null,
+    JSON.stringify(record.disproveIf),
+    record.controlVerified ? JSON.stringify(record.controlVerified) : null,
     record.reportedAt || null,
     record.reportPath || null,
     record.createdAt,
     record.updatedAt,
   );
+}
+
+// ── Evidence items ──────────────────────────────────────────────────
+
+function insertEvidenceItem(db: DatabaseSync, item: EvidenceItem): void {
+  db.prepare(
+    `INSERT INTO evidence_items (id, case_id, role, artifact_path, sha256, summary, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    item.id,
+    item.caseId,
+    item.role,
+    item.artifactPath ?? null,
+    item.sha256 ?? null,
+    item.summary,
+    item.createdAt,
+  );
+}
+
+/**
+ * Add a role-typed evidence item. Artifact path is hashed (SHA-256) and only
+ * its basename is stored — the full path is never persisted (path-leak guard).
+ */
+export function addEvidenceItemResult(
+  caseId: string,
+  input: { role: EvidenceRole; summary: string; artifactPath?: string },
+): EvidenceItem {
+  const db = getDb();
+  const current = getCaseById(caseId);
+  if (!current) throw new Error(`Case not found: ${caseId}`);
+  if (current.status === "killed" || current.status === "reported") {
+    throw new Error(`Cannot add evidence to terminal case ${caseId} (${current.status})`);
+  }
+  if (!(EVIDENCE_ROLE_VALUES as readonly string[]).includes(input.role)) {
+    throw new Error(
+      `Invalid evidence role: ${input.role}. Roles: ${EVIDENCE_ROLE_VALUES.join(", ")}`,
+    );
+  }
+  const summary = normalizeText(input.summary);
+  if (!summary) throw new Error("Evidence summary must not be empty");
+
+  let artifactPath: string | undefined;
+  let sha256: string | undefined;
+  if (input.artifactPath) {
+    if (!existsSync(input.artifactPath)) {
+      throw new Error(`Evidence artifact not found on disk: ${input.artifactPath}`);
+    }
+    const stat = statSync(input.artifactPath);
+    if (!stat.isFile()) {
+      throw new Error(`Evidence artifact is not a regular file: ${input.artifactPath}`);
+    }
+    if (stat.size > EVIDENCE_ARTIFACT_MAX_BYTES) {
+      throw new Error(
+        `Evidence artifact too large (${stat.size} bytes; max ${EVIDENCE_ARTIFACT_MAX_BYTES}): ${input.artifactPath}`,
+      );
+    }
+    artifactPath = basename(input.artifactPath);
+    sha256 = createHash("sha256").update(readFileSync(input.artifactPath)).digest("hex");
+  }
+
+  const item: EvidenceItem = {
+    id: `ev_${stableShortId(`${caseId}\n${summary}\n${randomUUID()}`)}`,
+    caseId,
+    role: input.role,
+    artifactPath,
+    sha256,
+    summary,
+    createdAt: new Date().toISOString(),
+  };
+  insertEvidenceItem(db, item);
+  return item;
+}
+
+export function listEvidenceItems(caseId: string): EvidenceItem[] {
+  const db = getDb();
+  return db
+    .prepare("SELECT * FROM evidence_items WHERE case_id = ? ORDER BY created_at")
+    .all(caseId) as EvidenceItem[];
+}
+
+// ── Coverage items ──────────────────────────────────────────────────
+
+function insertCoverageItem(db: DatabaseSync, item: CoverageItem): void {
+  db.prepare(
+    `INSERT INTO coverage_items (id, case_id, asset, class, scope, note, tested_by, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    item.id,
+    item.caseId,
+    item.asset,
+    item.class,
+    item.scope,
+    item.note,
+    item.testedBy ?? null,
+    item.createdAt,
+  );
+}
+
+/**
+ * Record a tested (asset × attack-class) cell. The cell's existence marks the
+ * class tested for that asset — found OR clean. `scope: wide` means the verdict
+ * is a property of the whole deployment: recorded once, applies to every asset
+ * of the deployment (do NOT re-test per asset).
+ */
+export function recordCoverageResult(
+  caseId: string,
+  input: {
+    asset: string;
+    class: string;
+    scope: CoverageScope;
+    note: string;
+    testedBy?: string;
+  },
+): CoverageItem {
+  const db = getDb();
+  const current = getCaseById(caseId);
+  if (!current) throw new Error(`Case not found: ${caseId}`);
+  if (current.status === "killed" || current.status === "reported") {
+    throw new Error(`Cannot record coverage on terminal case ${caseId} (${current.status})`);
+  }
+  if (!(COVERAGE_SCOPE_VALUES as readonly string[]).includes(input.scope)) {
+    throw new Error(
+      `Invalid coverage scope: ${input.scope}. Scope must be one of: ${COVERAGE_SCOPE_VALUES.join(", ")}`,
+    );
+  }
+  const asset = normalizeText(input.asset);
+  const attackClass = normalizeText(input.class);
+  const note = normalizeText(input.note);
+  if (!asset) throw new Error("Coverage asset must not be empty");
+  if (!attackClass) throw new Error("Coverage class must not be empty");
+  if (!note) throw new Error("Coverage note must not be empty");
+
+  const item: CoverageItem = {
+    id: `cov_${stableShortId(`${caseId}\n${asset}\n${attackClass}\n${input.scope}\n${randomUUID()}`)}`,
+    caseId,
+    asset,
+    class: attackClass,
+    scope: input.scope,
+    note,
+    testedBy: input.testedBy ? normalizeText(input.testedBy) : undefined,
+    createdAt: new Date().toISOString(),
+  };
+  insertCoverageItem(db, item);
+  return item;
+}
+
+export function listCoverage(caseId: string): CoverageItem[] {
+  const db = getDb();
+  return db
+    .prepare("SELECT * FROM coverage_items WHERE case_id = ? ORDER BY created_at")
+    .all(caseId) as CoverageItem[];
+}
+
+export type CoverageSummary = {
+  items: CoverageItem[];
+  /** Cells grouped per asset (wide cells repeated under every later asset they cover). */
+  byAsset: Record<string, CoverageItem[]>;
+  assets: string[];
+  classes: string[];
+};
+
+/**
+ * Machine-checkable coverage view: which (asset × class) cells are tested.
+ * A `wide` cell covers every asset recorded after it — a class with a wide
+ * clean verdict must NOT be re-tested per asset (that is the wide semantics).
+ */
+export function coverageSummary(caseId: string): CoverageSummary {
+  const items = listCoverage(caseId);
+  const byAsset: Record<string, CoverageItem[]> = {};
+  const assets: string[] = [];
+  const classes: string[] = [];
+
+  for (const item of items) {
+    if (!assets.includes(item.asset)) assets.push(item.asset);
+    if (!classes.includes(item.class)) classes.push(item.class);
+    if (!byAsset[item.asset]) byAsset[item.asset] = [];
+    byAsset[item.asset].push(item);
+  }
+  // Wide cells: a deployment-wide verdict covers every asset in the case. A
+  // local cell for the same class on the same asset is more specific and wins
+  // (the agent re-tested after the wide verdict — record shows both).
+  const wideByClass = new Map<string, CoverageItem>();
+  for (const item of items) {
+    if (item.scope === "wide") {
+      const prev = wideByClass.get(item.class);
+      if (!prev || item.createdAt >= prev.createdAt) wideByClass.set(item.class, item);
+    }
+  }
+  for (const [cls, wide] of wideByClass) {
+    for (const asset of assets) {
+      if (!byAsset[asset]) byAsset[asset] = [];
+      const cells = byAsset[asset];
+      const hasLocal = cells.some((c) => c.class === cls && c.scope === "local");
+      const hasWide = cells.some((c) => c.class === cls && c.scope === "wide");
+      if (!hasLocal && !hasWide) {
+        cells.push({ ...wide, asset, note: `${wide.note} (wide verdict covers this asset)` });
+      }
+    }
+  }
+  return { items, byAsset, assets, classes };
 }
 
 export function addCaseResult(input: CaseInput): CaseAddResult {
@@ -983,49 +1404,24 @@ export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResu
     throw new Error("Cannot mutate a reported case; file a follow-up case instead");
   }
 
-  const optionalFields = [
-    "title",
-    "target",
-    "endpoint",
-    "bugClass",
-    "summary",
-    "evidence",
-    "impact",
-    "nextStep",
-    "poc",
-    "remediation",
-    "disconfirmation",
-  ] as const;
-  const optionalPatch: Record<string, unknown> = {};
-  for (const field of optionalFields) {
-    if (field in update && update[field] !== undefined) {
-      optionalPatch[field] = update[field];
-    }
-  }
-
-  let next = buildRecord(
-    {
-      ...optionalPatch,
-      status: update.status ?? current.status,
-      confidence: update.confidence ?? current.confidence,
-      severity: update.severity ?? current.severity,
-      priority: update.priority ?? current.priority,
-      references: update.references ?? current.references,
-      blockers: update.blockers ?? current.blockers,
-      tags: update.tags ?? current.tags,
-      assumptions: update.assumptions ?? current.assumptions,
-    },
-    current,
-  );
+  // buildRecord resolves every field as `update.x ?? current.x`; the patch
+  // construction is the update itself.
+  let next = buildRecord(update, current);
 
   if (update.status && update.status !== current.status) {
     validateTransition(current.status, next.status, update, current);
   }
 
-  // Demoting off confirmed invalidates prior PoC + disconfirmation verification —
-  // re-promote required. Both verification artifacts must be re-earned together.
+  // Demoting off confirmed invalidates prior PoC + disconfirmation + control
+  // verification — re-promote required. All three artifacts must be re-earned
+  // together (a stale control run must not survive a demote/re-promote cycle).
   if (current.status === "confirmed" && next.status === "investigating") {
-    next = { ...next, pocVerified: undefined, disconfirmationVerified: undefined };
+    next = {
+      ...next,
+      pocVerified: undefined,
+      disconfirmationVerified: undefined,
+      controlVerified: undefined,
+    };
   }
 
   validateCase(next);
@@ -1044,8 +1440,9 @@ export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResu
           if (
             k === "updatedAt" ||
             k === "createdAt" ||
-            k === "linkedCaseIds" ||
-            k === "linkedCases"
+            k === "linkedCases" ||
+            k === "evidenceItems" ||
+            k === "coverageItems"
           ) {
             acc[k] = "";
           } else {
@@ -1083,6 +1480,8 @@ export type PocVerification = {
   ranAt: string;
   output?: string;
   sandbox: boolean;
+  /** True iff the script ran to completion (not a spawn error / signal kill / timeout). */
+  completed?: boolean;
 };
 
 /**
@@ -1128,6 +1527,8 @@ export function promoteFindingResult(
   id: string,
   verification: PocVerification,
   disconfirmationVerification?: PocVerification,
+  controlVerification?: PocVerification,
+  marker?: string,
 ): CaseUpdateResult {
   const db = getDb();
   const current = assertPromotable(id);
@@ -1136,6 +1537,62 @@ export function promoteFindingResult(
       `PoC verification failed (exit ${verification.exitCode}); cannot promote to confirmed`,
     );
   }
+
+  // Anti-cheat, enforced at the ledger level (not just the tool): a live
+  // finding (any non-sandboxed run — `sandbox` must be explicitly true to
+  // skip the control; undefined/false from JS callers fails closed) must carry
+  // a control-target verification that COMPLETED and, when the marker is known
+  // to the caller, did NOT print the marker in its output. Checking presence
+  // alone is not enough: a control run that crashed (completed: false) or that
+  // printed the marker proves nothing about target-dependence.
+  const isLive = verification.sandbox !== true;
+  if (isLive) {
+    const controlOk =
+      controlVerification?.completed === true &&
+      (!marker || !(controlVerification.output ?? "").includes(marker));
+    if (!controlOk) {
+      throw new Error(
+        "Live findings (non-sandboxed PoC run) require a valid controlVerification: a control-target " +
+          "run of the same PoC that COMPLETED (completed: true)" +
+          (marker ? ` and whose output does not contain the marker "${marker}"` : "") +
+          ". PromoteFinding requires control_path for local:true findings.",
+      );
+    }
+  }
+
+  // Evidence-chain closure pre-check BEFORE any DB write: the observation item
+  // must already exist. Checking first means a failed promote (missing
+  // observation) writes nothing — no phantom reproduction item is left on an
+  // investigating case, and a retry sees the real error, not a PK conflict.
+  if (!current.evidenceItems.some((e) => e.role === "observation")) {
+    throw new Error(
+      "Evidence chain incomplete: CONFIRMED requires an observation evidence item " +
+        "(EvidenceAdd role=observation — the initial signal, artifact-backed) in addition to " +
+        "the auto-recorded reproduction item. Add the observation item and retry promotion.",
+    );
+  }
+
+  // Machine-recorded reproduction evidence: the PoC gate itself writes the
+  // artifact-backed evidence item — confirmation is anchored to a real file
+  // with its SHA-256, not to agent prose in the evidence field.
+  let pocSha256: string | undefined;
+  try {
+    pocSha256 = createHash("sha256").update(readFileSync(verification.path)).digest("hex");
+  } catch {
+    pocSha256 = undefined;
+  }
+  const reproductionItem: EvidenceItem = {
+    id: `ev_${stableShortId(`${id}\nreproduction\n${verification.ranAt}`)}`,
+    caseId: id,
+    role: "reproduction",
+    artifactPath: basename(verification.path),
+    sha256: pocSha256,
+    summary: `PoC run exit ${verification.exitCode} (sandbox: ${verification.sandbox}) — verification marker present in output`,
+    createdAt: verification.ranAt,
+  };
+  insertEvidenceItem(db, reproductionItem);
+  // Attach to the record being validated (current was fetched pre-insert).
+  current.evidenceItems = [...(current.evidenceItems ?? []), reproductionItem];
 
   const newEvidence =
     (current.evidence ? `${current.evidence}\n\n` : "") +
@@ -1152,6 +1609,9 @@ export function promoteFindingResult(
   if (disconfirmationVerification) {
     update.disconfirmationVerified = disconfirmationVerification;
   }
+  if (controlVerification) {
+    update.controlVerified = controlVerification;
+  }
 
   const next = buildRecord(update, current);
   validateCase(next);
@@ -1160,7 +1620,267 @@ export function promoteFindingResult(
   return { record: next, changed: true };
 }
 
+// ── Chain suggestions ───────────────────────────────────────────────
+
+/** Automated exploit-chain patterns (ported shape from CyberStrike chain.ts). */
+const CHAIN_PATTERN_VALUES = [
+  "credential_endpoint",
+  "info_disclosure_ssrf",
+  "redirect_oauth",
+  "idor_data_leak",
+  "xss_csrf",
+  "ssti_rce",
+  "race_condition_business",
+] as const;
+export type ChainPattern = (typeof CHAIN_PATTERN_VALUES)[number];
+
+export type ChainSuggestion = {
+  pattern: ChainPattern;
+  sourceId: string;
+  targetId?: string;
+  sourceTitle: string;
+  targetTitle?: string;
+  rationale: string;
+  confidence: number;
+  /** Suggested CaseLink kind when the agent links the pair. */
+  suggestedKind?: CaseLinkKind;
+};
+
+// Word-boundary anchored so "admin" does not match "administration" and
+// "update" does not match "updated" — substring matching over-mines pairs.
+const CHAIN_CLASS_RE = {
+  credential: /\b(credential|password|api[ -]?key|token|secret|leak|dump|exposure)\b/i,
+  authEndpoint: /\b(auth|login|sso|signup|account|admin|endpoint|api)\b/i,
+  redirect: /\b(open redirect|redirect)\b/i,
+  oauth: /\b(oauth|callback|redirect_uri|sso|saml|openid|authorize)\b/i,
+  xss: /\b(xss|cross-?site.?script)\b/i,
+  stateChange:
+    /\b(POST|PUT|DELETE|PATCH|create|update|delete|transfer|payment|invite|admin|state.?chang)\b/i,
+  idor: /\b(idor|bola|object reference|broken access)\b/i,
+  userData:
+    /\b(user|users|profile|account|accounts|email|phone|address|personal|private|settings|data)\b/i,
+  ssti: /\b(ssti|template injection|template render)\b/i,
+  race: /\b(race|toctou|concurrent)\b/i,
+  payment: /\b(payment|transfer|order|checkout|cart|purchase|balance|credit|withdraw|deposit)\b/i,
+  infoDisclosure: /\b(info disclosure|information disclosure|leak|exposure|debug)\b/i,
+  ssrf: /\b(ssrf|server-?side request)\b/i,
+} satisfies Record<string, RegExp>;
+
+/** Multi-label second-level suffixes — *.co.uk must not false-pair via last-2 labels. */
+const SECOND_LEVEL_SUFFIXES = new Set([
+  "co",
+  "com",
+  "org",
+  "net",
+  "gov",
+  "ac",
+  "edu",
+  "mil",
+  "ltd",
+  "me",
+  "tv",
+  "info",
+  "biz",
+]);
+
+function eTLDPlus1(host: string): string {
+  const parts = host.split(".");
+  if (parts.length >= 3 && SECOND_LEVEL_SUFFIXES.has(parts[parts.length - 2] ?? "")) {
+    return parts.slice(-3).join(".");
+  }
+  return parts.slice(-2).join(".");
+}
+
+function chainText(c: CaseRecord): string {
+  return [c.title, c.bugClass ?? "", c.evidence ?? ""].join(" ");
+}
+
+function hasChainClass(c: CaseRecord, re: RegExp): boolean {
+  return re.test(chainText(c));
+}
+
+/** Same asset or related (same eTLD+1) — chains only pair cases on one target. */
+function sameAssetOrRelated(a: CaseRecord, b: CaseRecord): boolean {
+  const ta = (a.target ?? "").toLowerCase().trim();
+  const tb = (b.target ?? "").toLowerCase().trim();
+  if (!ta || !tb) return false;
+  if (ta === tb) return true;
+  if (ta.includes(tb) || tb.includes(ta)) return true;
+  return eTLDPlus1(ta) === eTLDPlus1(tb);
+}
+
+/**
+ * Scan non-terminal cases for exploitable chains (CyberStrike-style detection
+ * over XPI's case records). Emits ranked suggestions; the agent decides
+ * whether to CaseLink or open an escalation case.
+ */
+export function suggestChains(caseId?: string): ChainSuggestion[] {
+  // Pair over ALL non-terminal cases; the caseId filter narrows the RESULTS
+  // to suggestions involving that case (filtering the inputs first would drop
+  // unlinked partner cases and kill cross-case pairing).
+  const cases = readCasefile().filter((c) => c.status !== "killed" && c.status !== "reported");
+  const suggestions: ChainSuggestion[] = [];
+  const seen = new Set<string>();
+  const confirmed = (c: CaseRecord) => c.status === "confirmed";
+  const confidenceFor = (a: CaseRecord, b?: CaseRecord) => {
+    const both = confirmed(a) && (!b || confirmed(b));
+    const one = confirmed(a) || (b ? confirmed(b) : false);
+    return both ? 90 : one ? 75 : 55;
+  };
+  const add = (
+    pattern: ChainPattern,
+    a: CaseRecord,
+    b: CaseRecord | undefined,
+    rationale: string,
+    kind?: CaseLinkKind,
+  ) => {
+    const key = b ? `${pattern}:${[a.id, b.id].sort().join("+")}` : `${pattern}:${a.id}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    suggestions.push({
+      pattern,
+      sourceId: a.id,
+      targetId: b?.id,
+      sourceTitle: a.title,
+      targetTitle: b?.title,
+      rationale,
+      confidence: confidenceFor(a, b),
+      suggestedKind: kind,
+    });
+  };
+
+  // Pair rules as data: (classifier A, classifier B, rationale, link kind).
+  // One loop replaces seven copy-pasted pair loops.
+  const PAIR_RULES: Array<{
+    pattern: Exclude<ChainPattern, "ssti_rce">;
+    a: RegExp;
+    b: RegExp;
+    rationale: (a: CaseRecord, b: CaseRecord) => string;
+    kind?: CaseLinkKind;
+  }> = [
+    {
+      pattern: "credential_endpoint",
+      a: CHAIN_CLASS_RE.credential,
+      b: CHAIN_CLASS_RE.authEndpoint,
+      kind: "depends-on",
+      rationale: (a, b) =>
+        `Use leaked credential "${a.title}" to authenticate against "${b.title}" → account takeover`,
+    },
+    {
+      pattern: "redirect_oauth",
+      a: CHAIN_CLASS_RE.redirect,
+      b: CHAIN_CLASS_RE.oauth,
+      rationale: (a, b) =>
+        `Chain open redirect "${a.title}" into OAuth flow "${b.title}" to steal access tokens`,
+    },
+    {
+      pattern: "xss_csrf",
+      a: CHAIN_CLASS_RE.xss,
+      b: CHAIN_CLASS_RE.stateChange,
+      rationale: (a, b) =>
+        `Use XSS "${a.title}" to drive state-changing "${b.title}" (CSRF bypass / victim-action)`,
+    },
+    {
+      pattern: "idor_data_leak",
+      a: CHAIN_CLASS_RE.idor,
+      b: CHAIN_CLASS_RE.userData,
+      rationale: (a, b) => `Use IDOR "${a.title}" to enumerate user data via "${b.title}"`,
+    },
+    {
+      pattern: "race_condition_business",
+      a: CHAIN_CLASS_RE.race,
+      b: CHAIN_CLASS_RE.payment,
+      rationale: (a, b) =>
+        `Use race condition "${a.title}" on financial endpoint "${b.title}" (double-spend / bypass)`,
+    },
+    {
+      pattern: "info_disclosure_ssrf",
+      a: CHAIN_CLASS_RE.infoDisclosure,
+      b: CHAIN_CLASS_RE.ssrf,
+      rationale: (a, b) =>
+        `Use internal URL/config from "${a.title}" as SSRF target via "${b.title}"`,
+    },
+  ];
+
+  for (const rule of PAIR_RULES) {
+    const aCases = cases.filter((c) => rule.a.test(chainText(c)));
+    const bCases = cases.filter((c) => rule.b.test(chainText(c)));
+    for (const a of aCases) {
+      for (const b of bCases) {
+        if (a.id === b.id || !sameAssetOrRelated(a, b)) continue;
+        add(rule.pattern, a, b, rule.rationale(a, b), rule.kind);
+      }
+    }
+  }
+
+  // SSTI → RCE (single-case escalation)
+  for (const s of cases.filter((c) => hasChainClass(c, CHAIN_CLASS_RE.ssti))) {
+    add("ssti_rce", s, undefined, `Escalate SSTI "${s.title}" to RCE via template-engine gadgets`);
+  }
+
+  const scoped = caseId
+    ? suggestions.filter((s) => s.sourceId === caseId || s.targetId === caseId)
+    : suggestions;
+  return scoped.sort((a, b) => b.confidence - a.confidence);
+}
+
 // ── Link operations ──────────────────────────────────────────────────
+
+/** Both cases must exist and be mutable (not killed/reported). */
+function assertMutablePair(
+  sourceId: string,
+  targetId: string,
+  verb: "link" | "unlink",
+): { source: CaseRecord; target: CaseRecord } {
+  const source = getCaseById(sourceId);
+  const target = getCaseById(targetId);
+  if (!source) throw new Error(`Case not found: ${sourceId}`);
+  if (!target) throw new Error(`Case not found: ${targetId}`);
+  if (source.status === "killed" || source.status === "reported") {
+    throw new Error(`Cannot ${verb} terminal case ${sourceId} (${source.status})`);
+  }
+  if (target.status === "killed" || target.status === "reported") {
+    throw new Error(`Cannot ${verb} terminal case ${targetId} (${target.status})`);
+  }
+  return { source, target };
+}
+
+/** Run a case_links mutation + updated_at touch inside one transaction. */
+function withLinkTx(
+  db: DatabaseSync,
+  sourceId: string,
+  targetId: string,
+  mutate: (db: DatabaseSync) => void,
+): void {
+  db.exec("BEGIN");
+  try {
+    mutate(db);
+    const now = new Date().toISOString();
+    const updateTimeStmt = db.prepare("UPDATE cases SET updated_at = ? WHERE id = ?");
+    updateTimeStmt.run(now, sourceId);
+    updateTimeStmt.run(now, targetId);
+    db.exec("COMMIT");
+  } catch (err) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // ignore
+    }
+    throw err;
+  }
+}
+
+function existingLinkKind(
+  db: DatabaseSync,
+  sourceId: string,
+  targetId: string,
+): string | undefined {
+  return (
+    db
+      .prepare("SELECT kind FROM case_links WHERE source_id = ? AND target_id = ?")
+      .get(sourceId, targetId) as { kind: string } | undefined
+  )?.kind;
+}
 
 export function linkCasesResult(sourceId: string, targetId: string, kind?: string): CaseLinkResult {
   const db = getDb();
@@ -1171,131 +1891,59 @@ export function linkCasesResult(sourceId: string, targetId: string, kind?: strin
     kind && (LINK_KIND_VALUES as readonly string[]).includes(kind)
       ? (kind as CaseLinkKind)
       : DEFAULT_LINK_KIND;
-  const source = getCaseById(sourceId);
-  const target = getCaseById(targetId);
-  if (!source) throw new Error(`Case not found: ${sourceId}`);
-  if (!target) throw new Error(`Case not found: ${targetId}`);
-  if (source.status === "killed" || source.status === "reported") {
-    throw new Error(`Cannot link terminal case ${sourceId} (${source.status})`);
-  }
-  if (target.status === "killed" || target.status === "reported") {
-    throw new Error(`Cannot link terminal case ${targetId} (${target.status})`);
-  }
+  const { source, target } = assertMutablePair(sourceId, targetId, "link");
 
-  const checkStmt = db.prepare("SELECT kind FROM case_links WHERE source_id = ? AND target_id = ?");
-  const existing = checkStmt.get(sourceId, targetId) as { kind: string } | undefined;
-
+  const existing = existingLinkKind(db, sourceId, targetId);
   if (existing) {
-    return {
-      source,
-      target,
-      changed: false,
-      reason: "Cases are already linked",
-      kind: existing.kind,
-    };
+    return { source, target, changed: false, reason: "Cases are already linked", kind: existing };
   }
 
   // Atomic insert both directions: source→target keeps the stated kind, the
   // reverse row stores the inverse so each case lists the edge from its own
   // perspective.
   const inverseKind = LINK_KIND_INVERSE[resolvedKind];
-  db.exec("BEGIN");
-  try {
-    const linkStmt = db.prepare(
+  withLinkTx(db, sourceId, targetId, (tx) => {
+    const linkStmt = tx.prepare(
       "INSERT INTO case_links (source_id, target_id, kind) VALUES (?, ?, ?)",
     );
     linkStmt.run(sourceId, targetId, resolvedKind);
     linkStmt.run(targetId, sourceId, inverseKind);
+  });
 
-    const now = new Date().toISOString();
-    const updateTimeStmt = db.prepare("UPDATE cases SET updated_at = ? WHERE id = ?");
-    updateTimeStmt.run(now, sourceId);
-    updateTimeStmt.run(now, targetId);
-    db.exec("COMMIT");
-  } catch (err) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // ignore
-    }
-    throw err;
-  }
-
-  const finalSource = getCaseById(sourceId)!;
-  const finalTarget = getCaseById(targetId)!;
-  return { source: finalSource, target: finalTarget, changed: true, kind: resolvedKind };
+  return {
+    source: getCaseById(sourceId)!,
+    target: getCaseById(targetId)!,
+    changed: true,
+    kind: resolvedKind,
+  };
 }
 
 export function unlinkCasesResult(sourceId: string, targetId: string): CaseLinkResult {
   const db = getDb();
-  const source = getCaseById(sourceId);
-  const target = getCaseById(targetId);
-  if (!source) throw new Error(`Case not found: ${sourceId}`);
-  if (!target) throw new Error(`Case not found: ${targetId}`);
-  if (source.status === "killed" || source.status === "reported") {
-    throw new Error(`Cannot unlink terminal case ${sourceId} (${source.status})`);
-  }
-  if (target.status === "killed" || target.status === "reported") {
-    throw new Error(`Cannot unlink terminal case ${targetId} (${target.status})`);
-  }
+  const { source, target } = assertMutablePair(sourceId, targetId, "unlink");
 
-  const checkStmt = db.prepare("SELECT kind FROM case_links WHERE source_id = ? AND target_id = ?");
-  const existing = checkStmt.get(sourceId, targetId) as { kind: string } | undefined;
-
+  const existing = existingLinkKind(db, sourceId, targetId);
   if (!existing) {
     return { source, target, changed: false, reason: "Cases are not linked", kind: "related" };
   }
 
-  db.exec("BEGIN");
-  try {
-    const unlinkStmt = db.prepare(
+  withLinkTx(db, sourceId, targetId, (tx) => {
+    tx.prepare(
       "DELETE FROM case_links WHERE (source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?)",
-    );
-    unlinkStmt.run(sourceId, targetId, targetId, sourceId);
+    ).run(sourceId, targetId, targetId, sourceId);
+  });
 
-    const now = new Date().toISOString();
-    const updateTimeStmt = db.prepare("UPDATE cases SET updated_at = ? WHERE id = ?");
-    updateTimeStmt.run(now, sourceId);
-    updateTimeStmt.run(now, targetId);
-    db.exec("COMMIT");
-  } catch (err) {
-    try {
-      db.exec("ROLLBACK");
-    } catch {
-      // ignore
-    }
-    throw err;
-  }
-
-  const finalSource = getCaseById(sourceId)!;
-  const finalTarget = getCaseById(targetId)!;
-  return { source: finalSource, target: finalTarget, changed: true, kind: existing.kind };
+  return {
+    source: getCaseById(sourceId)!,
+    target: getCaseById(targetId)!,
+    changed: true,
+    kind: existing,
+  };
 }
 
 // ── Search & Queries ─────────────────────────────────────────────────
 
-// Searchable text columns (excludes ids/timestamps/JSON arrays for performance + signal).
-const SEARCH_COLUMNS = [
-  "title",
-  "summary",
-  "evidence",
-  "impact",
-  "target",
-  "endpoint",
-  "bugClass",
-  "poc",
-] as const;
-
-const FIELD_COLUMN: Record<CaseSearchField, string> = {
-  title: "title",
-  summary: "summary",
-  evidence: "evidence",
-  impact: "impact",
-  target: "target",
-  endpoint: "endpoint",
-  bugClass: "bugClass",
-  poc: "poc",
-};
+// Search field names double as their column names (SEARCH_FIELD_VALUES above).
 
 function severityRank(s: CaseSeverity): number {
   return SEVERITY_VALUES.indexOf(s);
@@ -1354,12 +2002,12 @@ function buildCaseWhere(options: CaseSearchOptions): {
   if (query) {
     const likeParam = `%${query}%`;
     if (options.field) {
-      where.push(`lower(${FIELD_COLUMN[options.field]}) LIKE ?`);
+      where.push(`lower(${options.field}) LIKE ?`);
       params.push(likeParam);
     } else {
-      const ors = SEARCH_COLUMNS.map((c) => `lower(${c}) LIKE ?`).join(" OR ");
+      const ors = SEARCH_FIELD_VALUES.map((c) => `lower(${c}) LIKE ?`).join(" OR ");
       where.push(`(${ors})`);
-      for (let i = 0; i < SEARCH_COLUMNS.length; i++) params.push(likeParam);
+      for (let i = 0; i < SEARCH_FIELD_VALUES.length; i++) params.push(likeParam);
     }
   }
 
@@ -1465,7 +2113,7 @@ export function formatCaseDetail(record: CaseRecord): string {
     if (
       !val ||
       (Array.isArray(val) && !val.length) ||
-      ["id", "createdAt", "updatedAt", "linkedCaseIds"].includes(key)
+      ["id", "createdAt", "updatedAt"].includes(key)
     )
       continue;
     const label = key.charAt(0).toUpperCase() + key.slice(1).replace(/([A-Z])/g, " $1");
@@ -1500,17 +2148,8 @@ function mdSection(title: string, body?: string): string {
 // pipeline artifacts (recon entry points, traces, skeptic verdicts, PoC logs)
 // from any scratchpad run that produced this case.
 
-const CONTEXT_PHASES: ScratchpadPhase[] = [
-  "recon",
-  "hunt",
-  "gapfil",
-  "trace",
-  "skeptic",
-  "validate",
-  "chain",
-  "patch",
-  "report",
-];
+// Context bundles cover every pipeline phase (imported from the scratchpad
+// where the canonical order lives).
 
 /** Per-artifact content cap for the context bundle (generous; artifacts are small). */
 const MAX_ARTIFACT_CHARS = 100_000;
@@ -1521,9 +2160,13 @@ function buildCompleteRecord(current: CaseRecord): string {
     if (v === undefined || v === null || v === "") continue;
     let display = typeof v === "object" ? JSON.stringify(v, null, 2) : String(v);
     // Path-leak guard: the verification objects carry the researcher's local
-    // PoC/disconfirmation script paths — show basenames only (the dedicated
+    // PoC/disconfirmation/control script paths — show basenames only (the dedicated
     // log sections below already render them as basenames).
-    if ((k === "pocVerified" || k === "disconfirmationVerified") && v && typeof v === "object") {
+    if (
+      (k === "pocVerified" || k === "disconfirmationVerified" || k === "controlVerified") &&
+      v &&
+      typeof v === "object"
+    ) {
       const redacted = {
         ...(v as Record<string, unknown>),
         path: basename((v as { path?: string }).path ?? ""),
@@ -1586,7 +2229,7 @@ function buildScratchpadSection(caseId: string): string {
     if (!allIds.includes(caseId) && !namedInArtifact) continue;
 
     sections.push(`### Run: ${entry.name} (project root: ${resume.checkpoint.project_root})`);
-    for (const phase of CONTEXT_PHASES) {
+    for (const phase of PHASE_ORDER) {
       const names = resume.artifacts[phase];
       if (!names?.length) continue;
       sections.push(`#### ${phase}/`);
@@ -1615,6 +2258,20 @@ export function writeCaseContext(id: string): {
   if (!current) throw new Error(`Case not found: ${id}`);
   if (current.status !== "confirmed" && current.status !== "reported") {
     throw new Error("Case context requires a confirmed or reported case");
+  }
+
+  // Report-time evidence-chain closure: a report bundle for a confirmed case
+  // must carry the full observation → reproduction chain. A confirmed case
+  // without it (e.g. promoted before the gate existed) is not reportable.
+  if (
+    current.status === "confirmed" &&
+    (!current.evidenceItems?.some((e) => e.role === "observation") ||
+      !current.evidenceItems?.some((e) => e.role === "reproduction"))
+  ) {
+    throw new Error(
+      `Case ${id} is confirmed but lacks the evidence chain (observation + reproduction items). ` +
+        "Add the missing EvidenceAdd items before generating the report context.",
+    );
   }
 
   const db = getDb();
@@ -1669,6 +2326,12 @@ export function writeCaseContext(id: string): {
           `### PoC Run Verification\n- **Timestamp:** ${current.pocVerified.ranAt}\n- **Script:** \`${basename(current.pocVerified.path)}\`\n- **Sandbox:** ${current.pocVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.pocVerified.exitCode}\n\n#### Output\n\`\`\`\n${current.pocVerified.output ?? ""}\n\`\`\``,
         )
       : undefined,
+    current.controlVerified
+      ? mdSection(
+          "Control-Target Check (anti-cheat)",
+          `### Control Run Verification\n- **Timestamp:** ${current.controlVerified.ranAt}\n- **Script:** \`${basename(current.controlVerified.path)}\`\n- **Sandbox:** ${current.controlVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.controlVerified.exitCode}\n- **Marker on control:** absent (required) — same PoC against a target lacking the vuln did NOT print the verification marker.\n\n#### Output\n\`\`\`\n${current.controlVerified.output ?? ""}\n\`\`\``,
+        )
+      : undefined,
     mdSection("Disconfirmation Attempt", current.disconfirmation),
     current.disconfirmationVerified
       ? mdSection(
@@ -1677,6 +2340,17 @@ export function writeCaseContext(id: string): {
         )
       : undefined,
     mdSection("Impact", current.impact),
+    mdSection(
+      "Evidence Items (role-typed, hashed)",
+      current.evidenceItems.length
+        ? current.evidenceItems
+            .map(
+              (e) =>
+                `- [${e.role}] ${e.summary}${e.artifactPath ? ` — artifact \`${e.artifactPath}\` sha256 \`${e.sha256 ?? "?"}\`` : ""} (${e.createdAt})`,
+            )
+            .join("\n")
+        : "None recorded.",
+    ),
     mdSection("Remediation", current.remediation),
     mdSection("Assumptions and Uncertainty", assumptions),
     mdSection("References", references),

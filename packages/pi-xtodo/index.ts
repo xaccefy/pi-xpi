@@ -20,14 +20,14 @@ import { Type } from "@sinclair/typebox";
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
-export const TOOL_NAME = "todo";
-export const TOOL_LABEL = "Todo";
-export const COMMAND_NAME = "todos";
+const TOOL_NAME = "todo";
+const TOOL_LABEL = "Todo";
+const COMMAND_NAME = "todos";
 
-export type TaskStatus = "pending" | "in_progress" | "completed" | "deleted";
-export type TaskAction = "create" | "update" | "list" | "get" | "delete" | "clear";
+type TaskStatus = "pending" | "in_progress" | "completed" | "deleted";
+type TaskAction = "create" | "update" | "list" | "get" | "delete" | "clear";
 
-export interface Task {
+interface Task {
   id: number;
   subject: string;
   description?: string;
@@ -705,9 +705,10 @@ export default function registerTodo(pi: ExtensionAPI) {
     description: "Show todo list overlay",
     handler: async (_args, ctx) => {
       const sessionId = sid(ctx);
-      const state = getSessionState(sessionId);
+      // Disk wins when it has tasks; otherwise show whatever is in memory.
       const stored = restoreState(sessionId);
-      const t = stored && stored.tasks.length > 0 ? stored : state;
+      const t =
+        stored && stored.tasks.length > 0 ? stored : (sessions.get(sessionId) ?? freshState());
       await showTodosOverlay(ctx, t.tasks);
     },
   });

@@ -6,7 +6,7 @@
  */
 
 import { Type } from "@sinclair/typebox";
-import { TtlLruCache } from "./cache.ts";
+import { TtlLruCache } from "@xaccefy/pi-shared";
 
 const DEEPWIKI_MCP_URL = "https://mcp.deepwiki.com/mcp";
 const DEEPWIKI_TOOL = "ask_question";

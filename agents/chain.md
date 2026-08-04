@@ -52,9 +52,11 @@ CaseAdd(
   target: "<target>",
   severity: "<chain severity — see rules below>",
   summary: "<narrative>",
-  tags: ["pipeline", "chain"]
+  tags: ["pipeline", "chain"],
+  disproveIf: ["<what would break the chain — e.g. step X does not attack-share the session>"]
 )
 ```
+(`disproveIf` is required on every CaseAdd.)
 
 **Chain severity rules — from proven step severities, never inflate:**
 - Chain severity = **highest severity among its confirmed steps**. Two `high` findings = `high`, not `critical`.
@@ -72,7 +74,7 @@ Return the chain case IDs and severities in your output. The harness folds them 
 ### 5. Handle degraded state
 
 If no chains are found:
-- Create a chain summary case stating "No multi-step chains identified — all findings are standalone"
+- Create a chain summary case (with `disproveIf: ["a later finding reveals a shared primitive"]`) stating "No multi-step chains identified — all findings are standalone"
 - Keep individual findings' severities as-is
 
 If the chain analysis itself fails (tool error, timeout):

@@ -36,23 +36,10 @@ const REDIRECT_LIST = ["follow", "manual"];
 
 // ── Session / cookie jar ─────────────────────────────────
 
-// Module-level state persists across http_request calls within a Pi
-// session (extension is loaded once per session). Cleared on
-// session_shutdown.
-interface SessionState {
-  cookies: Map<string, string>; // hostname → "k1=v1; k2=v2"
-}
-
-const sessions = new Map<string, SessionState>();
-
-function getSession(name: string): SessionState {
-  let s = sessions.get(name);
-  if (!s) {
-    s = { cookies: new Map() };
-    sessions.set(name, s);
-  }
-  return s;
-}
+// Module-level cookie jar (hostname → "k1=v1; k2=v2") persists across
+// http_request calls within a Pi session (extension is loaded once per
+// session). Cleared on session_shutdown.
+const cookieJar = new Map<string, string>();
 
 // ── Cookie helpers ───────────────────────────────────────
 
@@ -72,8 +59,7 @@ function injectCookieHeader(
   hostname: string,
   existing: Record<string, string>,
 ): Record<string, string> {
-  const jar = getSession("default");
-  const sessionCookies = jar.cookies.get(hostname);
+  const sessionCookies = cookieJar.get(hostname);
 
   if (!sessionCookies) return { ...existing };
   const cookieKey = findHeaderKey(existing, "cookie");
@@ -93,14 +79,13 @@ function injectCookieHeader(
 }
 
 function storeResponseCookies(hostname: string, res: Response): void {
-  const jar = getSession("default");
   const raw = (res.headers as any).getSetCookie?.() as string[] | undefined;
   if (!raw) return;
   // Parse the existing jar into a name→value map so a rotated Set-Cookie
   // (same name, new value) replaces rather than appends — servers expect
   // the latest value to win, and duplicate Cookie pairs are ambiguous.
   const current = new Map<string, string>();
-  for (const pair of (jar.cookies.get(hostname) || "").split(";")) {
+  for (const pair of (cookieJar.get(hostname) || "").split(";")) {
     const eq = pair.indexOf("=");
     if (eq > 0) current.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
   }
@@ -110,7 +95,7 @@ function storeResponseCookies(hostname: string, res: Response): void {
     if (eq <= 0) continue;
     current.set(segment.slice(0, eq).trim(), segment.slice(eq + 1).trim());
   }
-  jar.cookies.set(hostname, [...current].map(([k, v]) => `${k}=${v}`).join("; "));
+  cookieJar.set(hostname, [...current].map(([k, v]) => `${k}=${v}`).join("; "));
 }
 
 // ── TLS bypass ────────────────────────────────
@@ -372,8 +357,7 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
         }
 
         // ── Current cookies stored for this host ────────────
-        const session = getSession("default");
-        const cookiesOnHost = session.cookies.get(parsed.hostname.toLowerCase()) || "";
+        const cookiesOnHost = cookieJar.get(parsed.hostname.toLowerCase()) || "";
 
         // ── Build curl-style transcript for content ─────────
         const pathAndQuery = parsed.pathname + (parsed.search || "");
@@ -478,7 +462,7 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
   // Clear cookie jar on session shutdown so sessions don't leak state
   // between separate Pi runs or after extension reload.
   pi.on("session_shutdown", () => {
-    sessions.clear();
+    cookieJar.clear();
   });
 }
 

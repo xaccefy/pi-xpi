@@ -1,6 +1,6 @@
 # pi-webxp
 
-Web search, page fetch, library docs, repo QWeb search, page fetch, library docs, repo Q&A, and exploit technique search for Pi Agent. Merges the former `pi-lookup` and `pi-exploitsearch` into one "find information" extension.A, exploit technique search, and raw HTTP requests for Pi Agent. Merges the former `pi-lookup` and `pi-exploitsearch` into one "web interaction" extension.
+Web search, page fetch, library docs, repo Q&A, exploit technique search, and raw HTTP requests for Pi Agent. Merges the former `pi-lookup` and `pi-exploitsearch` into one "find information" extension.
 
 ## Install
 

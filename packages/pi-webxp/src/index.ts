@@ -26,93 +26,54 @@ export default function piWebxp(pi: ExtensionAPI) {
   // ── http_request ──
   httpRequestExtension(pi);
 
-  // ── context7 ──
+  // ── context7 + deepwiki (same registration shape: name, call arg, success noun) ──
 
-  pi.registerTool({
-    name: context7Tool.name,
-    label: context7Tool.label,
-    description: context7Tool.description,
-    promptSnippet: context7Tool.promptSnippet,
-    promptGuidelines: context7Tool.promptGuidelines,
-    parameters: context7Tool.parameters,
+  for (const [tool, callArg, resultKey, noun] of [
+    [context7Tool, "libraryName", "libraryId", "Docs"],
+    [deepwikiTool, "repo", "repo", "Answer"],
+  ] as const) {
+    pi.registerTool({
+      name: tool.name,
+      label: tool.label,
+      description: tool.description,
+      promptSnippet: tool.promptSnippet,
+      promptGuidelines: tool.promptGuidelines,
+      parameters: tool.parameters,
 
-    async execute(_id, params, signal, _onUpdate, _ctx) {
-      try {
-        const result = await context7Tool.execute(_id, params as Record<string, unknown>, signal);
-        return result;
-      } catch (error) {
-        return {
-          content: [{ type: "text" as const, text: `Context7 error: ${(error as Error).message}` }],
-          isError: true,
-          details: {},
-        };
-      }
-    },
+      async execute(_id, params, signal, _onUpdate, _ctx) {
+        try {
+          return await tool.execute(_id, params as Record<string, unknown>, signal);
+        } catch (error) {
+          return {
+            content: [
+              { type: "text" as const, text: `${tool.label} error: ${(error as Error).message}` },
+            ],
+            isError: true,
+            details: {},
+          };
+        }
+      },
 
-    renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("Context7 ")) +
-          theme.fg("dim", (args.libraryName as string) ?? ""),
-        0,
-        0,
-      );
-    },
+      renderCall(args, theme) {
+        return new Text(
+          theme.fg("toolTitle", theme.bold(`${tool.label} `)) +
+            theme.fg("dim", ((args as Record<string, unknown>)[callArg] as string) ?? ""),
+          0,
+          0,
+        );
+      },
 
-    renderResult(result, _options, theme) {
-      if ((result as { isError?: boolean }).isError) {
-        return new Text(theme.fg("error", "✗ Context7 failed"), 0, 0);
-      }
-      const details = result.details as { libraryId?: string } | undefined;
-      return new Text(
-        theme.fg("success", "✓ Docs ") + theme.fg("muted", details?.libraryId ?? ""),
-        0,
-        0,
-      );
-    },
-  });
-
-  // ── deepwiki ──
-
-  pi.registerTool({
-    name: deepwikiTool.name,
-    label: deepwikiTool.label,
-    description: deepwikiTool.description,
-    promptSnippet: deepwikiTool.promptSnippet,
-    promptGuidelines: deepwikiTool.promptGuidelines,
-    parameters: deepwikiTool.parameters,
-
-    async execute(_id, params, signal, _onUpdate, _ctx) {
-      try {
-        const result = await deepwikiTool.execute(_id, params as Record<string, unknown>, signal);
-        return result;
-      } catch (error) {
-        return {
-          content: [{ type: "text" as const, text: `DeepWiki error: ${(error as Error).message}` }],
-          isError: true,
-          details: {},
-        };
-      }
-    },
-
-    renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("DeepWiki ")) +
-          theme.fg("dim", (args.repo as string) ?? ""),
-        0,
-        0,
-      );
-    },
-
-    renderResult(result, _options, theme) {
-      if ((result as { isError?: boolean }).isError) {
-        return new Text(theme.fg("error", "✗ DeepWiki failed"), 0, 0);
-      }
-      const details = result.details as { repo?: string } | undefined;
-      return new Text(
-        theme.fg("success", "✓ Answer ") + theme.fg("muted", details?.repo ?? ""),
-        0,
-        0,
-      );
-    },
-  });
+      renderResult(result, _options, theme) {
+        if ((result as { isError?: boolean }).isError) {
+          return new Text(theme.fg("error", `✗ ${tool.label} failed`), 0, 0);
+        }
+        const details = result.details as Record<string, string> | undefined;
+        return new Text(
+          theme.fg("success", `✓ ${noun} `) + theme.fg("muted", details?.[resultKey] ?? ""),
+          0,
+          0,
+        );
+      },
+    });
+  }
 }

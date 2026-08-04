@@ -20,12 +20,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import {
-  getRunDir,
-  getScratchpadRoot,
-  type ScratchpadPhase,
-  scratchpad_write,
-} from "./scratchpad.ts";
+import { getRunDir, getScratchpadRoot, scratchpad_write } from "./scratchpad.ts";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -86,7 +81,9 @@ const VULN_CLASSES = [
   "other",
 ] as const;
 
-const SPECS: Record<SubmitStage, StageSpec> = {
+// Exported for test/pipeline-submit-schema-parity.test.ts (drift guard
+// against schemas/*.json — the two are kept as mirrors of each other).
+export const SPECS: Record<SubmitStage, StageSpec> = {
   // schemas/stage-finding.json
   hunt: {
     required: [
@@ -415,15 +412,6 @@ function dedupHunt(state: SubmitState, obj: Record<string, unknown>): { duplicat
 
 // ── Public API ───────────────────────────────────────────────────────
 
-const STAGE_TO_PHASE: Record<SubmitStage, ScratchpadPhase> = {
-  hunt: "hunt",
-  trace: "trace",
-  skeptic: "skeptic",
-  validate: "validate",
-  chain: "chain",
-  report: "report",
-};
-
 export function pipeline_submit(runId: string, stage: SubmitStage, output: unknown): SubmitResult {
   const parsed = parseOutput(output);
   if (parsed.error || !parsed.obj) {
@@ -497,9 +485,11 @@ export function pipeline_submit(runId: string, stage: SubmitStage, output: unkno
     }
   }
 
+  // Submit stages are a subset of scratchpad phases, so the stage name IS
+  // the phase directory.
   const artifact = scratchpad_write(
     runId,
-    STAGE_TO_PHASE[stage],
+    stage,
     `${key.replace(/[^a-zA-Z0-9._:-]/g, "_")}.json`,
     JSON.stringify(obj, null, 2),
   );

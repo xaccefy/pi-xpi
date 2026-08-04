@@ -40,9 +40,12 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 | web_fetch | Page content; SPA pages re-rendered via Chromium when the shell is thin |
 | context7 | Current library docs |
 | deepwiki | Q&A on a public GitHub repo |
-| CaseAdd / CaseUpdate / PromoteFinding | Ledger + hard PoC gate to confirm |
+| CaseAdd / CaseUpdate / PromoteFinding | Ledger + hard PoC gate to confirm (exit 0 + verification marker; `control_path` control-target check required for live findings — blocks unconditional-marker/mock PoCs) |
+| EvidenceAdd | Role-typed, hashed evidence items (observation/reproduction/impact/refutation/cleanup); refutation justifies kills; reproduction auto-recorded by the PoC gate |
 | CaseGet / CaseList / CaseSearch | Browse cases |
 | CaseLink / CaseUnlink | Exploit chains |
+| ChainSuggest | Auto-detect exploitable chain combinations across cases (credential+endpoint→ATO, XSS+state-change→CSRF, SSTI→RCE, race+payment, …), ranked — verify before linking |
+| CoverageAdd / CoverageReport | Machine-checkable test coverage: record (asset × attack-class) cells with wide/local scope; the plateau claim must match the matrix |
 | CaseContext | Case context bundle (complete record + artifacts) for the report writer |
 | PipelineSubmit | Stage-output validation gate: schema check + pre-filter + repair budget — stage can't advance on invalid output |
 | ScratchpadInit / Resume / Checkpoint | Crash-recoverable artifact store for pipeline runs |
@@ -58,6 +61,8 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 /xp on                                      # enable casefile cyber workflow in context
 /xp lite                                    # single-agent variant — no subagent dispatch
 ```
+
+CaseAdd requires `disproveIf` (falsification conditions) on every new case; a kill requires refutation evidence or a kill-reason token; live findings (`local:true`) require a `control_path` control run whose output must NOT contain the verification marker (harness-checked). Promotion also requires an `observation` evidence item (EvidenceAdd) before `confirmed`, and control/disconfirmation scripts that crash (killed/timeout/spawn error) are blocked — a crash is neither a clean control verdict nor a survived disproof.
 
 Pi injects skill descriptions (`web-pentest`, `cyberwf`) into every session; the agent reads the full skill file when the task matches (e.g. "find bugs in X", "bug bounty Y"). Run `/xp on` for the full attacker discipline with casefile tracking, or `/xp lite` for the same discipline done by the main agent alone (CTF / single-shot engagements).
 
@@ -101,7 +106,7 @@ pi-xpi/
 │   ├── pi-webxp
 │   └── pi-xtodo
 ├── schemas/                 # stage-finding, stage-trace, stage-skeptic, stage-validation, stage-chain, stage-report
-├── scripts/                 # bump-version, release
+├── scripts/                 # bump-version
 ├── skills/                  # web-pentest, cyberwf (auto-loaded)
 ├── install.sh
 └── package.json
@@ -117,11 +122,3 @@ bun run typecheck
 
 **Release (CI):** GitHub Actions → **Release** workflow → choose `patch` / `minor` / `major`.
 Requires repo secret `NPM_TOKEN`. The job runs tests, bumps all workspace versions, publishes every package + umbrella, tags `vX.Y.Z`, and pushes.
-
-**Local release helper:**
-
-```bash
-bun run release:patch   # or release:minor / release:major
-```
-
-(Requires a clean tree and push rights. It commits, tags, and pushes but does NOT publish to npm — use the CI Release workflow for publishing.)

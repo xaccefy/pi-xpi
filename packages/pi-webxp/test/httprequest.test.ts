@@ -219,6 +219,36 @@ describe("pi-webxp: http_request", () => {
     assert.equal(protectedDetails.status, 200);
     assert.ok(protectedDetails.cookiesOnHost.includes("session=abc123"));
   });
+  it("clears the cookie jar on session_shutdown", async () => {
+    const tool = api.tools.find((t) => t.name === "http_request")!;
+
+    // Seed the jar.
+    await tool.execute(
+      "c1",
+      { url: "https://example.com/login", method: "POST" },
+      null,
+      () => {},
+      {},
+    );
+
+    // New session: the jar must be empty again.
+    await (api as any).emit("session_shutdown");
+
+    const result = await tool.execute(
+      "c2",
+      { url: "https://example.com/protected" },
+      null,
+      () => {},
+      {},
+    );
+    assert.equal((result as any).isError, false);
+    const cookiesOnHost = (result as any).details.cookiesOnHost;
+    assert.ok(
+      !cookiesOnHost.includes("session="),
+      `jar cleared on session_shutdown, got: ${cookiesOnHost}`,
+    );
+  });
+
   // ── cookie rotation ─────────────────────────────────────
 
   it("replaces (not duplicates) cookies when Set-Cookie rotates a value", async () => {

@@ -53,7 +53,27 @@ type FakePi = {
 
 let tempDir: string;
 let pocScriptPath: string;
+let controlScriptPath: string;
 let casefileExtension: (pi: any) => void;
+
+// CaseAdd now requires disproveIf (falsification conditions); the tool-level
+// helper injects a default so the fixture-driven tests stay focused on the
+// behavior they exercise. Promotion additionally requires an observation
+// evidence item (evidence-chain closure), so the helper records one.
+async function addCase(pi: FakePi, fields: Record<string, unknown>) {
+  const result = await executeTool(pi, "CaseAdd", {
+    disproveIf: ["test: finding is actually intended behavior"],
+    ...fields,
+  });
+  if (result.details?.record?.id) {
+    await executeTool(pi, "EvidenceAdd", {
+      case_id: result.details.record.id,
+      role: "observation",
+      summary: "test fixture: initial observed signal",
+    }).catch(() => undefined);
+  }
+  return result;
+}
 
 function createFakePi(): FakePi {
   return {
@@ -84,6 +104,8 @@ beforeEach(async () => {
   setScratchpadRoot(tempDir);
   pocScriptPath = join(tempDir, "poc.sh");
   writeFileSync(pocScriptPath, "#!/bin/sh\nprintf 'ok'", "utf8");
+  controlScriptPath = join(tempDir, "control.sh");
+  writeFileSync(controlScriptPath, "#!/bin/sh\necho 'control target clean'", "utf8");
   process.env.PI_POC_ROOT = tempDir;
   // Hermeticity: the before_agent_start handler skips injection when
   // PI_SUBAGENT_CHILD=1 (the harness sets it when running inside pi-subagents);
@@ -113,6 +135,10 @@ describe("casefile extension", () => {
       "CaseSearch",
       "CaseUnlink",
       "CaseUpdate",
+      "ChainSuggest",
+      "CoverageAdd",
+      "CoverageReport",
+      "EvidenceAdd",
       "PipelineSubmit",
       "PromoteFinding",
       "ScratchpadCheckpoint",
@@ -141,7 +167,7 @@ describe("casefile extension", () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
 
-    const added = await executeTool(pi, "CaseAdd", {
+    const added = await addCase(pi, {
       title: "Sensitive file disclosure",
       status: "investigating",
       confidence: "medium",
@@ -178,6 +204,7 @@ describe("casefile extension", () => {
       id: record.id,
       poc_path: pocScriptPath,
       verification_marker: "ok",
+      control_path: controlScriptPath,
       local: true,
     });
     expect(promoted.details.record.status).toBe("confirmed");
@@ -210,11 +237,189 @@ describe("casefile extension", () => {
     expect(contextText).toContain("Linked Cases");
   });
 
+  test("PromoteFinding requires control_path for live findings (local:true)", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+
+    const added = await addCase(pi, {
+      title: "No control path",
+      status: "investigating",
+      evidence: "reflected input",
+      confidence: "high",
+      severity: "medium",
+      poc: "send payload, check reflection",
+      impact: "script execution",
+      target: "example-app",
+      disconfirmation: "tried without payload; no reflection",
+    });
+    const id = added.details.record.id;
+
+    const result = await executeTool(pi, "PromoteFinding", {
+      id,
+      poc_path: pocScriptPath,
+      verification_marker: "ok",
+      local: true,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("control_path");
+    expect(result.details.record.status).toBe("investigating");
+  });
+
+  test("PromoteFinding blocks a PoC whose marker appears in the control-target run (cheat)", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+
+    const added = await addCase(pi, {
+      title: "Cheating PoC",
+      status: "investigating",
+      evidence: "reflected input",
+      confidence: "high",
+      severity: "medium",
+      poc: "send payload, check reflection",
+      impact: "script execution",
+      target: "example-app",
+      disconfirmation: "tried without payload; no reflection",
+    });
+    const id = added.details.record.id;
+
+    // The control script echoes the marker unconditionally — the same way a
+    // cheating PoC prints it without the vulnerable condition. The harness
+    // must block promotion even though the PoC run itself "succeeded".
+    const cheatControl = join(tempDir, "cheat-control.sh");
+    writeFileSync(cheatControl, "#!/bin/sh\nprintf 'ok'", "utf8");
+
+    const result = await executeTool(pi, "PromoteFinding", {
+      id,
+      poc_path: pocScriptPath,
+      verification_marker: "ok",
+      control_path: cheatControl,
+      local: true,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("CONTROL CHECK FAILED");
+    expect(result.details.controlCheated).toBe(true);
+    expect(result.details.record.status).toBe("investigating");
+  });
+
+  test("PromoteFinding blocks a control script that crashes before running (no completion)", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+
+    const added = await addCase(pi, {
+      title: "Crashing control",
+      status: "investigating",
+      evidence: "reflected input",
+      confidence: "high",
+      severity: "medium",
+      poc: "send payload, check reflection",
+      impact: "script execution",
+      target: "example-app",
+      disconfirmation: "tried without payload; no reflection",
+    });
+    const id = added.details.record.id;
+
+    // A control script that kills itself never runs to completion — the gate
+    // must NOT treat "no marker in crash output" as a clean control verdict.
+    const crashControl = join(tempDir, "crash-control.sh");
+    writeFileSync(crashControl, "#!/bin/sh\nkill -9 $$\n", "utf8");
+
+    const result = await executeTool(pi, "PromoteFinding", {
+      id,
+      poc_path: pocScriptPath,
+      verification_marker: "ok",
+      control_path: crashControl,
+      local: true,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("did NOT complete");
+    expect(result.details.controlCrashed).toBe(true);
+    expect(result.details.record.status).toBe("investigating");
+  });
+
+  test("PromoteFinding blocks a crashed disconfirmation script (crash is not survived disproof)", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+
+    const added = await addCase(pi, {
+      title: "Crashing disconfirmation",
+      status: "investigating",
+      evidence: "reflected input",
+      confidence: "high",
+      severity: "medium",
+      poc: "send payload, check reflection",
+      impact: "script execution",
+      target: "example-app",
+      disconfirmation: "tried without payload; no reflection",
+    });
+    const id = added.details.record.id;
+
+    const crashDisconf = join(tempDir, "crash-disconf.sh");
+    writeFileSync(crashDisconf, "#!/bin/sh\nkill -9 $$\n", "utf8");
+
+    const result = await executeTool(pi, "PromoteFinding", {
+      id,
+      poc_path: pocScriptPath,
+      verification_marker: "ok",
+      disconfirmation_path: crashDisconf,
+      control_path: controlScriptPath,
+      local: true,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("did NOT complete");
+    expect(result.details.disconfirmationCrashed).toBe(true);
+    expect(result.details.record.status).toBe("investigating");
+  });
+
+  test("CoverageAdd records cells and CoverageReport renders the matrix", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+
+    const added = await addCase(pi, { title: "Coverage target", status: "hypothesis" });
+    const id = added.details.record.id;
+
+    const wide = await executeTool(pi, "CoverageAdd", {
+      case_id: id,
+      asset: "example-app",
+      class: "sql-injection",
+      scope: "wide",
+      note: "ffuf + manual on all params; no injection",
+    });
+    expect(wide.details.item.scope).toBe("wide");
+
+    const report = await executeTool(pi, "CoverageReport", { case_id: id });
+    expect(report.content[0].text).toContain("sql-injection");
+    expect(report.content[0].text).toContain("example-app");
+  });
+
+  test("ChainSuggest surfaces cross-case chains", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+
+    const cred = await addCase(pi, {
+      title: "Leaked API key",
+      status: "investigating",
+      confidence: "medium",
+      target: "example-app",
+      evidence: "key in public repo",
+    });
+    await addCase(pi, {
+      title: "Admin login endpoint",
+      status: "investigating",
+      confidence: "medium",
+      target: "example-app",
+      evidence: "login accepts credentials",
+    });
+
+    const suggestions = await executeTool(pi, "ChainSuggest", { case_id: cred.details.record.id });
+    expect(suggestions.content[0].text).toContain("credential_endpoint");
+    expect(suggestions.details.suggestions.length).toBeGreaterThan(0);
+  });
+
   test("PromoteFinding rejects a PoC that exits 0 but lacks the verification marker", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
 
-    const added = await executeTool(pi, "CaseAdd", {
+    const added = await addCase(pi, {
       title: "Missing marker PoC",
       target: "example-app",
       bugClass: "xss",
@@ -237,6 +442,7 @@ describe("casefile extension", () => {
       id,
       poc_path: pocScriptPath,
       verification_marker: "VULN_CONFIRMED_not_present",
+      control_path: controlScriptPath,
       local: true,
     });
     expect(result.isError).toBe(true);
@@ -248,13 +454,13 @@ describe("casefile extension", () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
 
-    const first = await executeTool(pi, "CaseAdd", {
+    const first = await addCase(pi, {
       title: "Provider metadata injection",
       target: "packages/ai",
       bugClass: "validation bypass",
       evidence: "Initial audit note",
     });
-    const duplicate = await executeTool(pi, "CaseAdd", {
+    const duplicate = await addCase(pi, {
       title: " provider metadata   injection ",
       target: "packages/ai",
       bugClass: "Validation Bypass",
@@ -273,11 +479,11 @@ describe("casefile extension", () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
 
-    const first = await executeTool(pi, "CaseAdd", {
+    const first = await addCase(pi, {
       title: "Open redirect",
       evidence: "next parameter accepts arbitrary URL",
     });
-    const second = await executeTool(pi, "CaseAdd", {
+    const second = await addCase(pi, {
       title: "OAuth callback abuse",
       evidence: "callback can consume redirected authorization code",
     });
@@ -286,8 +492,12 @@ describe("casefile extension", () => {
       source_id: first.details.record.id,
       target_id: second.details.record.id,
     });
-    expect(linked.details.source.linkedCaseIds).toEqual([second.details.record.id]);
-    expect(linked.details.target.linkedCaseIds).toEqual([first.details.record.id]);
+    expect(linked.details.source.linkedCases.map((l: { id: string }) => l.id)).toEqual([
+      second.details.record.id,
+    ]);
+    expect(linked.details.target.linkedCases.map((l: { id: string }) => l.id)).toEqual([
+      first.details.record.id,
+    ]);
 
     const duplicateLink = await executeTool(pi, "CaseLink", {
       source_id: first.details.record.id,
@@ -300,8 +510,8 @@ describe("casefile extension", () => {
       source_id: first.details.record.id,
       target_id: second.details.record.id,
     });
-    expect(unlinked.details.source.linkedCaseIds).toEqual([]);
-    expect(unlinked.details.target.linkedCaseIds).toEqual([]);
+    expect(unlinked.details.source.linkedCases.map((l: { id: string }) => l.id)).toEqual([]);
+    expect(unlinked.details.target.linkedCases.map((l: { id: string }) => l.id)).toEqual([]);
 
     const duplicateUnlink = await executeTool(pi, "CaseUnlink", {
       source_id: first.details.record.id,
@@ -315,8 +525,8 @@ describe("casefile extension", () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
 
-    const first = await executeTool(pi, "CaseAdd", { title: "Auth bypass root" });
-    const second = await executeTool(pi, "CaseAdd", { title: "Token leak symptom" });
+    const first = await addCase(pi, { title: "Auth bypass root" });
+    const second = await addCase(pi, { title: "Token leak symptom" });
 
     const linked = await executeTool(pi, "CaseLink", {
       source_id: first.details.record.id,
@@ -435,7 +645,7 @@ describe("casefile extension", () => {
       expect(second).toBeUndefined();
 
       // Third prompt after a case appears: case list refreshes, workflow NOT re-injected.
-      await executeTool(pi, "CaseAdd", {
+      await addCase(pi, {
         title: "Mid session lead",
         status: "hypothesis",
       });
@@ -456,7 +666,7 @@ describe("casefile extension", () => {
       const pi = createFakePi();
       casefileExtension(pi as any);
 
-      await executeTool(pi, "CaseAdd", {
+      await addCase(pi, {
         title: "Active <payload> lead",
         status: "investigating",
         summary: "This should not be injected",
@@ -464,7 +674,7 @@ describe("casefile extension", () => {
         confidence: "low",
         nextStep: "Test <payload> safely",
       });
-      const killed = await executeTool(pi, "CaseAdd", {
+      const killed = await addCase(pi, {
         title: "Killed duplicate",
         status: "investigating",
         evidence: "Duplicate",
@@ -475,7 +685,7 @@ describe("casefile extension", () => {
         status: "killed",
         assumptions: ["Duplicate lead with no new evidence"],
       });
-      const reported = await executeTool(pi, "CaseAdd", {
+      const reported = await addCase(pi, {
         title: "Already reported",
         status: "investigating",
         evidence: "Resolved finding",
@@ -491,6 +701,7 @@ describe("casefile extension", () => {
         id: reported.details.record.id,
         poc_path: pocScriptPath,
         verification_marker: "ok",
+        control_path: controlScriptPath,
         local: true,
       });
       const ctxResult = await executeTool(pi, "CaseContext", { id: reported.details.record.id });
@@ -528,11 +739,11 @@ describe("casefile extension", () => {
       const pi = createFakePi();
       casefileExtension(pi as any);
 
-      await executeTool(pi, "CaseAdd", {
+      await addCase(pi, {
         title: "Hypothesis lead",
         status: "hypothesis",
       });
-      const blocked = await executeTool(pi, "CaseAdd", {
+      const blocked = await addCase(pi, {
         title: "Blocked lead",
         status: "investigating",
         evidence: "Need env access",
@@ -567,7 +778,7 @@ describe("casefile extension", () => {
       const ids: string[] = [];
       let p0Id = "";
       for (let i = 0; i < 21; i++) {
-        const res = await executeTool(pi, "CaseAdd", {
+        const res = await addCase(pi, {
           title: `Coverage candidate number ${i}`,
           status: "hypothesis",
           evidence: "probe",
@@ -675,7 +886,7 @@ describe("casefile extension", () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
 
-    const storedXss = await executeTool(pi, "CaseAdd", {
+    const storedXss = await addCase(pi, {
       title: "Stored XSS",
       status: "investigating",
       evidence: "Payload renders in notes",
@@ -691,6 +902,7 @@ describe("casefile extension", () => {
       id: storedXss.details.record.id,
       poc_path: pocScriptPath,
       verification_marker: "ok",
+      control_path: controlScriptPath,
       local: true,
     });
 

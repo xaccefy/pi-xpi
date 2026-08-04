@@ -1,18 +1,26 @@
 import assert from "node:assert";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
-  addCaseResult,
+  addEvidenceItemResult,
   assertPromotable,
+  coverageSummary,
+  getCaseById,
   getCasefilePath,
+  addCaseResult as ledgerAddCaseResult,
   linkCasesResult,
+  listEvidenceItems,
+  type PocVerification,
   promoteFindingResult,
   readCasefile,
+  recordCoverageResult,
   searchCases,
   setCasefilePath,
+  suggestChains,
   unlinkCasesResult,
   updateCaseResult,
   writeCaseContext,
@@ -23,10 +31,35 @@ import {
   scratchpad_write,
   setScratchpadRoot,
 } from "../src/scratchpad.ts";
+import { DatabaseSync } from "../src/sqlite-compat/index.ts";
 
-const addCase = (input: Parameters<typeof addCaseResult>[0]) => {
-  const res = addCaseResult(input);
+const addCase = (input: Parameters<typeof ledgerAddCaseResult>[0]) => {
+  const res = ledgerAddCaseResult({
+    // New cases require falsification conditions; tests inject a default.
+    disproveIf: ["test: finding is actually intended behavior"],
+    ...input,
+  });
+  // Promotion requires the observation evidence item (evidence-chain closure);
+  // tests inject one so fixtures focus on the behavior they exercise.
+  addEvidenceItemResult(res.record.id, {
+    role: "observation",
+    summary: "test fixture: initial observed signal",
+  });
   return res.record;
+};
+
+// Direct addCaseResult call sites in older tests predate the disproveIf
+// requirement; route them through the same default injection.
+const addCaseResult = (input: Parameters<typeof ledgerAddCaseResult>[0]) => {
+  const res = ledgerAddCaseResult({
+    disproveIf: ["test: finding is actually intended behavior"],
+    ...input,
+  });
+  addEvidenceItemResult(res.record.id, {
+    role: "observation",
+    summary: "test fixture: initial observed signal",
+  });
+  return res;
 };
 
 let tempDir: string;
@@ -388,12 +421,12 @@ describe("casefile sqlite ledger", () => {
 
     const linked = linkCasesResult(caseA.id, caseB.id);
     assert.strictEqual(linked.changed, true);
-    assert.ok(linked.source.linkedCaseIds.includes(caseB.id));
-    assert.ok(linked.target.linkedCaseIds.includes(caseA.id));
+    assert.ok(linked.source.linkedCases.map((l) => l.id).includes(caseB.id));
+    assert.ok(linked.target.linkedCases.map((l) => l.id).includes(caseA.id));
 
     const unlinked = unlinkCasesResult(caseA.id, caseB.id);
     assert.strictEqual(unlinked.changed, true);
-    assert.ok(!unlinked.source.linkedCaseIds.includes(caseB.id));
+    assert.ok(!unlinked.source.linkedCases.map((l) => l.id).includes(caseB.id));
   });
 
   it("preserves exploit-chain links across CaseUpdate (no REPLACE cascade)", () => {
@@ -404,12 +437,12 @@ describe("casefile sqlite ledger", () => {
     const updated = updateCaseResult(a.id, { summary: "material field change" });
     assert.strictEqual(updated.changed, true);
     assert.ok(
-      updated.record.linkedCaseIds.includes(b.id),
+      updated.record.linkedCases.map((l) => l.id).includes(b.id),
       "update must not wipe case_links via INSERT OR REPLACE cascade",
     );
 
     const reloaded = readCasefile().find((c) => c.id === a.id);
-    assert.ok(reloaded?.linkedCaseIds.includes(b.id));
+    assert.ok(reloaded?.linkedCases.map((l) => l.id).includes(b.id));
   });
 
   it("records and surfaces a typed relationship kind on links", () => {
@@ -422,7 +455,7 @@ describe("casefile sqlite ledger", () => {
     assert.strictEqual(plain.kind, "related");
     const reloadedA = readCasefile().find((c) => c.id === a.id)!;
     assert.ok(reloadedA.linkedCases.some((l) => l.id === b.id && l.kind === "related"));
-    assert.ok(reloadedA.linkedCaseIds.includes(b.id));
+    assert.ok(reloadedA.linkedCases.map((l) => l.id).includes(b.id));
     unlinkCasesResult(a.id, b.id);
 
     // Directional kind: source→target keeps the stated kind; the reverse row
@@ -463,6 +496,345 @@ describe("casefile sqlite ledger", () => {
     assert.strictEqual(updated.record.status, "investigating");
   });
 
+  it("requires disproveIf (falsification conditions) on new cases", () => {
+    assert.throws(
+      () => ledgerAddCaseResult({ title: "No falsification", evidence: "x" }),
+      /disproveIf/,
+    );
+    assert.throws(
+      () => ledgerAddCaseResult({ title: "Empty falsification", disproveIf: ["   "] }),
+      /disproveIf/,
+    );
+  });
+
+  it("rejects a kill without refutation evidence or a kill-reason token", () => {
+    const noReason = addCase({ title: "Kill without reason" });
+    assert.throws(
+      () => updateCaseResult(noReason.id, { status: "killed" }),
+      /Cannot kill without justification/,
+    );
+    // Reason token in assumptions passes.
+    const token = addCase({ title: "Kill with token" });
+    const killed = updateCaseResult(token.id, {
+      status: "killed",
+      assumptions: ["intended_behavior: documented in README"],
+    });
+    assert.strictEqual(killed.record.status, "killed");
+    // Refutation evidence item also passes.
+    const refuted = addCase({ title: "Kill with refutation evidence" });
+    addEvidenceItemResult(refuted.id, {
+      role: "refutation",
+      summary: "Re-probe returned 403 with the same payload; path is WAF-blocked.",
+    });
+    const killed2 = updateCaseResult(refuted.id, {
+      status: "killed",
+      nextStep: "killed: refutation evidence — WAF-blocked re-probe",
+    });
+    assert.strictEqual(killed2.record.status, "killed");
+  });
+
+  it("adds role-typed, hashed evidence items and lists them on the case", () => {
+    // Bare case (no helper observation item) so the count below is exact.
+    const c = ledgerAddCaseResult({
+      title: "Evidence item case",
+      disproveIf: ["test: finding is actually intended behavior"],
+    }).record;
+    const artifact = join(tempDir, "probe-response.txt");
+    writeFileSync(artifact, "HTTP/1.1 200 OK\nsecret-data", "utf8");
+
+    const item = addEvidenceItemResult(c.id, {
+      role: "observation",
+      summary: "Probe response shows reflected input",
+      artifactPath: artifact,
+    });
+    assert.ok(item.id.startsWith("ev_"));
+    assert.strictEqual(item.role, "observation");
+    assert.strictEqual(item.artifactPath, "probe-response.txt"); // basename only
+    // The digest must be the REAL sha256 of the artifact bytes, not a stub.
+    const expected = createHash("sha256").update("HTTP/1.1 200 OK\nsecret-data").digest("hex");
+    assert.strictEqual(item.sha256, expected);
+    assert.throws(
+      () => addEvidenceItemResult(c.id, { role: "nonsense" as any, summary: "x" }),
+      /Invalid evidence role/,
+    );
+    assert.throws(
+      () =>
+        addEvidenceItemResult(c.id, {
+          role: "observation",
+          summary: "x",
+          artifactPath: join(tempDir, "missing.txt"),
+        }),
+      /Evidence artifact not found/,
+    );
+
+    const items = listEvidenceItems(c.id);
+    assert.strictEqual(items.length, 1);
+    assert.strictEqual(items[0].sha256, item.sha256);
+
+    // Terminal cases reject new evidence.
+    updateCaseResult(c.id, {
+      status: "killed",
+      assumptions: ["duplicate"],
+    });
+    assert.throws(
+      () => addEvidenceItemResult(c.id, { role: "impact", summary: "too late" }),
+      /terminal case/,
+    );
+  });
+
+  it("rejects promotion of a live finding (sandbox:false) without control verification", () => {
+    const live = addCase({
+      title: "Live IDOR",
+      status: "investigating",
+      evidence: "Observed other user's export",
+      confidence: "high",
+      impact: "data leak",
+      severity: "high",
+      poc: "/tmp/poc.sh",
+      target: "example-app",
+      disconfirmation: "Tried to disprove; could not.",
+    });
+    assert.throws(
+      () =>
+        promoteFindingResult(live.id, {
+          path: "/tmp/poc.sh",
+          exitCode: 0,
+          ranAt: "2024-01-01T00:00:00Z",
+          sandbox: false,
+        }),
+      /require.*controlVerification/,
+    );
+    // Content, not just presence: a crashed control (completed:false) is invalid.
+    assert.throws(
+      () =>
+        promoteFindingResult(
+          live.id,
+          { path: "/tmp/poc.sh", exitCode: 0, ranAt: "2024-01-01T00:00:00Z", sandbox: false },
+          undefined,
+          {
+            path: "/tmp/ctrl.sh",
+            exitCode: 127,
+            ranAt: "2024-01-01T00:00:00Z",
+            sandbox: false,
+            completed: false,
+            output: "",
+          },
+          "VULN_MARKER",
+        ),
+      /require.*controlVerification/,
+    );
+    // …and so is a control whose output contains the marker (unconditional-marker PoC).
+    assert.throws(
+      () =>
+        promoteFindingResult(
+          live.id,
+          { path: "/tmp/poc.sh", exitCode: 0, ranAt: "2024-01-01T00:00:00Z", sandbox: false },
+          undefined,
+          {
+            path: "/tmp/ctrl.sh",
+            exitCode: 1,
+            ranAt: "2024-01-01T00:00:00Z",
+            sandbox: false,
+            completed: true,
+            output: "VULN_MARKER leaked",
+          },
+          "VULN_MARKER",
+        ),
+      /require.*controlVerification/,
+    );
+    // sandbox: undefined (JS caller omitting the field) must ALSO fail closed.
+    // TS requires the field, so the omission is simulated via a runtime cast.
+    const noSandboxField = {
+      path: "/tmp/poc.sh",
+      exitCode: 0,
+      ranAt: "2024-01-01T00:00:00Z",
+      // sandbox deliberately absent
+    } as unknown as PocVerification;
+    assert.throws(
+      () => promoteFindingResult(live.id, noSandboxField),
+      /require.*controlVerification/,
+    );
+    // A control that RAN, exited non-zero (vuln absent — expected) and printed
+    // no marker is valid: the live finding promotes.
+    const ok = promoteFindingResult(
+      live.id,
+      { path: "/tmp/poc.sh", exitCode: 0, ranAt: "2024-01-01T00:00:00Z", sandbox: false },
+      undefined,
+      {
+        path: "/tmp/ctrl.sh",
+        exitCode: 1,
+        ranAt: "2024-01-01T00:00:00Z",
+        sandbox: false,
+        completed: true,
+        output: "control target clean",
+      },
+      "VULN_MARKER",
+    );
+    assert.strictEqual(ok.record.status, "confirmed");
+    // Sandboxed (source-audit) findings do not need a control run.
+    const source = addCase({
+      title: "Source XSS",
+      status: "investigating",
+      evidence: "Payload renders",
+      confidence: "high",
+      impact: "script execution",
+      severity: "high",
+      poc: "/tmp/poc.sh",
+      target: "packages/ui",
+      disconfirmation: "Tried; held.",
+    });
+    const promoted = promoteFindingResult(source.id, {
+      path: "/tmp/poc.sh",
+      exitCode: 0,
+      ranAt: "2024-01-01T00:00:00Z",
+      sandbox: true,
+    });
+    assert.strictEqual(promoted.record.status, "confirmed");
+  });
+
+  it("rejects promotion without an observation evidence item (chain closure)", () => {
+    // Built WITHOUT the helper's observation item.
+    const bare = ledgerAddCaseResult({
+      title: "No observation",
+      status: "investigating",
+      evidence: "reflected input",
+      confidence: "high",
+      impact: "script execution",
+      severity: "high",
+      poc: "/tmp/poc.sh",
+      target: "example-app",
+      disconfirmation: "Tried; could not disprove.",
+      disproveIf: ["test: finding is actually intended behavior"],
+    });
+    assert.throws(
+      () =>
+        promoteFindingResult(bare.record.id, {
+          path: "/tmp/poc.sh",
+          exitCode: 0,
+          ranAt: "2024-01-01T00:00:00Z",
+          sandbox: true,
+        }),
+      /Evidence chain incomplete/,
+    );
+    // No phantom reproduction item may exist on the still-investigating case.
+    assert.strictEqual(listEvidenceItems(bare.record.id).length, 0);
+    // Retry after adding the observation item succeeds — no PK conflict on the
+    // deterministic reproduction id.
+    addEvidenceItemResult(bare.record.id, { role: "observation", summary: "obs" });
+    const ok = promoteFindingResult(bare.record.id, {
+      path: "/tmp/poc.sh",
+      exitCode: 0,
+      ranAt: "2024-01-02T00:00:00Z",
+      sandbox: true,
+    });
+    assert.strictEqual(ok.record.status, "confirmed");
+    assert.strictEqual(listEvidenceItems(bare.record.id).length, 2); // obs + reproduction
+  });
+
+  it("migrates a pre-evidence/pre-coverage ledger schema on reopen", () => {
+    const seed = addCase({ title: "Legacy case" });
+
+    // Simulate a DB created before evidence_items / coverage_items existed:
+    // strip the new feature surface, then reopen through the ledger.
+    const raw = new DatabaseSync(ledgerPath);
+    raw.exec("DROP TABLE coverage_items");
+    raw.exec("DROP TABLE evidence_items");
+    raw.exec("ALTER TABLE cases DROP COLUMN disprove_if_json");
+    raw.exec("ALTER TABLE cases DROP COLUMN control_verified_json");
+    raw.close();
+
+    // Force the ledger to re-run schema init against the stripped file.
+    setCasefilePath(ledgerPath);
+
+    const reopened = getCaseById(seed.id);
+    assert.ok(reopened, "legacy row readable after migration");
+    const item = addEvidenceItemResult(seed.id, {
+      role: "observation",
+      summary: "post-migration",
+    });
+    assert.ok(item.id.startsWith("ev_"));
+    assert.strictEqual(listEvidenceItems(seed.id).length, 1);
+    // The restored schema accepts a fresh write end to end.
+    const next = addCase({ title: "After migration" });
+    assert.ok(next.id);
+  });
+
+  it("records coverage cells with wide/local scope and propagates wide verdicts", () => {
+    const c = addCase({ title: "Coverage case" });
+    const wide = recordCoverageResult(c.id, {
+      asset: "example-app",
+      class: "sql-injection",
+      scope: "wide",
+      note: "ffuf + manual payloads on all params; no injection",
+    });
+    assert.ok(wide.id.startsWith("cov_"));
+    assert.strictEqual(wide.scope, "wide");
+
+    // Local cell for a second asset — the wide verdict must cover it.
+    recordCoverageResult(c.id, {
+      asset: "api.example-app",
+      class: "sql-injection",
+      scope: "local",
+      note: "api param reflects payload; no DB error",
+    });
+    recordCoverageResult(c.id, {
+      asset: "admin.example-app",
+      class: "xss",
+      scope: "local",
+      note: "no reflection",
+    });
+
+    assert.throws(
+      () =>
+        recordCoverageResult(c.id, { asset: "x", class: "y", scope: "bogus" as never, note: "z" }),
+      /Invalid coverage scope/,
+    );
+
+    const summary = coverageSummary(c.id);
+    assert.deepStrictEqual(summary.classes.sort(), ["sql-injection", "xss"]);
+    // admin asset gets the wide sql-injection verdict applied (no local cell for it).
+    const adminCells = summary.byAsset["admin.example-app"]!;
+    assert.ok(adminCells.some((cell) => cell.class === "sql-injection" && cell.scope === "wide"));
+    assert.ok(adminCells.some((cell) => cell.class === "xss" && cell.scope === "local"));
+  });
+
+  it("suggests exploit chains from cases", () => {
+    const cred = addCase({
+      title: "Leaked API key in repo",
+      status: "investigating",
+      evidence: "Key in public repo",
+      confidence: "high",
+      impact: "credential exposure",
+      severity: "high",
+      target: "example-app",
+    });
+    const endpoint = addCase({
+      title: "Admin login endpoint",
+      status: "investigating",
+      evidence: "Login accepts credentials",
+      confidence: "high",
+      impact: "auth",
+      severity: "medium",
+      target: "example-app",
+    });
+
+    const suggestions = suggestChains();
+    const ato = suggestions.find((s) => s.pattern === "credential_endpoint");
+    assert.ok(ato, "credential_endpoint chain suggested");
+    assert.strictEqual(ato!.sourceId, cred.id);
+    assert.strictEqual(ato!.targetId, endpoint.id);
+    assert.strictEqual(ato!.confidence, 55); // neither confirmed
+
+    // Only pairs on the same asset chain.
+    const other = addCase({
+      title: "XSS in unrelated-app",
+      evidence: "reflected",
+      target: "other-app",
+    });
+    const xssSuggestions = suggestChains(other.id).filter((s) => s.pattern === "xss_csrf");
+    assert.strictEqual(xssSuggestions.length, 0);
+  });
+
   it("rejects field mutations on killed and reported cases", () => {
     const killed = addCase({
       title: "Dead lead",
@@ -470,7 +842,7 @@ describe("casefile sqlite ledger", () => {
     });
     updateCaseResult(killed.id, {
       status: "killed",
-      assumptions: ["matches documented behavior"],
+      assumptions: ["intended_behavior: matches documented behavior"],
     });
     assert.throws(
       () => updateCaseResult(killed.id, { summary: "should not stick" }),
@@ -755,10 +1127,12 @@ describe("casefile sqlite ledger", () => {
       record.id,
       { path: "/tmp/poc.sh", exitCode: 0, ranAt: "2024-01-01T00:00:00Z", sandbox: true },
       { path: "/tmp/disconfirm.sh", exitCode: 1, ranAt: "2024-01-01T00:00:00Z", sandbox: true },
+      { path: "/tmp/control.sh", exitCode: 1, ranAt: "2024-01-01T00:00:00Z", sandbox: true },
     );
     const confirmed = readCasefile().find((c) => c.id === record.id)!;
     assert.ok(confirmed.pocVerified, "pocVerified set after promotion");
     assert.ok(confirmed.disconfirmationVerified, "disconfirmationVerified set after promotion");
+    assert.ok(confirmed.controlVerified, "controlVerified set after promotion");
 
     // Demote back to investigating — both verification artifacts must be cleared.
     updateCaseResult(record.id, { status: "investigating" });
@@ -769,5 +1143,6 @@ describe("casefile sqlite ledger", () => {
       undefined,
       "disconfirmationVerified cleared on demotion",
     );
+    assert.strictEqual(demoted.controlVerified, undefined, "controlVerified cleared on demotion");
   });
 });

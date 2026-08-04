@@ -6,11 +6,17 @@
  * logs) instead of stuffing everything into casefile text fields or relying
  * on each other's output streams (which creates an echo chamber).
  *
- * Directory layout per pipeline run:
+ * Directory layout per pipeline run (one subdir per phase — see PHASE_DIRS):
  *   {project_root}/.scratchpad/{run_id}/
  *     recon/      — fingerprints, tech detection, surface maps
+ *     hunt/       — per-class findings
+ *     gapfil/     — gap-fill audit notes
  *     trace/      — per-finding reachability traces
- *     verify/     — PoC logs, run outputs
+ *     skeptic/    — adversarial disproof attempts
+ *     verify/     — PoC logs, run outputs (validate phase)
+ *     chain/      — exploit-chain analysis
+ *     patch/      — remediation work
+ *     report/     — report-writer context
  *     state.json  — checkpoint file with phase completion + key IDs
  *
  * Resume re-reads scratchpad artifacts; it does not re-run completed phases
@@ -59,7 +65,7 @@ export interface ScratchpadResume {
 
 // ── Constants ────────────────────────────────────────────────────────
 
-const PHASE_ORDER: ScratchpadPhase[] = [
+export const PHASE_ORDER: ScratchpadPhase[] = [
   "recon",
   "hunt",
   "gapfil",
@@ -90,28 +96,34 @@ const SCRATCHPAD_DIR = ".scratchpad";
 let scratchpadRootOverride: string | undefined;
 
 /**
- * Detect the workspace root by walking up for a .git dir or package.json,
- * matching the ledger's detectWorkspaceRoot() heuristic.
+ * Walk up from cwd to the first directory containing any of `markers`.
+ * PWD is deliberately excluded (shell-set, can be stale/forged); explicit
+ * env overrides win, then the real cwd walk. Shared by ledger, scratchpad,
+ * and the PoC runner so the heuristic lives in one place.
  */
-function detectWorkspaceRoot(): string {
-  if (scratchpadRootOverride) return scratchpadRootOverride;
-
-  // PWD is deliberately excluded (shell-set, can be stale/forged); explicit
-  // overrides only, then walk up from the real cwd.
-  const envs = ["XPI_SCRATCHPAD_ROOT", "PI_WORKSPACE_ROOT", "GITHUB_WORKSPACE"];
-  for (const e of envs) {
-    const v = process.env[e];
+export function findWorkspaceRoot(envNames: string[], markers: string[]): string {
+  for (const e of envNames) {
+    const v = process.env[e]?.trim();
     if (v) return resolve(v);
   }
 
   let curr = resolve(process.cwd());
   for (let i = 0; i < 20; i++) {
-    if (existsSync(join(curr, ".git")) || existsSync(join(curr, "package.json"))) return curr;
+    if (markers.some((m) => existsSync(join(curr, m)))) return curr;
     const parent = dirname(curr);
     if (parent === curr) break;
     curr = parent;
   }
   return resolve(process.cwd());
+}
+
+/** Detect the scratchpad workspace root (override, env, then walk up). */
+function detectWorkspaceRoot(): string {
+  if (scratchpadRootOverride) return scratchpadRootOverride;
+  return findWorkspaceRoot(
+    ["XPI_SCRATCHPAD_ROOT", "PI_WORKSPACE_ROOT", "GITHUB_WORKSPACE"],
+    [".git", "package.json"],
+  );
 }
 
 /** Override the scratchpad root (for testing). Pass undefined to reset. */
@@ -126,41 +138,28 @@ export function getScratchpadRoot(projectRoot?: string): string {
 }
 
 /**
- * Sanitize a run_id into a single safe directory name. Unlike artifact names,
- * run_ids arrive from the agent and were never sanitized — `..`/`/` would let
- * join() escape .scratchpad, turning ScratchpadClear("..") into a recursive
- * delete of the project root. Same allowlist as artifact names, plus rejection
- * of dot-only results (.", "..", or a sanitized empty string).
+ * Sanitize an agent-supplied name into a single safe path component. `..`/`/`
+ * would let join() escape its base directory (ScratchpadClear("..") would
+ * recursively delete the project root; an artifact named ".." points at the
+ * phase dir itself), so anything outside the allowlist becomes `_`, and a
+ * dot-only or empty result is rejected.
  */
-function sanitizeRunId(runId: string): string {
-  const safe = runId.replace(/[^a-zA-Z0-9._-]/g, "_");
-  if (!safe || /^\.*$/.test(safe)) {
-    throw new Error(`Invalid run_id: "${runId}" — nothing left after sanitization`);
+function sanitizeName(name: string, label: string): string {
+  const safe = name.replace(/[^a-zA-Z0-9._-]/g, "_");
+  if (!safe || /^\.+$/.test(safe)) {
+    throw new Error(`Invalid ${label}: "${name}" — nothing left after sanitization`);
   }
   return safe;
 }
 
 /** The directory for a specific run. */
 export function getRunDir(runId: string, projectRoot?: string): string {
-  return join(getScratchpadRoot(projectRoot), sanitizeRunId(runId));
+  return join(getScratchpadRoot(projectRoot), sanitizeName(runId, "run_id"));
 }
 
 /** The state.json path for a run. */
 export function getStatePath(runId: string, projectRoot?: string): string {
   return join(getRunDir(runId, projectRoot), "state.json");
-}
-
-/**
- * Sanitize an artifact name into a safe filename. Same allowlist as run_ids,
- * plus dot-only rejection: a name like `..` or `.` would otherwise let join()
- * point at the phase/run directory itself (EISDIR crash on write/read).
- */
-function sanitizeArtifactName(artifactName: string): string {
-  const safe = artifactName.replace(/[^a-zA-Z0-9._-]/g, "_");
-  if (!safe || /^\.+$/.test(safe)) {
-    throw new Error(`Invalid artifact name: "${artifactName}" — nothing left after sanitization`);
-  }
-  return safe;
 }
 
 function emptyCheckpoint(runId: string, projectRoot: string): ScratchpadCheckpoint {
@@ -243,7 +242,7 @@ export function scratchpad_write(
   ensureRunDirs(runDir);
 
   // Sanitize artifact name: no path traversal, no dot-only escape.
-  const safeName = sanitizeArtifactName(artifactName);
+  const safeName = sanitizeName(artifactName, "artifact name");
   const dir = join(runDir, PHASE_DIRS[phase]);
   const filePath = join(dir, safeName);
   writeFileSync(filePath, content, "utf8");
@@ -260,7 +259,7 @@ export function scratchpad_read(
   projectRoot?: string,
 ): string | null {
   const root = projectRoot ?? detectWorkspaceRoot();
-  const safeName = sanitizeArtifactName(artifactName);
+  const safeName = sanitizeName(artifactName, "artifact name");
   const filePath = join(getRunDir(runId, root), PHASE_DIRS[phase], safeName);
   if (!existsSync(filePath)) return null;
   return readFileSync(filePath, "utf8");

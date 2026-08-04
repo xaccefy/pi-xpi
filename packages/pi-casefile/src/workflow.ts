@@ -7,6 +7,24 @@
  * report-readiness criteria. Token-disciplined: every rule here is load-bearing;
  * wording is compressed, nothing is dropped.
  */
+import { KILL_REASON_VALUES } from "./ledger.ts";
+
+const KILL_REASONS_TEXT = KILL_REASON_VALUES.join(" / ");
+
+/** Case-lifecycle diagram, shared by the FULL and LITE workflows. */
+const LIFECYCLE_DIAGRAM = `
+\`\`\`
+                     +--- KILLED (dead end, documented why)
+                     |
+RECON -> HYPOTHESIS --+
+                       |
+                       +--> INVESTIGATING --> CONFIRMED --> REPORTED
+                                |   ^                 |
+                                |   |  chain/primitive |
+                                |   +-----------------+
+                                |
+                                +--> KILLED (insufficient impact, duplicate, etc.)
+\`\`\``;
 export const STATIC_CYBER_WORKFLOW = `
 # Cyber Workflow (Attacker-Oriented)
 
@@ -31,19 +49,7 @@ RECON (you, inline) → **HUNT** (auditor subagents, one per attack class, paral
 **Subagent crash handling:** a subagent that dies (SIGABRT, OOM, timeout) is a RETRY, not a verdict — re-dispatch the same task once with a stronger model (\`subagent({agent, model, task})\`); repetition-loop runs are a known failure mode on cheap models. Crash again → record \`blocked: <agent> crashed\` in the pipeline-run case and continue; never silently drop the stage.
 
 ## Case Lifecycle (State Machine)
-
-\`\`\`
-                     +--- KILLED (dead end, documented why)
-                     |
-RECON -> HYPOTHESIS --+
-                       |
-                       +--> INVESTIGATING --> CONFIRMED --> REPORTED
-                                |   ^                 |
-                                |   |  chain/primitive |
-                                |   +-----------------+
-                                |
-                                +--> KILLED (insufficient impact, duplicate, etc.)
-\`\`\`
+${LIFECYCLE_DIAGRAM}
 
 ### Phase → State map
 
@@ -123,7 +129,13 @@ An attempt: reproduce under different conditions (auth/config/network position);
 Strong example: "Read /api/users/123 as user B after confirming user A owns 123 → 403. Repeated with X-Override-User header (seen in admin traffic) → user A's data returned. Protection bypassed via the admin header."
 Weak: "Tried to disprove. Could not." — insufficient.
 
-If the disconfirmation script (\`disconfirmation_path\`) exits 0, promotion is blocked. If you cannot write a meaningful disconfirmation script, you don't understand the finding well enough to promote it.
+If the disconfirmation script (\`disconfirmation_path\`) exits 0, promotion is blocked. If you cannot write a meaningful disconfirmation script, you don't understand the finding well enough to promote it. A disconfirmation (or control) script that CRASHES — killed, timed out, interpreter missing — is blocked too: the harness detects the missing completion marker, and a crash is neither a survived disproof nor a clean control verdict.
+
+**Evidence chain closure (before PromoteFinding):** promotion is rejected unless the case carries an \`observation\` evidence item (EvidenceAdd role=observation — the initial signal) in addition to the auto-recorded reproduction item. Record observations as you go, not at promote time.
+
+**Control-target check (anti-cheat, REQUIRED for live findings):** for any finding tested against a live target (\`local:true\`), write \`control_path\` — a script that runs the SAME PoC against a control lacking the vulnerability (patched replica, second account, baseline endpoint, WAF-blocked path). The harness runs it and blocks promotion if the verification_marker appears in the control output. That is what proves the marker is target-dependent, not an unconditional print. If the PoC cannot be pointed at a control (no replica exists), say so in \`disconfirmation\` and downgrade confidence accordingly — do not skip the check for live findings.
+
+**PoC audit (anti-cheat, before PromoteFinding):** have an independent eye on the PoC script itself. For \`confidence: high\` findings the skeptic agent re-reads the PoC file (not just the source) hunting for: unconditional marker prints, trivially-true checks (accepting any 200, grepping for always-present strings), hardcoded expected values, and local mocks of the target. Record the audit result as an EvidenceAdd \`observation\` item (or \`refutation\` if it found a cheat → kill). The model that writes the check must not be the only one that reads it.
 
 ### 2. Design & Runtime Check — non-intentionality gate (mandatory)
 
@@ -211,7 +223,7 @@ Reproduce at least twice or via two methods.
 
 ## KILLED cataloging
 
-When a case is definitively dead (not "I don't know yet"), record the reason: intended_behavior / duplicate / framework_protection / exploit_unreliable / insufficient_impact / environmental_issue / not_applicable (true bug, no realistic attacker value). Documenting kills prevents re-opening dead ends. Cases with unresolved unknowns stay INVESTIGATING, not killed.
+When a case is definitively dead (not "I don't know yet"), record the reason: ${KILL_REASONS_TEXT} (true bug, no realistic attacker value). Documenting kills prevents re-opening dead ends. Cases with unresolved unknowns stay INVESTIGATING, not killed.
 `.trim();
 
 /**
@@ -239,19 +251,7 @@ Think like a real external attacker, not a code reviewer. Technical bugs are che
 **No subagent tool.** In lite mode you do not call \`subagent\`. All specialist work is yours.
 
 ## Case Lifecycle (State Machine)
-
-\`\`\`
-                     +--- KILLED (dead end, documented why)
-                     |
-RECON -> HYPOTHESIS --+
-                       |
-                       +--> INVESTIGATING --> CONFIRMED --> REPORTED
-                                |   ^                 |
-                                |   |  chain/primitive |
-                                |   +-----------------+
-                                |
-                                +--> KILLED (insufficient impact, duplicate, etc.)
-\`\`\`
+${LIFECYCLE_DIAGRAM}
 
 ## Stage discipline (all done by you, inline)
 
@@ -275,12 +275,16 @@ Write the final report as a self-contained markdown file at the report path Case
 - **No finding is confirmed until its target is verified in scope** per the program's scope instruction. Out-of-scope findings are killed, not confirmed.
 - **No finding is validated without a reachability trace** showing REACHABLE.
 - **High-confidence findings: do your own adversarial disconfirmation.** No skeptic subagent in lite mode — actively try to disprove your own finding and document the attempt in \`disconfirmation\`. Failing to disprove is the expected outcome.
-- **Confirmed requires** evidence + poc + impact + severity + target + disconfirmation, and a PoC that exited 0 **with the verification_marker in the output**. No mocks for the exploitation step.
+- **Confirmed requires** evidence + poc + impact + severity + target + disconfirmation, and a PoC that exited 0 **with the verification_marker in the output**. **Live findings (local:true) also require control_path**: the same PoC run against a control lacking the vuln must NOT print the marker (harness-side check) — this is what stops unconditional-marker and mock-target cheats. No mocks for the exploitation step.
 - **Severity is derived from proven PoC impact, not theory.** Under-claiming is safe; over-claiming gets the finding rejected at triage.
 - **Evidence-first:** every claim must be traceable to observed/reproduced behavior, source code, or documented platform behavior.
 - **Design & runtime check (mandatory before CONFIRMED):** actively search the target's docs, git history, changelog, and runtime/framework docs for evidence the behavior is BY DESIGN or already FIXED IN THE RUNTIME. Found it → KILL (\`intended_behavior\` / \`framework_protection\`), unless the documented intent is itself the flaw with real attacker impact. Not found → document the search in \`disconfirmation\` as non-intentionality proof.
 
 ## KILLED cataloging
 
-When a case is definitively dead (not "I don't know yet"), record the reason: intended_behavior / duplicate / framework_protection / exploit_unreliable / insufficient_impact / environmental_issue / not_applicable. Documenting kills prevents re-opening dead ends. Cases with unresolved unknowns stay INVESTIGATING, not killed.
+When a case is definitively dead (not "I don't know yet"), record the reason: ${KILL_REASONS_TEXT}. **A kill without a reason is rejected by the ledger** — add an EvidenceAdd \`refutation\` item or state the reason token in assumptions/nextStep. Documenting kills prevents re-opening dead ends. Cases with unresolved unknowns stay INVESTIGATING, not killed.
+
+## Stall rule (deferred)
+
+3 rounds without new signal, new surface, or new techniques → CaseUpdate(status: 'blocked', blockers: ["deferred after 3 rounds — revisit when: <exact condition>"]). Blocked-with-revisit-condition is the deferred state; do not kill leads that are merely stalled.
 `.trim();

@@ -4,6 +4,7 @@
  * Shared across XPI packages so a bug fix lands once. Kept dependency-free
  * (no typebox, no host types) so any extension can import it.
  */
+import { setTimeout as nodeDelay } from "node:timers/promises";
 export class TtlLruCache<T> {
   private readonly map = new Map<string, { expires: number; value: T }>();
   private readonly inflight = new Map<string, Promise<T>>();
@@ -68,15 +69,8 @@ export function abortableSleep(ms: number, parentSignal?: AbortSignal): Promise<
   if (parentSignal?.aborted) {
     return Promise.reject(parentSignal.reason ?? new Error("aborted"));
   }
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      parentSignal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(parentSignal?.reason ?? new Error("aborted"));
-    };
-    parentSignal?.addEventListener("abort", onAbort, { once: true });
-  });
+  if (parentSignal) {
+    return nodeDelay(ms, undefined, { signal: parentSignal });
+  }
+  return nodeDelay(ms);
 }

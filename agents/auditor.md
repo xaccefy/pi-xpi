@@ -74,7 +74,7 @@ attacker_model: authenticated low-privilege user
 subsystem: user-management
 ```
 
-Then `CaseAdd(title: "<short>", status: hypothesis, endpoint, bugClass, target, evidence)`. **Do NOT set severity** — you haven't proven exploitability. Set `confidence` (how likely the lead is real); severity is assigned by the exploit agent after a PoC exits 0.
+Then `CaseAdd(title: "<short>", status: hypothesis, endpoint, bugClass, target, evidence, disproveIf)`. **`disproveIf` is REQUIRED** — name the falsification conditions (what would disprove this lead, e.g. `["the input is parameterized before the query", "the ORM escapes this call site"]`). **Do NOT set severity** — you haven't proven exploitability. Set `confidence` (how likely the lead is real); severity is assigned by the exploit agent after a PoC exits 0.
 
 ### Step 6: Coverage log
 

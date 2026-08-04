@@ -19,7 +19,6 @@ afterEach(async () => {
   delete process.env.PI_POC_ROOT;
   delete process.env.PI_POC_ALLOW_ABSOLUTE;
   delete process.env.PI_POC_DEFAULT_LANGUAGE;
-  delete process.env.PI_POC_LANGUAGES;
   await rm(tempDir, { recursive: true, force: true });
 });
 
@@ -61,21 +60,16 @@ describe("poc-runner", () => {
     expect(result.output).toContain("hello world");
   });
 
-  it("fails closed when the interpreter is missing (no false exit 0)", () => {
-    // Define a language whose interpreter does not exist, and force it via the
-    // default-language env. This reproduces the spawn ENOENT path: previously the
-    // PoC would report exitCode 0 and get promoted to CONFIRMED without running.
+  it("rejects an unknown PI_POC_DEFAULT_LANGUAGE", () => {
+    // Only built-in languages are allowed as the default; a typo must error,
+    // not silently fall through. Language override config was removed on
+    // purpose (its templates were trusted shells inside the sandbox).
     process.env.PI_POC_DEFAULT_LANGUAGE = "ghost";
-    process.env.PI_POC_LANGUAGES = JSON.stringify({
-      ghost: { image: "alpine", run: "definitely_missing_interpreter_xyz {{file}}" },
-    });
 
     const poc = join(tempDir, "poc.txt");
     writeFileSync(poc, "echo hi", "utf8");
 
-    const result = runPoc(poc, false);
-    expect(result.exitCode).not.toBe(0);
-    expect(result.output).toContain("[spawn error]");
+    expect(() => runPoc(poc, false)).toThrow(/Cannot determine PoC language/);
   });
 
   it("fails closed when docker is missing (sandbox path)", () => {
@@ -96,27 +90,15 @@ describe("poc-runner", () => {
     expect(result.exitCode).not.toBe(0);
   });
 
-  it("passes extra template flags as separate args and keeps a space-containing path intact", () => {
-    // A custom language with a multi-arg run template (interpreter + flag + file).
-    // Previously the space-in-path branch collapsed everything after the interpreter
-    // into one arg, breaking the flag. The fix splits the static template first.
-    process.env.PI_POC_DEFAULT_LANGUAGE = "nodeflag";
-    process.env.PI_POC_LANGUAGES = JSON.stringify({
-      // --no-warnings is a valueless flag; the path is the file to run.
-      nodeflag: { image: "node:22-slim", run: "node --no-warnings {{file}}" },
-    });
-
-    // PoC path with a space — must stay a single arg.
+  it("keeps a space-containing PoC path intact (local run, no shell)", () => {
+    // Local runs spawn with NO shell so a space in the path stays one arg.
     const dir = mkdtempSync(join(tempDir, "with space-"));
-    const poc = join(dir, "poc.txt");
-    writeFileSync(poc, "process.stdout.write(process.argv.join('|'))", "utf8");
+    const poc = join(dir, "poc.js");
+    writeFileSync(poc, 'process.stdout.write("ok from spaced path")', "utf8");
 
     const result = runPoc(poc, false);
     expect(result.exitCode).toBe(0);
-    // The path must arrive intact as a single arg (not split on its space).
-    // Node strips --no-warnings from argv, so we assert on the path itself:
-    // if the fix regressed, the path would be truncated at the space.
-    expect(result.output).toContain(poc);
+    expect(result.output).toContain("ok from spaced path");
     expect(result.output).not.toContain("Cannot find module");
   });
 });

@@ -96,6 +96,43 @@ describe("pi-webxp: web_search/web_fetch", () => {
     assert.strictEqual(fetchResult.content[0].text, "# Mocked Markdown Content");
   });
 
+  it("routes github.com hosts to /fetch-github-readme, everything else to /fetch-web", async () => {
+    const pi = new MockExtensionAPI();
+    piWebxp(pi as any);
+    const fetchTool = pi.tools.find((t) => t.name === "web_fetch");
+    assert.ok(fetchTool);
+
+    const hitEndpoints: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const urlStr = url.toString();
+      const path = urlStr.slice(urlStr.indexOf("/", "http://x".length)); // everything after host
+      if (urlStr.endsWith("/health")) {
+        return { ok: true, json: async () => ({ status: "ok", data: {} }) } as Response;
+      }
+      if (urlStr.endsWith("/fetch-github-readme") || urlStr.endsWith("/fetch-web")) {
+        hitEndpoints.push(path);
+        return {
+          ok: true,
+          json: async () => ({ status: "ok", data: { url: "", markdown: "x" } }),
+        } as Response;
+      }
+      throw new Error(`unexpected endpoint: ${urlStr}`);
+    }) as any;
+
+    await fetchTool.execute("c1", { url: "https://github.com/owner/repo" }, null, null, null);
+    await fetchTool.execute("c2", { url: "https://gist.github.com/user/id" }, null, null, null);
+    await fetchTool.execute("c3", { url: "https://example.com/page" }, null, null, null);
+    // Substring in the query string must NOT trigger the GitHub route.
+    await fetchTool.execute("c4", { url: "https://evil.example/?q=github.com" }, null, null, null);
+
+    assert.deepStrictEqual(hitEndpoints, [
+      "/fetch-github-readme",
+      "/fetch-github-readme",
+      "/fetch-web",
+      "/fetch-web",
+    ]);
+  });
+
   it("retries fetchWithRetry once on a transient 500 then succeeds", async () => {
     const pi = new MockExtensionAPI();
     piWebxp(pi as any);

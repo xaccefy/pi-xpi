@@ -1,7 +1,7 @@
 /**
  * Casefile — offensive security case tracker for Pi.
  *
- * Tools: CaseAdd, CaseUpdate, PromoteFinding, CaseGet, CaseList, CaseSearch, CaseLink, CaseUnlink, CaseContext, PipelineSubmit, ScratchpadInit, ScratchpadResume, ScratchpadCheckpoint, ScratchpadWrite, ScratchpadRead, ScratchpadPhaseDone, ScratchpadClear
+ * Tools: CaseAdd, CaseUpdate, PromoteFinding, EvidenceAdd, CoverageAdd, CoverageReport, ChainSuggest, CaseGet, CaseList, CaseSearch, CaseLink, CaseUnlink, CaseContext, PipelineSubmit, ScratchpadInit, ScratchpadResume, ScratchpadCheckpoint, ScratchpadWrite, ScratchpadRead, ScratchpadPhaseDone, ScratchpadClear
  * Command: /casefile — interactive dashboard
  * Event: before_agent_start — injects cyber workflow once per session, refreshes the active case list per prompt
  */
@@ -14,6 +14,7 @@ import { Type } from "@sinclair/typebox";
 
 import {
   addCaseResult,
+  addEvidenceItemResult,
   assertPromotable,
   type CaseConfidence,
   type CaseInput,
@@ -24,7 +25,14 @@ import {
   type CaseStatus,
   type CaseUpdate,
   CONFIDENCE_VALUES,
+  COVERAGE_SCOPE_VALUES,
+  type CoverageItem,
+  type CoverageScope,
   countCases,
+  coverageSummary,
+  EVIDENCE_ROLE_VALUES,
+  type EvidenceItem,
+  type EvidenceRole,
   formatCase,
   formatCaseDetail,
   formatCases,
@@ -36,10 +44,12 @@ import {
   promoteFindingResult,
   readActiveCases,
   readCasefile,
+  recordCoverageResult,
   SEARCH_FIELD_VALUES,
   SEVERITY_VALUES,
   STATUS_VALUES,
   searchCases,
+  suggestChains,
   unlinkCasesResult,
   updateCaseResult,
   writeCaseContext,
@@ -47,6 +57,7 @@ import {
 import { pipeline_submit, SUBMIT_STAGES, type SubmitStage } from "./pipeline-submit.ts";
 import { type PocRun, runPoc } from "./poc-runner.ts";
 import {
+  PHASE_ORDER,
   type ScratchpadPhase,
   type ScratchpadResume,
   scratchpad_checkpoint,
@@ -91,6 +102,12 @@ const CommonFields = {
       description: "Explicit assumptions, unknowns, or uncertainty notes",
     }),
   ),
+  disproveIf: Type.Optional(
+    Type.Array(Type.String(), {
+      description:
+        "Falsification conditions — what would disprove this hypothesis (REQUIRED on CaseAdd)",
+    }),
+  ),
 };
 
 // ── Tool: CaseAdd ─────────────────────────────────────────────────────
@@ -114,6 +131,30 @@ const UpdateSchema = Type.Object(
   { additionalProperties: false },
 );
 
+// ── Tool: EvidenceAdd ────────────────────────────────────────────────
+
+const EvidenceAddSchema = Type.Object(
+  {
+    case_id: Type.String({ description: "Case ID to attach the evidence item to" }),
+    role: Type.String({
+      enum: [...EVIDENCE_ROLE_VALUES],
+      description:
+        "Evidence role: observation | reproduction | impact | refutation | cleanup. " +
+        "refutation justifies a kill; cleanup tracks engagement cleanup items; " +
+        "reproduction is auto-recorded by the PoC gate at promote.",
+    }),
+    summary: Type.String({ description: "Short summary of this evidence item" }),
+    artifact_path: Type.Optional(
+      Type.String({
+        description:
+          "Path to the artifact file on disk. Stored as basename + SHA-256 hash " +
+          "(full path is never persisted).",
+      }),
+    ),
+  },
+  { additionalProperties: false },
+);
+
 // ── Tool: PromoteFinding ─────────────────────────────────────────────
 
 const PromoteSchema = Type.Object(
@@ -133,6 +174,12 @@ const PromoteSchema = Type.Object(
           "Absolute path to a disconfirmation script that tries to disprove the finding; must exit non-zero (failure to disprove)",
       }),
     ),
+    control_path: Type.Optional(
+      Type.String({
+        description:
+          "Absolute path to a control-target script: runs the SAME PoC against a control that lacks the vulnerability. The harness checks the control run's output — if the verification_marker appears there, promotion is BLOCKED (the PoC prints the marker without the vulnerable condition). REQUIRED when local:true (live findings).",
+      }),
+    ),
     local: Type.Optional(Type.Boolean({ description: "Run locally instead of in Docker sandbox" })),
   },
   { additionalProperties: false },
@@ -140,36 +187,35 @@ const PromoteSchema = Type.Object(
 
 // ── Tool: CaseGet ─────────────────────────────────────────────────────
 
-const GetSchema = Type.Object(
+/** id-only schema, shared by CaseGet / CaseContext. */
+const IdSchema = Type.Object(
   {
     id: Type.String({ description: "Case ID" }),
   },
   { additionalProperties: false },
 );
 
-// ── Tool: CaseList ────────────────────────────────────────────────────
+// ── Tools: CaseList / CaseSearch ──────────────────────────────────────
 
-const ListSchema = Type.Object(
-  {
-    status: Type.Optional(CaseStatusSchema),
-    confidence: Type.Optional(CaseConfidenceSchema),
-    severity: Type.Optional(CaseSeveritySchema),
-    minSeverity: Type.Optional(CaseSeveritySchema),
-    priority: Type.Optional(CasePrioritySchema),
-    tag: Type.Optional(Type.String({ description: "Filter by tag" })),
-    since: Type.Optional(
-      Type.String({ description: "ISO timestamp; only cases created at/after this time" }),
-    ),
-    until: Type.Optional(
-      Type.String({ description: "ISO timestamp; only cases created at/before this time" }),
-    ),
-    limit: Type.Optional(Type.Number({ description: "Max results (default 50)" })),
-    offset: Type.Optional(Type.Number({ description: "Skip N results for pagination" })),
-  },
-  { additionalProperties: false },
-);
+/** Structured filter fields, shared by the list and search schemas. */
+const FILTER_FIELDS = {
+  status: Type.Optional(CaseStatusSchema),
+  confidence: Type.Optional(CaseConfidenceSchema),
+  severity: Type.Optional(CaseSeveritySchema),
+  minSeverity: Type.Optional(CaseSeveritySchema),
+  priority: Type.Optional(CasePrioritySchema),
+  tag: Type.Optional(Type.String({ description: "Filter by tag" })),
+  since: Type.Optional(
+    Type.String({ description: "ISO timestamp; only cases created at/after this time" }),
+  ),
+  until: Type.Optional(
+    Type.String({ description: "ISO timestamp; only cases created at/before this time" }),
+  ),
+  limit: Type.Optional(Type.Number({ description: "Max results (default 50)" })),
+  offset: Type.Optional(Type.Number({ description: "Skip N results for pagination" })),
+};
 
-// ── Tool: CaseSearch ──────────────────────────────────────────────────
+const ListSchema = Type.Object({ ...FILTER_FIELDS }, { additionalProperties: false });
 
 const SearchSchema = Type.Object(
   {
@@ -180,20 +226,7 @@ const SearchSchema = Type.Object(
         description: "Restrict search to a specific field",
       }),
     ),
-    status: Type.Optional(CaseStatusSchema),
-    confidence: Type.Optional(CaseConfidenceSchema),
-    severity: Type.Optional(CaseSeveritySchema),
-    minSeverity: Type.Optional(CaseSeveritySchema),
-    priority: Type.Optional(CasePrioritySchema),
-    tag: Type.Optional(Type.String({ description: "Filter by tag" })),
-    since: Type.Optional(
-      Type.String({ description: "ISO timestamp; only cases created at/after this time" }),
-    ),
-    until: Type.Optional(
-      Type.String({ description: "ISO timestamp; only cases created at/before this time" }),
-    ),
-    limit: Type.Optional(Type.Number()),
-    offset: Type.Optional(Type.Number()),
+    ...FILTER_FIELDS,
   },
   { additionalProperties: false },
 );
@@ -225,13 +258,6 @@ const UnlinkSchema = Type.Object(
   { additionalProperties: false },
 );
 
-const ContextSchema = Type.Object(
-  {
-    id: Type.String({ description: "Case ID to build the context bundle for" }),
-  },
-  { additionalProperties: false },
-);
-
 // ── Tool: Scratchpad ─────────────────────────────────────────────────
 //
 // The scratchpad is the pipeline's crash-recoverable artifact store.
@@ -239,34 +265,16 @@ const ContextSchema = Type.Object(
 // (recon maps, trace outputs, verification logs). Resume re-reads
 // artifacts; it does not re-run completed phases (idempotent).
 
-const SCRATCHPAD_PHASES = [
-  "recon",
-  "hunt",
-  "gapfil",
-  "trace",
-  "skeptic",
-  "validate",
-  "chain",
-  "patch",
-  "report",
-] as const;
-
 const ScratchpadPhaseSchema = Type.String({
-  enum: [...SCRATCHPAD_PHASES],
+  enum: [...PHASE_ORDER],
   description:
     "Pipeline phase: recon | hunt | gapfil | trace | skeptic | validate | chain | patch | report",
 });
 
-const ScratchpadInitSchema = Type.Object(
+/** run_id-only schema, shared by Scratchpad Init / Resume / Clear. */
+const RunIdSchema = Type.Object(
   {
-    run_id: Type.String({ description: "Unique run identifier for this pipeline run" }),
-  },
-  { additionalProperties: false },
-);
-
-const ScratchpadResumeSchema = Type.Object(
-  {
-    run_id: Type.String({ description: "Run identifier to resume" }),
+    run_id: Type.String({ description: "Pipeline run identifier" }),
   },
   { additionalProperties: false },
 );
@@ -310,13 +318,6 @@ const ScratchpadPhaseDoneSchema = Type.Object(
   {
     run_id: Type.String({ description: "Run identifier" }),
     phase: ScratchpadPhaseSchema,
-  },
-  { additionalProperties: false },
-);
-
-const ScratchpadClearSchema = Type.Object(
-  {
-    run_id: Type.String({ description: "Run identifier to clear (deletes that run only)" }),
   },
   { additionalProperties: false },
 );
@@ -390,6 +391,57 @@ function renderCaseResult(
   const prefix = success ? successPrefix : failPrefix;
   const color = success ? "success" : "warning";
   return theme.fg(color, prefix) + renderOneLine(details.record, theme);
+}
+
+/** One-line tool call header, shared by every tool's renderCall. */
+function callLine(theme: Theme, name: string, detail?: string): Text {
+  const title = theme.fg("toolTitle", theme.bold(detail !== undefined ? `${name} ` : name));
+  return new Text(title + (detail ? theme.fg("dim", detail) : ""), 0, 0);
+}
+
+/** CaseRecord[] page summary, shared by CaseList / CaseSearch renderResult. */
+function renderCasePage(
+  result: { details: unknown },
+  theme: Theme,
+  noun: string,
+  expanded: boolean,
+): Text {
+  const details = result.details as { cases?: CaseRecord[]; total?: number } | undefined;
+  const total = details?.total ?? 0;
+  const cases = details?.cases ?? [];
+  let line = theme.fg("success", "✓ ") + theme.fg("muted", `${total} ${noun}`);
+  if (expanded && cases.length > 0) {
+    line += `\n${cases.map((c) => `  ${renderOneLine(c, theme)}`).join("\n")}`;
+  }
+  return new Text(line, 0, 0);
+}
+
+/** Filtered case query, shared by CaseList / CaseSearch execute. */
+function runCaseQuery(
+  params: Record<string, unknown>,
+  header: (count: number, total: number, offset: number) => string,
+  emptyText: string,
+) {
+  const { cases, total } = searchCases({
+    query: params.query as string | undefined,
+    field: params.field as CaseSearchField | undefined,
+    status: params.status as CaseStatus | undefined,
+    confidence: params.confidence as CaseConfidence | undefined,
+    severity: params.severity as CaseSeverity | undefined,
+    minSeverity: params.minSeverity as CaseSeverity | undefined,
+    priority: params.priority as CasePriority | undefined,
+    tag: params.tag as string | undefined,
+    since: params.since as string | undefined,
+    until: params.until as string | undefined,
+    limit: params.limit as number | undefined,
+    offset: params.offset as number | undefined,
+  });
+  const offset = (params.offset as number | undefined) ?? 0;
+  const body = cases.length > 0 ? formatCases(cases) : emptyText;
+  return {
+    content: [{ type: "text" as const, text: `${header(cases.length, total, offset)}\n${body}` }],
+    details: { cases, total, offset },
+  };
 }
 
 // ── Dashboard component ──────────────────────────────────────────────
@@ -656,6 +708,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     promptSnippet: "Record a security finding or hypothesis as a case",
     promptGuidelines: [
       "Use CaseAdd for a new security lead. New cases start as status='hypothesis' or 'investigating' — promote later with CaseUpdate.",
+      "disproveIf is REQUIRED on CaseAdd: name the falsification conditions (what would disprove this hypothesis). A hypothesis that can't say what kills it isn't a hypothesis yet.",
       "Check the injected case list or CaseList/CaseSearch first. Do not add a duplicate for the same title/scope.",
       "CaseAdd rejects exact and NEAR-duplicates (same target + overlapping title, e.g. parallel-subagent re-phrasings). A near-duplicate result → continue the existing case ID via CaseUpdate, don't create a new one.",
       "confirmed/reported only via their gates: proof in poc + PromoteFinding for confirmed; CaseContext + report for reported.",
@@ -685,12 +738,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("CaseAdd ")) +
-          theme.fg("muted", (args.title as string) ?? ""),
-        0,
-        0,
-      );
+      return callLine(theme, "CaseAdd", (args.title as string) ?? "");
     },
 
     renderResult(result, { expanded }, theme) {
@@ -738,12 +786,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("CaseUpdate ")) +
-          theme.fg("dim", (args.id as string) ?? ""),
-        0,
-        0,
-      );
+      return callLine(theme, "CaseUpdate", (args.id as string) ?? "");
     },
 
     renderResult(result, { expanded }, theme) {
@@ -764,19 +807,216 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
   });
 
+  // ── Tool: EvidenceAdd ──
+
+  pi.registerTool({
+    name: "EvidenceAdd",
+    label: "Add Evidence Item",
+    description:
+      "Record a role-typed, artifact-backed evidence item on a case (observation, reproduction, impact, refutation, cleanup). Artifact files are stored as basename + SHA-256 — the full path is never persisted. refutation items justify a kill; cleanup items track engagement cleanup before REPORT.",
+    promptSnippet: "Record a role-typed evidence item",
+    promptGuidelines: [
+      "Use EvidenceAdd for artifact-backed evidence: raw responses, logs, screenshots, disproof attempts — anything a claim should trace back to.",
+      "role=refutation is the structural justification for a kill (killed without one requires a kill-reason token in assumptions/nextStep).",
+      "role=cleanup tracks engagement cleanup items — confirmed before REPORT for sanctioned engagements.",
+      "reproduction is auto-recorded by the PromoteFinding gate (the PoC run itself, hashed); you don't add it manually.",
+    ],
+    parameters: EvidenceAddSchema,
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const item = addEvidenceItemResult(params.case_id as string, {
+        role: params.role as EvidenceRole,
+        summary: params.summary as string,
+        artifactPath: params.artifact_path as string | undefined,
+      });
+      const record = getCaseById(params.case_id as string)!;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Evidence item recorded:\n[${item.role}] ${item.summary}${item.artifactPath ? ` — ${item.artifactPath} sha256:${item.sha256?.slice(0, 12)}…` : ""}\n\n${formatCaseDetail(record)}`,
+          },
+        ],
+        details: { item, record },
+      };
+    },
+
+    renderCall(args, theme) {
+      return callLine(
+        theme,
+        "EvidenceAdd",
+        `${(args.case_id as string) ?? ""} [${(args.role as string) ?? ""}]`,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const details = result.details as { item?: EvidenceItem } | undefined;
+      if (!details?.item) {
+        return new Text(theme.fg("error", "✗ EvidenceAdd failed"), 0, 0);
+      }
+      return new Text(
+        theme.fg("success", "✓ ") +
+          theme.fg("dim", `[${details.item.role}] `) +
+          truncateToWidth(details.item.summary, 60),
+        0,
+        0,
+      );
+    },
+  });
+
+  // ── Tool: CoverageAdd ──
+
+  const CoverageAddSchema = Type.Object(
+    {
+      case_id: Type.String({
+        description: "Case ID (the pipeline-run or finding case) to record coverage under",
+      }),
+      asset: Type.String({
+        description:
+          "The asset tested — copy it verbatim from the case target where shown. For scope=wide use the deployment-wide identifier.",
+      }),
+      class: Type.String({
+        description:
+          "The attack class tested (e.g. sql-injection, xss, idor, ssti, ssrf, auth-bypass, ...).",
+      }),
+      scope: Type.Union(
+        COVERAGE_SCOPE_VALUES.map((s) => Type.Literal(s)),
+        {
+          description:
+            "'wide' if the verdict applies to the whole deployment/account/host (recorded ONCE, applies to every asset of the deployment — do NOT re-test it per asset); 'local' if specific to this one asset.",
+        },
+      ),
+      note: Type.String({
+        description:
+          "Short note of the tests ACTUALLY RUN and the verdict: techniques tried · result · key gap. A verdict guessed without testing can hide a real issue.",
+      }),
+    },
+    { additionalProperties: false },
+  );
+
+  pi.registerTool({
+    name: "CoverageAdd",
+    label: "Record Coverage",
+    description:
+      "Record what you tested so it is not re-tested. Call AFTER finishing a CLASS of issue, for BOTH outcomes (found or clean — a clean result is just as important to record). scope=wide: the verdict is a property of the whole deployment, recorded once and applied to every later asset (do NOT re-test per asset); scope=local: specific to this one asset. The cell's existence marks that class tested for that asset.",
+    promptSnippet: "Record a tested attack class (coverage)",
+    promptGuidelines: [
+      "Record a coverage cell after you finish testing a class on an asset — found OR clean. Clean results are what make 'every class is COVERED' machine-checkable.",
+      "scope=wide for deployment-wide verdicts (record once, applies to every asset of the deployment — do NOT re-test it per asset). scope=local for single-asset verdicts.",
+      "The note must describe tests you ACTUALLY RAN, not assumptions. A verdict guessed without testing can hide a real issue.",
+      "Coverage cells live on the pipeline-run case (or the target's main case); CoverageReport shows the matrix.",
+    ],
+    parameters: CoverageAddSchema,
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const item = recordCoverageResult(params.case_id as string, {
+        asset: params.asset as string,
+        class: params.class as string,
+        scope: (params.scope ?? "local") as CoverageScope,
+        note: params.note as string,
+      });
+      const record = getCaseById(params.case_id as string)!;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Coverage recorded: [${item.scope}] ${item.asset} × ${item.class} — ${item.note}\n\n${formatCaseDetail(record)}`,
+          },
+        ],
+        details: { item, record },
+      };
+    },
+
+    renderCall(args, theme) {
+      return callLine(
+        theme,
+        "CoverageAdd",
+        `${(args.asset as string) ?? ""} [${(args.class as string) ?? ""}]`,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const details = result.details as { item?: CoverageItem } | undefined;
+      if (!details?.item) {
+        return new Text(theme.fg("error", "✗ CoverageAdd failed"), 0, 0);
+      }
+      return new Text(
+        theme.fg("success", "✓ ") +
+          theme.fg("dim", `[${details.item.scope}] `) +
+          truncateToWidth(`${details.item.asset} × ${details.item.class}`, 50),
+        0,
+        0,
+      );
+    },
+  });
+
+  // ── Tool: CoverageReport ──
+
+  const CoverageReportSchema = Type.Object(
+    {
+      case_id: Type.String({ description: "Case ID to render the coverage matrix for" }),
+    },
+    { additionalProperties: false },
+  );
+
+  pi.registerTool({
+    name: "CoverageReport",
+    label: "Coverage Matrix",
+    description:
+      "Render the machine-checkable coverage matrix for a case: which (asset × attack-class) cells are tested, with wide-verdict propagation. Run before deciding the hunt/gapfill is done — the plateau stop (zero new classes testable) must be visible in the matrix, not asserted in prose.",
+    promptSnippet: "Show which attack classes were tested where",
+    promptGuidelines: [
+      "Run CoverageReport before claiming 'every class is COVERED/SKIPPED/NOT_FOUND' — the claim must match the matrix.",
+      "A class with a wide clean verdict covers every asset — do NOT re-test it per asset.",
+      "Classes tested with no cell recorded are invisible: record coverage as you finish each class (CoverageAdd).",
+    ],
+    parameters: CoverageReportSchema,
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const summary = coverageSummary(params.case_id as string);
+      const lines: string[] = [`Coverage matrix for ${params.case_id}:`];
+      for (const asset of summary.assets) {
+        lines.push(`\n## ${asset}`);
+        for (const cell of summary.byAsset[asset] ?? []) {
+          lines.push(
+            `- [${cell.scope}] ${cell.class} — ${cell.note}${cell.testedBy ? ` (by ${cell.testedBy})` : ""}`,
+          );
+        }
+      }
+      if (summary.items.length === 0) {
+        lines.push("\n(no coverage recorded yet — run CoverageAdd as each class is tested)");
+      }
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: { summary },
+      };
+    },
+
+    renderCall(args, theme) {
+      return callLine(theme, "CoverageReport", (args.case_id as string) ?? "");
+    },
+
+    renderResult(result, _opts, theme) {
+      const details = result.details as { summary?: { items?: CoverageItem[] } } | undefined;
+      const n = details?.summary?.items?.length ?? 0;
+      return new Text(theme.fg("success", `✓ ${n} coverage cell(s)`), 0, 0);
+    },
+  });
+
   // ── Tool: PromoteFinding ──
 
   pi.registerTool({
     name: "PromoteFinding",
     label: "Promote Finding",
     description:
-      "Run an on-disk PoC script (Docker sandbox or local) and, on exit 0 + verification marker present in output, promote an investigating case to confirmed. The verification_marker proves the exploit actually worked — exit code 0 alone is NOT sufficient. Optionally run a disconfirmation script that must exit non-0 (finding survived the attempt to disprove).",
+      "Run an on-disk PoC script (Docker sandbox or local) and, on exit 0 + verification marker present in output, promote an investigating case to confirmed. The verification_marker proves the exploit actually worked — exit code 0 alone is NOT sufficient. For live findings (local:true) a control_path script is REQUIRED: the same PoC run against a control lacking the vuln must NOT print the marker — this blocks unconditional-marker and mock-target cheats. Optionally run a disconfirmation script that must exit non-0 (finding survived the attempt to disprove).",
     promptSnippet: "Run a PoC and promote an investigating case to confirmed",
     promptGuidelines: [
       "Use PromoteFinding when an investigating case has a concrete PoC script on disk and you are ready to prove it.",
-      "Prerequisites: status='investigating' and non-empty poc, evidence, impact, severity, target, disconfirmation.",
+      "Prerequisites: status='investigating' and non-empty poc, evidence, impact, severity, target, disconfirmation, plus an EvidenceAdd 'observation' item on the case (the initial signal) — the PoC gate auto-records the reproduction item.",
       "Default sandbox: docker run --rm --network none. Use local:true for network-dependent bugs.",
       "Gate: exit 0 AND verification_marker in the PoC output. The marker (e.g. 'VULN_CONFIRMED_<case-id>') must be printed only AFTER the exploit is verified (data extracted, callback received, payload reflected) — never unconditionally or before the exploit check. The marker check prevents fluke exit 0 (script crashed early) and mocked PoCs (target faked) from passing.",
+      "control_path (REQUIRED for local:true): a script that runs the SAME PoC against a control lacking the vuln (patched replica, second account, baseline endpoint). The harness blocks promotion if the verification_marker appears in the control run's output — an unconditional-marker PoC cannot pass this.",
       "disconfirmation_path: a script that tries to disprove the finding; if it exits 0, promotion is blocked.",
       "Never CaseUpdate status='confirmed' directly — it is rejected. Always use PromoteFinding.",
     ],
@@ -786,42 +1026,58 @@ export default function casefileExtension(pi: ExtensionAPI) {
       // Validate promotability BEFORE running the PoC — a sandboxed run can take
       // 30s (plus first-time image pull), so fail cheap when the case can't
       // advance anyway (missing, wrong status, missing required fields).
-      assertPromotable(params.id as string);
+      const caseId = params.id as string;
+      assertPromotable(caseId);
+
+      // Shared blocked-promotion shape: the case stays investigating and the
+      // caller gets the record back for context.
+      const fail = (text: string, extra?: Record<string, unknown>) => ({
+        content: [{ type: "text" as const, text }],
+        isError: true,
+        details: { record: getCaseById(caseId), ...extra },
+      });
 
       // Reject empty/whitespace markers BEFORE any PoC run — it's a param
       // error, so fail cheap instead of burning a (up to 30s) sandboxed run.
       const marker = (params.verification_marker as string | undefined)?.trim();
       if (!marker) {
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                "verification_marker is empty or whitespace. " +
-                "A non-empty marker printed only AFTER the PoC confirms exploitation is required — " +
-                "exit code 0 alone is not sufficient. Case remains investigating.",
-            },
-          ],
-          isError: true,
-          details: { record: getCaseById(params.id as string) },
-        };
+        return fail(
+          "verification_marker is empty or whitespace. " +
+            "A non-empty marker printed only AFTER the PoC confirms exploitation is required — " +
+            "exit code 0 alone is not sufficient. Case remains investigating.",
+        );
+      }
+
+      // Live findings require control_path — check BEFORE paying for the PoC
+      // run (an agent that forgot the control script shouldn't burn a 30s
+      // sandboxed run to be told).
+      if (params.local === true && !params.control_path) {
+        return fail(
+          "Live findings (local:true) require control_path: a script that runs the same PoC " +
+            "against a control lacking the vuln. The harness verifies the verification_marker is " +
+            "absent from the control run's output — that is what proves the marker is target-dependent. " +
+            "Write the control script and retry.",
+          { missingControl: true },
+        );
       }
 
       const run = runPoc(params.poc_path as string, params.local !== true);
 
       // Fail closed without throwing: non-zero PoC must leave the case investigating.
       if (run.exitCode !== 0) {
-        const record = getCaseById(params.id as string);
-        return {
-          content: [
-            {
-              type: "text",
-              text: `PoC failed (exit ${run.exitCode}). Case remains investigating.\nOutput:\n${run.output}`,
-            },
-          ],
-          isError: true,
-          details: { record, run },
-        };
+        return fail(
+          `PoC failed (exit ${run.exitCode}). Case remains investigating.\nOutput:\n${run.output}`,
+          { run },
+        );
+      }
+
+      // Defense-in-depth: exit 0 implies the run completed (sandbox wrapper /
+      // local spawn semantics), but never trust a run the runner says crashed.
+      if (!run.completed) {
+        return fail(
+          `PoC did NOT complete (spawn error, killed, or timeout). Case remains investigating.\nOutput:\n${run.output}`,
+          { run, pocCrashed: true },
+        );
       }
 
       // Verification marker check: exit code 0 alone is NOT sufficient.
@@ -829,63 +1085,63 @@ export default function casefileExtension(pi: ExtensionAPI) {
       // exploit actually worked — not just that the script ran. This blocks
       // fluke exit 0 (crash before real logic) and mocked PoCs that don't
       // actually exploit the target.
-      if (!(run.output ?? "").includes(marker)) {
-        const record = getCaseById(params.id as string);
-        return {
-          content: [
-            {
-              type: "text",
-              text:
-                `PoC exited 0 but the verification marker "${marker}" was NOT found in the output.\n` +
-                `This means the script ran but did not prove exploitation. The marker must be printed only AFTER the PoC verifies the exploit worked (data extracted, callback received, payload reflected, etc.).\n` +
-                `Do not print the marker unconditionally — print it only when the exploit is confirmed.\n\nOutput:\n${run.output}`,
-            },
-          ],
-          isError: true,
-          details: { record, run, markerMissing: true },
-        };
+      if (!run.output.includes(marker)) {
+        return fail(
+          `PoC exited 0 but the verification marker "${marker}" was NOT found in the output.\n` +
+            `This means the script ran but did not prove exploitation. The marker must be printed only AFTER the PoC verifies the exploit worked (data extracted, callback received, payload reflected, etc.).\n` +
+            `Do not print the marker unconditionally — print it only when the exploit is confirmed.\n\nOutput:\n${run.output}`,
+          { run, markerMissing: true },
+        );
       }
 
       // Run disconfirmation script if provided — must exit NON-0 (finding survived the attempt to disprove).
       let disconfirmationRun: PocRun | undefined;
       if (params.disconfirmation_path) {
         disconfirmationRun = runPoc(params.disconfirmation_path as string, params.local !== true);
+        if (!disconfirmationRun.completed) {
+          return fail(
+            `Disconfirmation script did NOT complete (spawn error, killed, or timeout — no completion marker). ` +
+              `A crash is not a survived disproof: fix the disconfirmation script and retry.\n` +
+              `Output:\n${disconfirmationRun.output}`,
+            { run, disconfirmationRun, disconfirmationCrashed: true },
+          );
+        }
         if (disconfirmationRun.exitCode === 0) {
-          const record = getCaseById(params.id as string);
-          return {
-            content: [
-              {
-                type: "text",
-                text:
-                  `Disconfirmation script exited 0 (finding was disproven). ` +
-                  `Case remains investigating.\nOutput:\n${disconfirmationRun.output}`,
-              },
-            ],
-            isError: true,
-            details: { record, run, disconfirmationRun },
-          };
+          return fail(
+            `Disconfirmation script exited 0 (finding was disproven). ` +
+              `Case remains investigating.\nOutput:\n${disconfirmationRun.output}`,
+            { run, disconfirmationRun },
+          );
         }
       }
 
-      const result = promoteFindingResult(
-        params.id as string,
-        {
-          path: run.path,
-          exitCode: run.exitCode,
-          ranAt: run.ranAt,
-          output: run.output,
-          sandbox: run.sandbox,
-        },
-        disconfirmationRun
-          ? {
-              path: disconfirmationRun.path,
-              exitCode: disconfirmationRun.exitCode,
-              ranAt: disconfirmationRun.ranAt,
-              output: disconfirmationRun.output,
-              sandbox: disconfirmationRun.sandbox,
-            }
-          : undefined,
-      );
+      // Control-target anti-cheat check: the same PoC pointed at a control that
+      // lacks the vuln must NOT print the marker. The control script is
+      // agent-written, but the marker-absence check is harness-side and
+      // deterministic — the model cannot pass it by asserting success.
+      let controlRun: PocRun | undefined;
+      if (params.control_path) {
+        controlRun = runPoc(params.control_path as string, params.local !== true);
+        if (!controlRun.completed) {
+          return fail(
+            `CONTROL CHECK FAILED: the control-target script did NOT complete (spawn error, killed, or timeout). ` +
+              `A control run that never executed proves nothing about the marker — fix the control script and retry.\n` +
+              `Control output:\n${controlRun.output}`,
+            { run, controlRun, controlCrashed: true },
+          );
+        }
+        if (controlRun.output.includes(marker)) {
+          return fail(
+            `CONTROL CHECK FAILED: the verification marker "${marker}" appeared in the control-target run. ` +
+              `The PoC prints the marker without the vulnerable condition — a cheating PoC (unconditional marker) ` +
+              `or a broken check. Case remains investigating.\nControl output:\n${controlRun.output}`,
+            { run, controlRun, controlCheated: true },
+          );
+        }
+      }
+
+      // PocRun is structurally a PocVerification — pass the runs straight through.
+      const result = promoteFindingResult(caseId, run, disconfirmationRun, controlRun, marker);
       const record = result.record;
       return {
         content: [
@@ -899,12 +1155,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("PromoteFinding ")) +
-          theme.fg("dim", (args.id as string) ?? ""),
-        0,
-        0,
-      );
+      return callLine(theme, "PromoteFinding", (args.id as string) ?? "");
     },
 
     renderResult(result, _options, theme) {
@@ -921,7 +1172,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     label: "Get Case",
     description: "Get full details of a single case by ID.",
     promptSnippet: "Look up a specific case by ID",
-    parameters: GetSchema,
+    parameters: IdSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       const record = getCaseById(params.id as string);
@@ -935,11 +1186,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("CaseGet ")) + theme.fg("dim", (args.id as string) ?? ""),
-        0,
-        0,
-      );
+      return callLine(theme, "CaseGet", (args.id as string) ?? "");
     },
 
     renderResult(result, _options, theme) {
@@ -961,40 +1208,19 @@ export default function casefileExtension(pi: ExtensionAPI) {
     parameters: ListSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const { cases, total } = searchCases({
-        status: params.status as CaseStatus | undefined,
-        confidence: params.confidence as CaseConfidence | undefined,
-        severity: params.severity as CaseSeverity | undefined,
-        minSeverity: params.minSeverity as CaseSeverity | undefined,
-        priority: params.priority as CasePriority | undefined,
-        tag: params.tag,
-        since: params.since as string | undefined,
-        until: params.until as string | undefined,
-        limit: params.limit,
-        offset: params.offset,
-      });
-      const offset = params.offset ?? 0;
-      const header = `Showing ${cases.length} of ${total} cases (offset: ${offset})`;
-      const body = cases.length > 0 ? formatCases(cases) : "No cases match filters.";
-      return {
-        content: [{ type: "text", text: `${header}\n${body}` }],
-        details: { cases, total, offset },
-      };
+      return runCaseQuery(
+        params as Record<string, unknown>,
+        (count, total, offset) => `Showing ${count} of ${total} cases (offset: ${offset})`,
+        "No cases match filters.",
+      );
     },
 
     renderCall(_args, theme) {
-      return new Text(theme.fg("toolTitle", theme.bold("CaseList")), 0, 0);
+      return callLine(theme, "CaseList");
     },
 
     renderResult(result, { expanded }, theme) {
-      const details = result.details as { cases?: CaseRecord[]; total?: number } | undefined;
-      const total = details?.total ?? 0;
-      const cases = details?.cases ?? [];
-      let line = theme.fg("success", "✓ ") + theme.fg("muted", `${total} case(s)`);
-      if (expanded && cases.length > 0) {
-        line += `\n${cases.map((c) => `  ${renderOneLine(c, theme)}`).join("\n")}`;
-      }
-      return new Text(line, 0, 0);
+      return renderCasePage(result, theme, "case(s)", expanded);
     },
   });
 
@@ -1009,46 +1235,20 @@ export default function casefileExtension(pi: ExtensionAPI) {
     parameters: SearchSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const { cases, total } = searchCases({
-        query: params.query,
-        field: params.field as CaseSearchField | undefined,
-        status: params.status as CaseStatus | undefined,
-        confidence: params.confidence as CaseConfidence | undefined,
-        severity: params.severity as CaseSeverity | undefined,
-        minSeverity: params.minSeverity as CaseSeverity | undefined,
-        priority: params.priority as CasePriority | undefined,
-        tag: params.tag,
-        since: params.since as string | undefined,
-        until: params.until as string | undefined,
-        limit: params.limit,
-        offset: params.offset,
-      });
-      const offset = params.offset ?? 0;
-      const header = `Search "${params.query}"${params.field ? ` in ${params.field}` : ""}: ${cases.length} of ${total} results (offset: ${offset})`;
-      const body = cases.length > 0 ? formatCases(cases) : "No matching cases.";
-      return {
-        content: [{ type: "text", text: `${header}\n${body}` }],
-        details: { cases, total, offset },
-      };
-    },
-
-    renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("CaseSearch ")) + theme.fg("dim", `"${args.query}"`),
-        0,
-        0,
+      return runCaseQuery(
+        params as Record<string, unknown>,
+        (count, total, offset) =>
+          `Search "${params.query}"${params.field ? ` in ${params.field}` : ""}: ${count} of ${total} results (offset: ${offset})`,
+        "No matching cases.",
       );
     },
 
+    renderCall(args, theme) {
+      return callLine(theme, "CaseSearch", `"${args.query}"`);
+    },
+
     renderResult(result, { expanded }, theme) {
-      const details = result.details as { cases?: CaseRecord[]; total?: number } | undefined;
-      const total = details?.total ?? 0;
-      const cases = details?.cases ?? [];
-      let line = theme.fg("success", "✓ ") + theme.fg("muted", `${total} result(s)`);
-      if (expanded && cases.length > 0) {
-        line += `\n${cases.map((c) => `  ${renderOneLine(c, theme)}`).join("\n")}`;
-      }
-      return new Text(line, 0, 0);
+      return renderCasePage(result, theme, "result(s)", expanded);
     },
   });
 
@@ -1094,14 +1294,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
 
     renderCall(args, theme) {
       const kind = args.kind ? ` [${args.kind}]` : "";
-      return new Text(
-        theme.fg("toolTitle", theme.bold("CaseLink ")) +
-          theme.fg(
-            "dim",
-            `${(args.source_id as string) ?? ""} ↔ ${(args.target_id as string) ?? ""}${kind}`,
-          ),
-        0,
-        0,
+      return callLine(
+        theme,
+        "CaseLink",
+        `${(args.source_id as string) ?? ""} ↔ ${(args.target_id as string) ?? ""}${kind}`,
       );
     },
 
@@ -1163,14 +1359,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("CaseUnlink ")) +
-          theme.fg(
-            "dim",
-            `${(args.source_id as string) ?? ""} ↻ ${(args.target_id as string) ?? ""}`,
-          ),
-        0,
-        0,
+      return callLine(
+        theme,
+        "CaseUnlink",
+        `${(args.source_id as string) ?? ""} ↻ ${(args.target_id as string) ?? ""}`,
       );
     },
 
@@ -1187,6 +1379,65 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
   });
 
+  // ── Tool: ChainSuggest ──
+
+  const ChainSuggestSchema = Type.Object(
+    {
+      case_id: Type.Optional(
+        Type.String({
+          description:
+            "Optional: scope suggestions to this case and its linked cases. Omit to scan all non-terminal cases.",
+        }),
+      ),
+    },
+    { additionalProperties: false },
+  );
+
+  pi.registerTool({
+    name: "ChainSuggest",
+    label: "Suggest Exploit Chains",
+    description:
+      "Scan non-terminal cases for exploitable chains (credential+endpoint→ATO, open-redirect+OAuth→token theft, XSS+state-changing→CSRF bypass, IDOR+user-data→mass leak, SSTI→RCE, race+payment→financial, info-disclosure+SSRF). Returns ranked candidates with confidence and a suggested link kind — the agent decides whether to CaseLink them or open an escalation case. Catches chain combinations the model may have missed.",
+    promptSnippet: "Find missed exploit-chain combinations",
+    promptGuidelines: [
+      "Run ChainSuggest before concluding an engagement — low-severity findings that chain into high-impact (ATO, token theft, mass leak) are the ones triage cares about.",
+      "A suggestion is a HYPOTHESIS to verify, not a finding: test the chained behavior on the live target before linking or promoting anything.",
+      "Chain a suggested pair with CaseLink (suggested kind) or open a new escalation case with status=hypothesis.",
+    ],
+    parameters: ChainSuggestSchema,
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const suggestions = suggestChains((params.case_id as string | undefined) ?? undefined);
+      const lines: string[] = [
+        suggestions.length
+          ? `${suggestions.length} chain candidate(s):`
+          : "No chain candidates found across non-terminal cases.",
+      ];
+      for (const s of suggestions) {
+        const pair = s.targetId
+          ? `${s.sourceId} (${s.sourceTitle}) + ${s.targetId} (${s.targetTitle ?? ""})`
+          : `${s.sourceId} (${s.sourceTitle})`;
+        lines.push(
+          `\n[${s.pattern}] conf ${s.confidence}% — ${pair}\n  ${s.rationale}${s.suggestedKind ? `\n  suggested link kind: ${s.suggestedKind}` : ""}`,
+        );
+      }
+      return {
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: { suggestions },
+      };
+    },
+
+    renderCall(args, theme) {
+      return callLine(theme, "ChainSuggest", (args.case_id as string) ?? "all");
+    },
+
+    renderResult(result, _opts, theme) {
+      const details = result.details as { suggestions?: { length: number } } | undefined;
+      const n = details?.suggestions?.length ?? 0;
+      return new Text(theme.fg(n ? "accent" : "dim", `${n} chain candidate(s)`), 0, 0);
+    },
+  });
+
   // ── Tool: CaseContext ──
 
   pi.registerTool({
@@ -1199,7 +1450,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
       "Use CaseContext only for confirmed or already reported cases. Keep hypotheses and investigating cases in the ledger until proof is captured.",
       "After CaseContext, dispatch the reporter subagent (agents/reporter) to write the final report to the returned report path, then CaseUpdate(status: 'reported').",
     ],
-    parameters: ContextSchema,
+    parameters: IdSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       const { path, contextPath, record } = writeCaseContext(params.id as string);
@@ -1215,12 +1466,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("CaseContext ")) +
-          theme.fg("dim", (args.id as string) ?? ""),
-        0,
-        0,
-      );
+      return callLine(theme, "CaseContext", (args.id as string) ?? "");
     },
 
     renderResult(result, _options, theme) {
@@ -1298,12 +1544,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("PipelineSubmit ")) +
-          theme.fg("dim", `${args.stage ?? ""}`),
-        0,
-        0,
-      );
+      return callLine(theme, "PipelineSubmit", `${args.stage ?? ""}`);
     },
 
     renderResult(result, _opts, theme) {
@@ -1335,7 +1576,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
       "The run_id is arbitrary but should be unique per pipeline run — typically <target>-<timestamp>.",
       "On resume, ScratchpadInit returns the existing checkpoint without wiping it; pair with ScratchpadResume to skip completed phases.",
     ],
-    parameters: ScratchpadInitSchema,
+    parameters: RunIdSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       const cp = scratchpad_init(params.run_id as string);
@@ -1351,12 +1592,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("ScratchpadInit ")) +
-          theme.fg("dim", (args.run_id as string) ?? ""),
-        0,
-        0,
-      );
+      return callLine(theme, "ScratchpadInit", (args.run_id as string) ?? "");
     },
 
     renderResult(result, _opts, theme) {
@@ -1378,7 +1614,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
       "If ScratchpadResume returns null, the run has no checkpoint — call ScratchpadInit to start fresh.",
       "Use ScratchpadPhaseDone before dispatching each stage to avoid re-running completed phases (idempotent resume).",
     ],
-    parameters: ScratchpadResumeSchema,
+    parameters: RunIdSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       const resume = scratchpad_resume(params.run_id as string);
@@ -1409,12 +1645,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("ScratchpadResume ")) +
-          theme.fg("dim", (args.run_id as string) ?? ""),
-        0,
-        0,
-      );
+      return callLine(theme, "ScratchpadResume", (args.run_id as string) ?? "");
     },
 
     renderResult(result, _opts, theme) {
@@ -1463,12 +1694,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("ScratchpadCheckpoint ")) +
-          theme.fg("dim", `${args.run_id ?? ""} ${args.phase ?? ""}`),
-        0,
-        0,
-      );
+      return callLine(theme, "ScratchpadCheckpoint", `${args.run_id ?? ""} ${args.phase ?? ""}`);
     },
 
     renderResult(result, _opts, theme) {
@@ -1517,11 +1743,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("ScratchpadWrite ")) +
-          theme.fg("dim", `${args.run_id ?? ""}/${args.phase ?? ""}/${args.artifact_name ?? ""}`),
-        0,
-        0,
+      return callLine(
+        theme,
+        "ScratchpadWrite",
+        `${args.run_id ?? ""}/${args.phase ?? ""}/${args.artifact_name ?? ""}`,
       );
     },
 
@@ -1569,11 +1794,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("ScratchpadRead ")) +
-          theme.fg("dim", `${args.run_id ?? ""}/${args.phase ?? ""}/${args.artifact_name ?? ""}`),
-        0,
-        0,
+      return callLine(
+        theme,
+        "ScratchpadRead",
+        `${args.run_id ?? ""}/${args.phase ?? ""}/${args.artifact_name ?? ""}`,
       );
     },
 
@@ -1617,12 +1841,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("ScratchpadPhaseDone ")) +
-          theme.fg("dim", `${args.run_id ?? ""} ${args.phase ?? ""}`),
-        0,
-        0,
-      );
+      return callLine(theme, "ScratchpadPhaseDone", `${args.run_id ?? ""} ${args.phase ?? ""}`);
     },
 
     renderResult(result, _opts, theme) {
@@ -1649,7 +1868,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
       "Use ScratchpadClear to force a fresh start for a single run (--fresh). It deletes that run's directory only.",
       "After clearing, call ScratchpadInit to recreate the directory structure before writing artifacts.",
     ],
-    parameters: ScratchpadClearSchema,
+    parameters: RunIdSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       scratchpad_clear(params.run_id as string);
@@ -1665,12 +1884,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
 
     renderCall(args, theme) {
-      return new Text(
-        theme.fg("toolTitle", theme.bold("ScratchpadClear ")) +
-          theme.fg("dim", (args.run_id as string) ?? ""),
-        0,
-        0,
-      );
+      return callLine(theme, "ScratchpadClear", (args.run_id as string) ?? "");
     },
 
     renderResult(_result, _opts, theme) {

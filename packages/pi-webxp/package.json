@@ -35,7 +35,6 @@
     "src/context7.ts",
     "src/deepwiki.ts",
     "src/exploitsearch.ts",
-    "src/cache.ts",
     "README.md",
     "LICENSE"
   ],

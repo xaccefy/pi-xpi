@@ -12,7 +12,12 @@ import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { abortableSleep, isTransientHttpStatus } from "./cache.ts";
+import { abortableSleep } from "@xaccefy/pi-shared";
+
+/** Retriable HTTP statuses for daemon calls (408/429/5xx). */
+function isTransientHttpStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
+}
 
 // ── Constants & Environment ──────────────────────────────────────────
 
@@ -33,9 +38,6 @@ const REQUEST_TIMEOUT_MS = 30000;
 let daemonProcess: ChildProcess | null = null;
 let daemonSpawnError: Error | null = null;
 let startupPromise: Promise<boolean> | null = null;
-
-// Domain mapping for fetch endpoints
-const DOMAIN_ENDPOINT_MAP = [{ match: "github.com", endpoint: "/fetch-github-readme" }];
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -566,14 +568,11 @@ export default function websearchExtension(pi: ExtensionAPI) {
 
         // Match on hostname only — never substring-match the full URL, which would
         // route e.g. https://evil.example/?q=github.com to the GitHub README fetcher.
-        let endpoint = "/fetch-web";
         const host = parsedUrl.hostname.toLowerCase();
-        for (const entry of DOMAIN_ENDPOINT_MAP) {
-          if (host === entry.match || host.endsWith(`.${entry.match}`)) {
-            endpoint = entry.endpoint;
-            break;
-          }
-        }
+        const endpoint =
+          host === "github.com" || host.endsWith(".github.com")
+            ? "/fetch-github-readme"
+            : "/fetch-web";
 
         const res = await fetchWithRetry(
           `${DAEMON_URL}${endpoint}`,
