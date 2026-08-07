@@ -1,5 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 
@@ -17,7 +25,46 @@ export type PocRun = {
    * a crash is NOT a verdict, and callers must not treat it as one.
    */
   completed: boolean;
+  /**
+   * Sanitized but UNTRUNCATED output (capped only by the spawn maxBuffer).
+   * Marker presence/absence checks MUST run on this, never on `output`,
+   * which is sliced for display — a cheating script can print its marker
+   * past the 4000-char display window. Never persisted to the ledger.
+   */
+  rawOutput?: string;
+  /** True when `output` was truncated for display (rawOutput has more). */
+  truncated?: boolean;
+  /**
+   * True when the run never started because of harness infrastructure
+   * failure (e.g. sandbox image pull failed) — set only by the runner,
+   * never derived from PoC-controlled output text.
+   */
+  infraError?: boolean;
 };
+
+/**
+ * Run-mode options for `runPoc`. Host execution is NEVER selectable by the
+ * agent alone: `local: true` only takes effect when the OPERATOR has set
+ * `PI_POC_ALLOW_LOCAL=1` (host is a fallback when Docker is unavailable;
+ * `PI_POC_FORCE_LOCAL=1` + ALLOW skips Docker on purpose). The default is a
+ * Docker sandbox; `network: "host"` gives the sandbox host networking while
+ * keeping the read-only FS / dropped caps / unprivileged user / resource limits.
+ */
+export type PocRunOptions = {
+  /** Docker sandbox networking: "none" (default) or "host" (live/network-dependent findings). */
+  network?: "none" | "host";
+  /** True to run on the host (no Docker). Requires operator opt-in PI_POC_ALLOW_LOCAL=1. */
+  local?: boolean;
+  /**
+   * Extra environment variables merged into the run. The harness sets
+   * `PI_POC_MODE` ("poc" | "control" | "disconfirmation") and `PI_POC_TARGET`
+   * (the case target) so PoCs can be written once and parameterized per run.
+   */
+  env?: Record<string, string>;
+};
+
+/** Operator-only opt-in for host execution (never agent-supplied). */
+const LOCAL_EXEC_ENV = "PI_POC_ALLOW_LOCAL";
 
 export type PocLanguage = {
   /** Docker image used when running inside the sandbox. */
@@ -59,6 +106,8 @@ const EXTENSION_MAP: Record<string, string> = {
 };
 
 const OUTPUT_MAX_CHARS = 4000;
+/** Sanitized output is kept whole (for marker checks) up to this size. */
+const RAW_OUTPUT_MAX_CHARS = 4 * 1024 * 1024;
 const TIMEOUT_MS = 30_000;
 /** Completion sentinel echoed after the PoC command inside the sandbox shell. */
 function makeSentinel(): string {
@@ -160,27 +209,57 @@ function validatePocPath(pocPath: string): string {
   }
 
   const root = getProjectRoot();
+  // Operator escape hatch: PI_POC_ALLOW_ABSOLUTE=1 disables BOTH the lexical
+  // and the realpath containment checks (agent cannot set it).
+  const allowAbsolute = process.env.PI_POC_ALLOW_ABSOLUTE === "1";
   // Use path.relative so prefix-sibling escapes like /tmp/proj vs /tmp/proj-evil are rejected.
   // startsWith(`${root}/`) would accept /tmp/proj-evil when root is /tmp/proj.
   const rel = relative(root, normalized);
   const outsideWorkspace = rel === "" ? false : rel.startsWith("..") || isAbsolute(rel);
-  if (outsideWorkspace) {
-    const allowAbsolute = process.env.PI_POC_ALLOW_ABSOLUTE === "1";
-    if (!allowAbsolute) {
-      throw new Error(
-        `PoC path must be under the project workspace (${root}). ` +
-          `Set PI_POC_ALLOW_ABSOLUTE=1 to allow arbitrary absolute paths.`,
-      );
-    }
+  if (outsideWorkspace && !allowAbsolute) {
+    throw new Error(
+      `PoC path must be under the project workspace (${root}). ` +
+        `Set PI_POC_ALLOW_ABSOLUTE=1 to allow arbitrary absolute paths.`,
+    );
   }
 
   if (!existsSync(normalized)) {
     throw new Error(`PoC not found on disk: ${pocPath}`);
   }
 
+  // Symlink containment: the lexical checks above are defeated by a
+  // workspace file that is a symlink to a host path (e.g. $HOME/.env) —
+  // existsSync/copyFileSync/readFileSync all dereference. Resolve the real
+  // path and re-run the containment check on it, then require a regular
+  // file (FIFOs/devices/sockets are rejected).
+  let real: string;
+  try {
+    real = realpathSync(normalized);
+  } catch {
+    throw new Error(`PoC path cannot be resolved: ${pocPath}`);
+  }
+  if (!allowAbsolute) {
+    const realRel = relative(root, real);
+    const realOutside = realRel === "" ? false : realRel.startsWith("..") || isAbsolute(realRel);
+    if (realOutside) {
+      throw new Error(
+        `PoC path resolves outside the project workspace (${real}). ` +
+          `Symlinked files outside ${root} are rejected.`,
+      );
+    }
+  }
+  const realStat = statSync(real);
+  if (!realStat.isFile()) {
+    throw new Error(`PoC path must resolve to a regular file (got ${pocPath})`);
+  }
+
   return normalized;
 }
 
+/**
+ * Strip control chars / ANSI escapes from PoC output. Does NOT slice —
+ * truncation is display-only and must never hide content from marker checks.
+ */
 function sanitizeOutput(output: string): string {
   // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional
   const nulls = /\x00/g;
@@ -194,8 +273,30 @@ function sanitizeOutput(output: string): string {
     .replace(/\r/g, "\n")
     .replace(nulls, "")
     .replace(ansi, "")
-    .replace(ctrl, "")
-    .slice(0, OUTPUT_MAX_CHARS);
+    .replace(ctrl, "");
+}
+
+/** Split sanitized output into the raw (whole) and display (sliced) halves. */
+function splitOutput(raw: string): { rawOutput: string; output: string; truncated: boolean } {
+  const rawOutput = raw.slice(0, RAW_OUTPUT_MAX_CHARS);
+  const truncated = raw.length > OUTPUT_MAX_CHARS;
+  return { rawOutput, output: raw.slice(0, OUTPUT_MAX_CHARS), truncated };
+}
+
+/** Reject control characters in harness-supplied PoC env values. */
+function sanitizePocEnv(env: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      throw new Error(`Invalid PoC env key: ${key}`);
+    }
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: intentional
+    if (/[\x00-\x1f\x7f]/.test(value)) {
+      throw new Error(`PoC env value for ${key} contains control characters`);
+    }
+    out[key] = value;
+  }
+  return out;
 }
 
 function buildDockerArgs(
@@ -203,14 +304,23 @@ function buildDockerArgs(
   command: string,
   workspaceDir: string,
   containerName: string,
+  network: "none" | "host",
+  env?: Record<string, string>,
 ): string[] {
+  const envArgs: string[] = [];
+  for (const [key, value] of Object.entries(sanitizePocEnv(env ?? {}))) {
+    // Values are single tokens from the harness (PI_POC_MODE / PI_POC_TARGET);
+    // pass them as separate -e args so no shell quoting is involved.
+    envArgs.push("-e", `${key}=${value}`);
+  }
   return [
     "run",
     "--rm",
     "--name",
     containerName,
     "--network",
-    "none",
+    network,
+    ...envArgs,
     "--read-only",
     "--cap-drop",
     "ALL",
@@ -290,7 +400,12 @@ function ensureImage(image: string): void {
   }
 }
 
-function runSandboxed(pocPath: string, language: PocLanguage): PocRun {
+function runSandboxed(
+  pocPath: string,
+  language: PocLanguage,
+  network: "none" | "host" = "none",
+  env?: Record<string, string>,
+): PocRun {
   const ranAt = new Date().toISOString();
   const sourceName = basename(pocPath);
   const workspaceDir = mkdtempSync(resolve(tmpdir(), "poc-runner-"));
@@ -311,6 +426,7 @@ function runSandboxed(pocPath: string, language: PocLanguage): PocRun {
         ranAt,
         sandbox: true,
         completed: false,
+        infraError: true,
       };
     }
     copyFileSync(pocPath, `${workspaceDir}/${sourceName}`);
@@ -326,7 +442,7 @@ function runSandboxed(pocPath: string, language: PocLanguage): PocRun {
 
     const result = spawnSync(
       "docker",
-      buildDockerArgs(language.image, wrapped, workspaceDir, containerName),
+      buildDockerArgs(language.image, wrapped, workspaceDir, containerName, network, env),
       {
         encoding: "utf8",
         timeout: TIMEOUT_MS,
@@ -337,11 +453,13 @@ function runSandboxed(pocPath: string, language: PocLanguage): PocRun {
     const spawnErr = result.error ? `\n[spawn error] ${result.error.message}` : "";
     const raw = (result.stdout ?? "") + (result.stderr ?? "") + spawnErr;
     const completed = raw.includes(sentinel);
-    const output = sanitizeOutput(raw.replace(sentinel, ""));
+    const { rawOutput, output, truncated } = splitOutput(sanitizeOutput(raw.replace(sentinel, "")));
     return {
       path: pocPath,
       exitCode: spawnExitCode(result),
       output,
+      rawOutput,
+      truncated,
       ranAt,
       sandbox: true,
       completed,
@@ -361,7 +479,7 @@ function runSandboxed(pocPath: string, language: PocLanguage): PocRun {
   }
 }
 
-function runLocal(pocPath: string, language: PocLanguage): PocRun {
+function runLocal(pocPath: string, language: PocLanguage, env?: Record<string, string>): PocRun {
   const ranAt = new Date().toISOString();
 
   // The run template is `<interpreter> [flags...] {{file}}`. Split the static
@@ -378,6 +496,11 @@ function runLocal(pocPath: string, language: PocLanguage): PocRun {
     encoding: "utf8",
     timeout: TIMEOUT_MS,
     maxBuffer: MAX_BUFFER,
+    // Host runs get the harness env contract merged over the operator env;
+    // the spawn env is explicitly provided so PI_POC_MODE / PI_POC_TARGET
+    // reach the script without leaking through a shell. Same control-char
+    // rejection as the sandboxed path.
+    env: env ? { ...process.env, ...sanitizePocEnv(env) } : undefined,
   });
 
   // Local runs stay shell-free (space-containing paths stay single args), so
@@ -386,11 +509,15 @@ function runLocal(pocPath: string, language: PocLanguage): PocRun {
   // means the script never ran to completion — fail closed on those.
   const spawnErr = result.error ? `\n[spawn error] ${result.error.message}` : "";
   const completed = !result.error && result.signal === null;
-  const output = sanitizeOutput((result.stdout ?? "") + (result.stderr ?? "") + spawnErr);
+  const { rawOutput, output, truncated } = splitOutput(
+    sanitizeOutput((result.stdout ?? "") + (result.stderr ?? "") + spawnErr),
+  );
   return {
     path: pocPath,
     exitCode: spawnExitCode(result),
     output,
+    rawOutput,
+    truncated,
     ranAt,
     sandbox: false,
     completed,
@@ -408,17 +535,59 @@ function runLocal(pocPath: string, language: PocLanguage): PocRun {
  *
  * Security:
  * - PoC paths must be absolute and under the project workspace by default.
- * - Docker sandbox runs with no network, read-only root FS, dropped caps,
- *   no new privileges, and an unprivileged user.
- * - Local execution is restricted to interpreted languages.
+ * - Docker sandbox runs with read-only root FS, dropped caps, no new
+ *   privileges, an unprivileged user, and resource limits. Networking is
+ *   `none` by default; `network: "host"` adds host networking for live
+ *   findings WITHOUT giving up the FS/cap/user isolation.
+ * - Host execution (local: true) is NOT agent-selectable: the default is a
+ *   host-network Docker sandbox. Bare host requires the operator's
+ *   `PI_POC_ALLOW_LOCAL=1` and is used only when Docker is unavailable
+ *   (or when `PI_POC_FORCE_LOCAL=1` is also set). Without ALLOW the run
+ *   fails closed if Docker cannot start.
+ *
+ * Back-compat: `runPoc(path, true)` == sandboxed, `runPoc(path, false)` ==
+ * `{ local: true }` (host-network sandbox; host if operator-gated).
  */
-export function runPoc(pocPath: string, useSandbox = true): PocRun {
+export function runPoc(pocPath: string, options?: PocRunOptions | boolean): PocRun {
   const normalized = validatePocPath(pocPath);
   const { language } = resolveLanguage(normalized);
 
-  if (useSandbox) {
-    return runSandboxed(normalized, language);
+  const opts: PocRunOptions =
+    typeof options === "boolean"
+      ? options
+        ? { network: "none" }
+        : { local: true }
+      : (options ?? {});
+
+  // Host execution is gated by the OPERATOR, never by an agent-supplied flag.
+  // `local: true` means "network access needed":
+  //   1. Prefer a host-network Docker sandbox (isolation retained).
+  //   2. Fall back to bare host ONLY when Docker/image is unavailable AND the
+  //      operator set PI_POC_ALLOW_LOCAL=1.
+  //   3. PI_POC_FORCE_LOCAL=1 + ALLOW lets the operator (or test harness)
+  //      skip Docker and run on the host deliberately — still never agent-only.
+  if (opts.local === true) {
+    const allowLocal = process.env[LOCAL_EXEC_ENV] === "1";
+    const forceLocal = process.env.PI_POC_FORCE_LOCAL === "1";
+    if (forceLocal && allowLocal) {
+      return runLocal(normalized, language, opts.env);
+    }
+    const sandboxed = runSandboxed(normalized, language, "host", opts.env);
+    if (!sandboxed.infraError) {
+      return sandboxed;
+    }
+    if (allowLocal) {
+      return runLocal(normalized, language, opts.env);
+    }
+    return {
+      ...sandboxed,
+      output:
+        sandboxed.output +
+        `\n[host execution blocked] local:true cannot run on the host without the operator's ` +
+        `${LOCAL_EXEC_ENV}=1 — an agent-supplied local flag alone cannot enable host execution. ` +
+        "Ask the operator to opt in, or use the default (isolated) sandbox if the PoC does not need network.",
+    };
   }
 
-  return runLocal(normalized, language);
+  return runSandboxed(normalized, language, opts.network ?? "none", opts.env);
 }

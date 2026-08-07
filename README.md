@@ -15,7 +15,7 @@
 XPI turns the Pi agent into a security researcher: a case ledger with enforced gates, real exploit-technique grounding, web lookup, fast code search, and a pipeline that keeps findings honest.
 
 - **Casefile** — hypothesis → investigating → confirmed → reported, with gates at every step
-- **Honest PoC gates** — exit 0 + verification marker + control-target check (no fake confirms)
+- **Honest PoC gates** — exit 0 + verification marker + mandatory control-target run with liveness marker on every promotion (no fake confirms)
 - **Exploit chains** — `ChainSuggest` surfaces combinations the model missed
 - **Coverage matrix** — machine-checkable "we tested everything" claims
 - **Code search** — fff-powered grep/find, frecency-ranked

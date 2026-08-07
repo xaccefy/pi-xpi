@@ -28,12 +28,12 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 | `web_fetch` | Page content; SPA pages re-rendered via Chromium when the shell is thin |
 | `context7` | Current library docs |
 | `deepwiki` | Q&A on a public GitHub repo |
-| `CaseAdd` / `CaseUpdate` / `PromoteFinding` | Ledger + hard PoC gate to confirm (exit 0 + verification marker; `control_path` control-target check required for live findings — blocks unconditional-marker/mock PoCs) |
+| `CaseAdd` / `CaseUpdate` / `PromoteFinding` | Ledger + hard PoC gate to confirm (exit 0 + verification marker; `control_path` + `control_liveness_marker` control-target check REQUIRED for every promotion — blocks unconditional-marker/mock PoCs and dead controls) |
 | `EvidenceAdd` | Role-typed, hashed evidence items (observation/reproduction/impact/refutation/cleanup); refutation justifies kills; reproduction auto-recorded by the PoC gate |
 | `CaseGet` / `CaseList` / `CaseSearch` | Browse cases |
 | `CaseLink` / `CaseUnlink` | Exploit chains |
 | `ChainSuggest` | Auto-detect exploitable chain combinations across cases (credential+endpoint→ATO, XSS+state-change→CSRF, SSTI→RCE, race+payment, …), ranked — verify before linking |
-| `CoverageAdd` / `CoverageReport` | Machine-checkable test coverage: record (asset × attack-class) cells with wide/local scope; the plateau claim must match the matrix |
+| `CoverageAdd` / `CoverageReport` | Machine-checkable test coverage: record (asset × attack-class) cells with wide/local scope, linked to artifact-backed evidence items (`evidence_item_id`); unbacked cells render as ⚠ unbacked, and the plateau claim must match the matrix |
 | `CaseContext` | Case context bundle (complete record + artifacts) for the report writer |
 | `PipelineSubmit` | Stage-output validation gate: schema check + pre-filter + repair budget — stage can't advance on invalid output |
 | `ScratchpadInit` / `Resume` / `Checkpoint` | Crash-recoverable artifact store for pipeline runs |
@@ -50,7 +50,7 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 /xp lite                                    # single-agent variant — no subagent dispatch
 ```
 
-CaseAdd requires `disproveIf` (falsification conditions) on every new case; a kill requires refutation evidence or a kill-reason token; live findings (`local:true`) require a `control_path` control run whose output must NOT contain the verification marker (harness-checked). Promotion also requires an `observation` evidence item (EvidenceAdd) before `confirmed`, and control/disconfirmation scripts that crash (killed/timeout/spawn error) are blocked — a crash is neither a clean control verdict nor a survived disproof.
+CaseAdd requires `disproveIf` (falsification conditions) on every new case; a kill of an investigating/confirmed case requires refutation evidence (a keyword alone is not enough once the case advanced past hypothesis). EVERY promotion — sandboxed and live alike — requires `control_path` + `control_liveness_marker`: the control run's output must NOT contain the verification marker AND must contain the liveness marker (harness-checked), so unconditional-marker PoCs and dead controls are both blocked. `local:true` runs in a host-network Docker sandbox (read-only FS / dropped caps / unprivileged user); true host execution is operator-gated via `PI_POC_ALLOW_LOCAL=1` and is never agent-selectable. Promotion also requires an **artifact-backed** `observation` evidence item (EvidenceAdd with `artifact_path` — summary-only observations are rejected) before `confirmed`; severity high/critical additionally require an executed `disconfirmation_path` run (non-zero exit). Control/disconfirmation scripts that crash (killed/timeout/spawn error) are blocked — a crash is neither a clean control verdict nor a survived disproof.
 
 Pi injects skill descriptions (`web-pentest`, `cyberwf`) into every session; the agent reads the full skill file when the task matches (e.g. "find bugs in X", "bug bounty Y"). Run `/xp on` for the full attacker discipline with casefile tracking, or `/xp lite` for the same discipline done by the main agent alone (CTF / single-shot engagements).
 

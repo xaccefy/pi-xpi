@@ -62,11 +62,11 @@ hypothesis → investigating → confirmed → reported
 | `CaseAdd` | Open a case (`title` + `disproveIf` required; start as `hypothesis` or `investigating`) |
 | `CaseUpdate` | Evidence, impact, severity, status (not direct confirm) |
 | `EvidenceAdd` | Role-typed, hashed evidence item on a case (refutation justifies kills; cleanup tracks cleanup) |
-| `PromoteFinding` | Run on-disk PoC (Docker sandbox by default; `local:true` for host) → confirm on exit 0 + marker; `control_path` required for live findings |
+| `PromoteFinding` | Run on-disk PoC (Docker sandbox by default; `local:true` = host-network sandbox, host execution operator-gated via `PI_POC_ALLOW_LOCAL=1`) → confirm on exit 0 + marker; `control_path` + `control_liveness_marker` REQUIRED for every promotion |
 | `CaseGet` / `CaseList` / `CaseSearch` | Read / filter / search |
 | `CaseLink` / `CaseUnlink` | Bidirectional exploit chains |
 | `ChainSuggest` | Scan cases for exploitable chain combinations (credential+endpoint→ATO, redirect+OAuth→token theft, XSS+state-change→CSRF, IDOR+user-data, SSTI→RCE, race+payment, info-disclosure+SSRF), ranked by confidence |
-| `CoverageAdd` | Record a tested (asset × attack-class) cell — `scope: wide` (deployment-wide verdict, applies to every later asset) or `local`; both found and clean results count |
+| `CoverageAdd` | Record a tested (asset × attack-class) cell — `scope: wide` (deployment-wide verdict, applies to every later asset) or `local`; both found and clean results count. Optionally link the cell to an artifact-backed evidence item (`evidence_item_id`); unbacked cells render as ⚠ unbacked in the report |
 | `CoverageReport` | Render the machine-checkable coverage matrix (which classes are tested where; plateau claims must match it) |
 | `CaseContext` | Context bundle for a confirmed/reported case (full record, logs, links, artifacts) + report path |
 

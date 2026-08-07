@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import {
   addEvidenceItemResult,
@@ -33,17 +33,26 @@ import {
 } from "../src/scratchpad.ts";
 import { DatabaseSync } from "../src/sqlite-compat/index.ts";
 
+/** Writes the artifact file backing the helper observation evidence item. */
+function observationArtifactPath(): string {
+  const p = join(tempDir, "observation.txt");
+  writeFileSync(p, "observed signal (fixture)", "utf8");
+  return p;
+}
+
 const addCase = (input: Parameters<typeof ledgerAddCaseResult>[0]) => {
   const res = ledgerAddCaseResult({
     // New cases require falsification conditions; tests inject a default.
     disproveIf: ["test: finding is actually intended behavior"],
     ...input,
   });
-  // Promotion requires the observation evidence item (evidence-chain closure);
-  // tests inject one so fixtures focus on the behavior they exercise.
+  // Promotion requires an ARTIFACT-BACKED observation evidence item
+  // (evidence-chain closure); tests inject one so fixtures focus on the
+  // behavior they exercise.
   addEvidenceItemResult(res.record.id, {
     role: "observation",
     summary: "test fixture: initial observed signal",
+    artifactPath: observationArtifactPath(),
   });
   return res.record;
 };
@@ -58,8 +67,87 @@ const addCaseResult = (input: Parameters<typeof ledgerAddCaseResult>[0]) => {
   addEvidenceItemResult(res.record.id, {
     role: "observation",
     summary: "test fixture: initial observed signal",
+    artifactPath: observationArtifactPath(),
   });
   return res;
+};
+
+/** Writes a REAL script file (same-file contract) and returns its path. */
+function pocScriptPath(name = "poc.sh"): string {
+  const safe = name.replace(/[^a-zA-Z0-9._-]/g, "_") || "poc.sh";
+  const p = join(tempDir, safe);
+  writeFileSync(p, "#!/bin/sh\necho ok\n", "utf8");
+  return p;
+}
+
+/** Writes a report file that passes the content gate (size + sections + no internal identifiers). */
+function writeGoodReport(reportPath: string): void {
+  writeFileSync(
+    reportPath,
+    `# Stored XSS in chat\n\n## Summary\nReflected input is rendered without encoding, allowing script execution.\n\n## Vulnerability Details\nThe search endpoint reflects the query parameter into the page.\n\n## Steps to Reproduce\n1. Submit a payload.\n2. Observe execution.\n\n## Impact\nAn attacker can execute script in a victim's session and steal tokens.\n\n## Remediation\nEncode output at the sink; add a CSP.\n`,
+    "utf8",
+  );
+}
+
+/** Default disconfirmation verification (completed, non-zero = survived). */
+const DISCONFIRM_OK = {
+  path: "/tmp/disconf.sh",
+  exitCode: 1,
+  ranAt: "2024-01-01T00:00:00Z",
+  sandbox: true,
+  completed: true,
+};
+/** Default control verification: SAME script as the PoC (same-file contract),
+ * completed, no vuln marker, liveness present. */
+const CONTROL_OK = {
+  path: "",
+  exitCode: 1,
+  ranAt: "2024-01-01T00:00:00Z",
+  sandbox: true,
+  completed: true,
+  output: "CONTROL_REACHED",
+};
+
+/**
+ * Standard promotion fixture. Every promotion now requires (a) a completed
+ * control run from the SAME script as the PoC (sha256-equal — the two-file
+ * cheat is dead; the only permitted difference is PI_POC_MODE), whose output
+ * lacks the verification marker and contains the liveness marker; (b) an
+ * executed non-zero disconfirmation run; (c) the verification marker present
+ * in the (untruncated) PoC output; (d) an observation item that predates the
+ * repro. The helper normalizes path + ranAt so fixtures focus on behavior.
+ */
+const promote = (
+  id: string,
+  verification: Parameters<typeof promoteFindingResult>[1],
+  opts: {
+    marker?: string;
+    liveness?: string;
+    disconfirmation?: Parameters<typeof promoteFindingResult>[2];
+    control?: Parameters<typeof promoteFindingResult>[3];
+  } = {},
+) => {
+  const marker = opts.marker ?? "VULN_MARKER";
+  const liveness = opts.liveness ?? "CONTROL_REACHED";
+  // Preserve the caller's basename (tests assert the recorded PoC basename).
+  const scriptPath = pocScriptPath(basename(verification.path ?? "poc.sh"));
+  const v = {
+    ...verification,
+    path: scriptPath,
+    ranAt: new Date().toISOString(),
+    output: verification.output ?? marker,
+  };
+  const control = opts.control
+    ? { ...opts.control, path: scriptPath }
+    : { ...CONTROL_OK, path: scriptPath, output: liveness };
+  return promoteFindingResult(
+    id,
+    v,
+    opts.disconfirmation ?? DISCONFIRM_OK,
+    control,
+    marker,
+    liveness,
+  );
 };
 
 let tempDir: string;
@@ -332,14 +420,14 @@ describe("casefile sqlite ledger", () => {
       poc: "repro",
       disconfirmation: "tried, held",
     });
-    promoteFindingResult(original.id, {
+    promote(original.id, {
       path: "/tmp/poc.sh",
       exitCode: 0,
       ranAt: "2024-01-01T00:00:00Z",
       sandbox: true,
     });
     const { path } = writeCaseContext(original.id);
-    writeFileSync(path, "# Report\n", "utf8");
+    writeGoodReport(path);
     updateCaseResult(original.id, { status: "reported" });
 
     // An exact duplicate of a REPORTED case is a new follow-up case, not a merge.
@@ -399,7 +487,7 @@ describe("casefile sqlite ledger", () => {
     });
     assert.strictEqual(updated.changed, true);
 
-    const promoted = promoteFindingResult(record.id, {
+    const promoted = promote(record.id, {
       path: "/workspace/idor-poc.py",
       exitCode: 0,
       ranAt: "2024-01-01T00:00:00Z",
@@ -520,17 +608,226 @@ describe("casefile sqlite ledger", () => {
       assumptions: ["intended_behavior: documented in README"],
     });
     assert.strictEqual(killed.record.status, "killed");
-    // Refutation evidence item also passes.
+    // Refutation evidence item also passes (must be artifact-backed now —
+    // prose-only refutation cannot justify a kill).
     const refuted = addCase({ title: "Kill with refutation evidence" });
     addEvidenceItemResult(refuted.id, {
       role: "refutation",
       summary: "Re-probe returned 403 with the same payload; path is WAF-blocked.",
+      artifactPath: observationArtifactPath(),
     });
     const killed2 = updateCaseResult(refuted.id, {
       status: "killed",
       nextStep: "killed: refutation evidence — WAF-blocked re-probe",
     });
     assert.strictEqual(killed2.record.status, "killed");
+  });
+
+  it("requires refutation evidence to kill a case that reached investigating/confirmed", () => {
+    const investigating = addCase({
+      title: "Advanced case",
+      status: "investigating",
+      evidence: "Reflected input observed",
+      confidence: "medium",
+    });
+    // A keyword in free text is NOT enough once the case left hypothesis.
+    assert.throws(
+      () =>
+        updateCaseResult(investigating.id, {
+          status: "killed",
+          assumptions: ["out_of_scope: not in program scope"],
+        }),
+      /refutation evidence/,
+    );
+    // A refutation evidence item (artifact-backed) makes the kill valid.
+    addEvidenceItemResult(investigating.id, {
+      role: "refutation",
+      summary: "Re-probe: the sink is WAF-blocked; payload never reaches it.",
+      artifactPath: observationArtifactPath(),
+    });
+    const killed = updateCaseResult(investigating.id, { status: "killed" });
+    assert.strictEqual(killed.record.status, "killed");
+
+    // A CONFIRMED case is the same: refutation evidence required, keyword alone
+    // insufficient.
+    const confirmed = addCase({
+      title: "Confirmed case",
+      status: "investigating",
+      evidence: "Observed leak",
+      confidence: "high",
+      impact: "data leak",
+      severity: "high",
+      poc: "/tmp/poc.sh",
+      target: "example-app",
+      disconfirmation: "Tried; could not disprove.",
+    });
+    promote(confirmed.id, {
+      path: "/tmp/poc.sh",
+      exitCode: 0,
+      ranAt: "2024-01-01T00:00:00Z",
+      sandbox: true,
+    });
+    assert.strictEqual(readCasefile().find((c) => c.id === confirmed.id)?.status, "confirmed");
+    assert.throws(
+      () => updateCaseResult(confirmed.id, { status: "killed", nextStep: "not_applicable" }),
+      /refutation evidence/,
+    );
+    addEvidenceItemResult(confirmed.id, {
+      role: "refutation",
+      summary: "Re-test after patch: path no longer reachable.",
+      artifactPath: observationArtifactPath(),
+    });
+    const killedConfirmed = updateCaseResult(confirmed.id, { status: "killed" });
+    assert.strictEqual(killedConfirmed.record.status, "killed");
+  });
+
+  it("requires an executed disconfirmation run for EVERY promotion", () => {
+    const rec = addCase({
+      title: "High severity IDOR",
+      status: "investigating",
+      evidence: "Observed other user's data",
+      confidence: "high",
+      impact: "data leak",
+      severity: "high",
+      poc: "/tmp/poc.sh",
+      target: "example-app",
+      disconfirmation: "Tried; could not disprove.",
+    });
+    const scriptPath = pocScriptPath();
+    const ranAt = new Date().toISOString();
+    const poc = {
+      path: scriptPath,
+      exitCode: 0,
+      ranAt,
+      sandbox: true,
+      completed: true,
+      output: "VULN_MARKER",
+    };
+    const ctrl = {
+      path: scriptPath,
+      exitCode: 1,
+      ranAt,
+      sandbox: true,
+      completed: true,
+      output: "CONTROL_REACHED",
+    };
+    // Prose disconfirmation alone is not enough — the ledger requires an
+    // executed run for EVERY promotion (not just high/critical: a case filed
+    // low/medium must not skip the run and be re-raised afterwards).
+    assert.throws(
+      () => promoteFindingResult(rec.id, poc, undefined, ctrl, "VULN_MARKER", "CONTROL_REACHED"),
+      /disconfirmation run/,
+    );
+    // A crashed disconfirmation (completed:false) is not a survived disproof.
+    assert.throws(
+      () =>
+        promoteFindingResult(
+          rec.id,
+          poc,
+          {
+            path: "/tmp/disconf.sh",
+            exitCode: 1,
+            ranAt,
+            sandbox: true,
+            completed: false,
+          },
+          ctrl,
+          "VULN_MARKER",
+          "CONTROL_REACHED",
+        ),
+      /disconfirmation run/,
+    );
+    // With a completed non-zero disconfirmation run the high-severity promote passes.
+    const ok = promote(rec.id, {
+      path: "/tmp/poc.sh",
+      exitCode: 0,
+      ranAt,
+      sandbox: true,
+    });
+    assert.strictEqual(ok.record.status, "confirmed");
+  });
+
+  it("links coverage cells to artifact-backed evidence items and rejects bogus links", () => {
+    const c = addCase({ title: "Coverage backing" });
+    const ev = addEvidenceItemResult(c.id, {
+      role: "observation",
+      summary: "probe log",
+      artifactPath: observationArtifactPath(),
+    });
+    const backed = recordCoverageResult(c.id, {
+      asset: "example-app",
+      class: "sqli",
+      scope: "local",
+      note: "payloads on all params; no injection",
+      evidenceItemId: ev.id,
+    });
+    assert.strictEqual(backed.evidenceItemId, ev.id);
+    // The linkage survives persistence (re-read from the ledger).
+    assert.strictEqual(coverageSummary(c.id).items[0].evidenceItemId, ev.id);
+
+    // A summary-only evidence item cannot back a cell (no sha256).
+    const prose = addEvidenceItemResult(c.id, { role: "observation", summary: "prose only" });
+    assert.throws(
+      () =>
+        recordCoverageResult(c.id, {
+          asset: "a",
+          class: "xss",
+          scope: "local",
+          note: "no reflection",
+          evidenceItemId: prose.id,
+        }),
+      /artifact-backed/,
+    );
+    // An item from ANOTHER case cannot back this cell.
+    const other = addCase({ title: "Other case" });
+    const otherEv = addEvidenceItemResult(other.id, {
+      role: "observation",
+      summary: "other",
+      artifactPath: observationArtifactPath(),
+    });
+    assert.throws(
+      () =>
+        recordCoverageResult(c.id, {
+          asset: "a",
+          class: "xss",
+          scope: "local",
+          note: "no reflection",
+          evidenceItemId: otherEv.id,
+        }),
+      /not found on this case/,
+    );
+    // Unbacked cells are allowed but flagged (no evidenceItemId) — CoverageReport
+    // renders them distinctly as unbacked.
+    const unbacked = recordCoverageResult(c.id, {
+      asset: "a",
+      class: "ssti",
+      scope: "local",
+      note: "no reflection",
+    });
+    assert.strictEqual(unbacked.evidenceItemId, undefined);
+  });
+
+  it("near-dup redirect surfaces the existing case title (no silent drop)", () => {
+    const first = addCaseResult({
+      title:
+        "IAM middleware: global userCache keyed only by email:service — cross-environment/tenant permission reuse",
+      target: "kiwicom/js-iam-middleware",
+      evidence: "probe",
+    });
+    assert.strictEqual(first.created, true);
+
+    const rephrased = addCaseResult({
+      title:
+        "userCache key omits iamURL/iamToken/tenant — cross-environment permission cache collision",
+      target: "kiwicom/js-iam-middleware",
+      evidence: "probe",
+    });
+    assert.strictEqual(rephrased.created, false);
+    assert.strictEqual(rephrased.nearDuplicate, true);
+    assert.match(rephrased.reason ?? "", /Near-duplicate of existing case/);
+    // The drop is NOT silent: the existing case's title is surfaced so the
+    // agent can decide whether the merge is right.
+    assert.ok((rephrased.reason ?? "").includes(first.record.title));
   });
 
   it("adds role-typed, hashed evidence items and lists them on the case", () => {
@@ -582,7 +879,7 @@ describe("casefile sqlite ledger", () => {
     );
   });
 
-  it("rejects promotion of a live finding (sandbox:false) without control verification", () => {
+  it("requires control verification for EVERY promotion (sandboxed and live alike)", () => {
     const live = addCase({
       title: "Live IDOR",
       status: "investigating",
@@ -594,6 +891,7 @@ describe("casefile sqlite ledger", () => {
       target: "example-app",
       disconfirmation: "Tried to disprove; could not.",
     });
+    // No control at all → blocked (was previously allowed for sandboxed runs).
     assert.throws(
       () =>
         promoteFindingResult(live.id, {
@@ -602,7 +900,7 @@ describe("casefile sqlite ledger", () => {
           ranAt: "2024-01-01T00:00:00Z",
           sandbox: false,
         }),
-      /require.*controlVerification/,
+      /require.*control(LivenessMarker|Verification)/,
     );
     // Content, not just presence: a crashed control (completed:false) is invalid.
     assert.throws(
@@ -621,7 +919,7 @@ describe("casefile sqlite ledger", () => {
           },
           "VULN_MARKER",
         ),
-      /require.*controlVerification/,
+      /require.*control(LivenessMarker|Verification)/,
     );
     // …and so is a control whose output contains the marker (unconditional-marker PoC).
     assert.throws(
@@ -640,7 +938,28 @@ describe("casefile sqlite ledger", () => {
           },
           "VULN_MARKER",
         ),
-      /require.*controlVerification/,
+      /require.*control(LivenessMarker|Verification)/,
+    );
+    // …and so is a control that completed WITHOUT the liveness marker: it never
+    // reached its target (unreachable host / wrong port / early exit).
+    assert.throws(
+      () =>
+        promoteFindingResult(
+          live.id,
+          { path: "/tmp/poc.sh", exitCode: 0, ranAt: "2024-01-01T00:00:00Z", sandbox: false },
+          undefined,
+          {
+            path: "/tmp/ctrl.sh",
+            exitCode: 1,
+            ranAt: "2024-01-01T00:00:00Z",
+            sandbox: false,
+            completed: true,
+            output: "control target clean (but never reached)",
+          },
+          "VULN_MARKER",
+          "CONTROL_REACHED",
+        ),
+      /require.*control(LivenessMarker|Verification)/,
     );
     // sandbox: undefined (JS caller omitting the field) must ALSO fail closed.
     // TS requires the field, so the omission is simulated via a runtime cast.
@@ -652,26 +971,30 @@ describe("casefile sqlite ledger", () => {
     } as unknown as PocVerification;
     assert.throws(
       () => promoteFindingResult(live.id, noSandboxField),
-      /require.*controlVerification/,
+      /require.*control(LivenessMarker|Verification)/,
     );
-    // A control that RAN, exited non-zero (vuln absent — expected) and printed
-    // no marker is valid: the live finding promotes.
-    const ok = promoteFindingResult(
+    // A control that RAN, exited non-zero (vuln absent — expected), printed no
+    // marker and printed the liveness marker is valid: the finding promotes.
+    const ok = promote(
       live.id,
       { path: "/tmp/poc.sh", exitCode: 0, ranAt: "2024-01-01T00:00:00Z", sandbox: false },
-      undefined,
       {
-        path: "/tmp/ctrl.sh",
-        exitCode: 1,
-        ranAt: "2024-01-01T00:00:00Z",
-        sandbox: false,
-        completed: true,
-        output: "control target clean",
+        marker: "VULN_MARKER",
+        liveness: "CONTROL_REACHED",
+        control: {
+          path: "/tmp/ctrl.sh",
+          exitCode: 1,
+          ranAt: "2024-01-01T00:00:00Z",
+          sandbox: false,
+          completed: true,
+          output: "control target clean\nCONTROL_REACHED",
+        },
       },
-      "VULN_MARKER",
     );
     assert.strictEqual(ok.record.status, "confirmed");
-    // Sandboxed (source-audit) findings do not need a control run.
+    // Sandboxed (source-audit) findings now require the control run TOO —
+    // the anti-cheat is mode-independent (the default sandboxed mode was the
+    // exact path an unconditional-marker PoC could sneak through).
     const source = addCase({
       title: "Source XSS",
       status: "investigating",
@@ -683,7 +1006,17 @@ describe("casefile sqlite ledger", () => {
       target: "packages/ui",
       disconfirmation: "Tried; held.",
     });
-    const promoted = promoteFindingResult(source.id, {
+    assert.throws(
+      () =>
+        promoteFindingResult(source.id, {
+          path: "/tmp/poc.sh",
+          exitCode: 0,
+          ranAt: "2024-01-01T00:00:00Z",
+          sandbox: true,
+        }),
+      /require.*control(LivenessMarker|Verification)/,
+    );
+    const promoted = promote(source.id, {
       path: "/tmp/poc.sh",
       exitCode: 0,
       ranAt: "2024-01-01T00:00:00Z",
@@ -718,17 +1051,34 @@ describe("casefile sqlite ledger", () => {
     );
     // No phantom reproduction item may exist on the still-investigating case.
     assert.strictEqual(listEvidenceItems(bare.record.id).length, 0);
-    // Retry after adding the observation item succeeds — no PK conflict on the
-    // deterministic reproduction id.
+    // A SUMMARY-ONLY observation is still rejected — the observation must be
+    // artifact-backed (SHA-256), not agent prose.
     addEvidenceItemResult(bare.record.id, { role: "observation", summary: "obs" });
-    const ok = promoteFindingResult(bare.record.id, {
+    assert.throws(
+      () =>
+        promoteFindingResult(bare.record.id, {
+          path: "/tmp/poc.sh",
+          exitCode: 0,
+          ranAt: "2024-01-02T00:00:00Z",
+          sandbox: true,
+        }),
+      /Evidence chain incomplete/,
+    );
+    // Retry after adding an ARTIFACT-BACKED observation item succeeds — no PK
+    // conflict on the deterministic reproduction id.
+    addEvidenceItemResult(bare.record.id, {
+      role: "observation",
+      summary: "obs (artifact-backed)",
+      artifactPath: observationArtifactPath(),
+    });
+    const ok = promote(bare.record.id, {
       path: "/tmp/poc.sh",
       exitCode: 0,
       ranAt: "2024-01-02T00:00:00Z",
       sandbox: true,
     });
     assert.strictEqual(ok.record.status, "confirmed");
-    assert.strictEqual(listEvidenceItems(bare.record.id).length, 2); // obs + reproduction
+    assert.strictEqual(listEvidenceItems(bare.record.id).length, 3); // obs + obs + reproduction
   });
 
   it("migrates a pre-evidence/pre-coverage ledger schema on reopen", () => {
@@ -836,10 +1186,12 @@ describe("casefile sqlite ledger", () => {
     assert.strictEqual(ev.caseId, c.id);
     assert.ok(ev.createdAt);
 
-    // Single-case read hydrates too.
+    // Single-case read hydrates too. The helper's observation is
+    // artifact-backed: artifact_path/sha256 must map to camelCase.
     const viaSingle = getCaseById(c.id)!;
     assert.strictEqual(viaSingle.coverageItems[0].testedBy, "agent-1");
-    assert.ok(viaSingle.evidenceItems[0].artifactPath === undefined);
+    assert.strictEqual(viaSingle.evidenceItems[0].artifactPath, "observation.txt");
+    assert.match(viaSingle.evidenceItems[0].sha256 ?? "", /^[0-9a-f]{64}$/);
   });
 
   it("suggests exploit chains from cases", () => {
@@ -954,16 +1306,17 @@ describe("casefile sqlite ledger", () => {
       target: "example-app",
       disconfirmation: "Checked if data is public by default; it is not.",
     });
-    promoteFindingResult(live.id, {
+    promote(live.id, {
       path: "/tmp/poc.sh",
       exitCode: 0,
       ranAt: "2024-01-01T00:00:00Z",
       sandbox: true,
     });
     // CaseContext records reportPath; the report writer then creates the file
-    // (the confirmed→reported gate requires it on disk).
+    // (the confirmed→reported gate requires it on disk AND passing the content
+    // gate: non-trivial size, required sections, no internal identifiers).
     const { path } = writeCaseContext(live.id);
-    writeFileSync(path, "# Report\n", "utf8");
+    writeGoodReport(path);
     updateCaseResult(live.id, { status: "reported" });
     assert.throws(
       () => updateCaseResult(live.id, { summary: "should not stick" }),
@@ -1045,7 +1398,7 @@ describe("casefile sqlite ledger", () => {
       disconfirmation:
         "Attempted to access own export without auth; blocked. Only IDOR via session works.",
     });
-    promoteFindingResult(record.id, {
+    promote(record.id, {
       path: "/workspace/idor-poc.py",
       exitCode: 0,
       ranAt: "2024-01-01T00:00:00Z",
@@ -1154,7 +1507,7 @@ describe("casefile sqlite ledger", () => {
       target: "example-app",
       disconfirmation: "Tried to disprove; could not.",
     });
-    promoteFindingResult(record.id, {
+    promote(record.id, {
       path: "/tmp/gate-poc.sh",
       exitCode: 0,
       ranAt: "2024-01-01T00:00:00Z",
@@ -1217,11 +1570,28 @@ describe("casefile sqlite ledger", () => {
       target: "example-app",
       disconfirmation: "Tried to disprove; could not.",
     });
-    promoteFindingResult(
+    promote(
       record.id,
       { path: "/tmp/poc.sh", exitCode: 0, ranAt: "2024-01-01T00:00:00Z", sandbox: true },
-      { path: "/tmp/disconfirm.sh", exitCode: 1, ranAt: "2024-01-01T00:00:00Z", sandbox: true },
-      { path: "/tmp/control.sh", exitCode: 1, ranAt: "2024-01-01T00:00:00Z", sandbox: true },
+      {
+        marker: "VULN_MARKER",
+        liveness: "CONTROL_REACHED",
+        disconfirmation: {
+          path: "/tmp/disconfirm.sh",
+          exitCode: 1,
+          ranAt: "2024-01-01T00:00:00Z",
+          sandbox: true,
+          completed: true,
+        },
+        control: {
+          path: "/tmp/control.sh",
+          exitCode: 1,
+          ranAt: "2024-01-01T00:00:00Z",
+          sandbox: true,
+          completed: true,
+          output: "CONTROL_REACHED",
+        },
+      },
     );
     const confirmed = readCasefile().find((c) => c.id === record.id)!;
     assert.ok(confirmed.pocVerified, "pocVerified set after promotion");
@@ -1238,5 +1608,348 @@ describe("casefile sqlite ledger", () => {
       "disconfirmationVerified cleared on demotion",
     );
     assert.strictEqual(demoted.controlVerified, undefined, "controlVerified cleared on demotion");
+  });
+
+  it("enforces the same-file control contract at the ledger (sha256 of control == sha256 of poc)", () => {
+    const rec = addCase({
+      title: "Same-file control",
+      status: "investigating",
+      evidence: "observed",
+      confidence: "high",
+      impact: "leak",
+      severity: "medium",
+      poc: "/tmp/poc.sh",
+      target: "example-app",
+      disconfirmation: "Tried; held.",
+    });
+    // A DIFFERENT real file as the control — the two-file cheat.
+    const pocPath = join(tempDir, "poc.sh");
+    const otherPath = join(tempDir, "other.sh");
+    writeFileSync(pocPath, "#!/bin/sh\necho VULN_MARKER", "utf8");
+    writeFileSync(otherPath, "#!/bin/sh\necho CONTROL_REACHED", "utf8");
+    const ranAt = new Date().toISOString();
+    assert.throws(
+      () =>
+        promoteFindingResult(
+          rec.id,
+          {
+            path: pocPath,
+            exitCode: 0,
+            ranAt,
+            sandbox: true,
+            completed: true,
+            output: "VULN_MARKER",
+          },
+          { ...DISCONFIRM_OK, ranAt },
+          {
+            path: otherPath,
+            exitCode: 1,
+            ranAt,
+            sandbox: true,
+            completed: true,
+            output: "CONTROL_REACHED",
+          },
+          "VULN_MARKER",
+          "CONTROL_REACHED",
+        ),
+      /SAME script/,
+    );
+    // The SAME file for both (control mode prints liveness only) promotes fine.
+    const ok = promoteFindingResult(
+      rec.id,
+      { path: pocPath, exitCode: 0, ranAt, sandbox: true, completed: true, output: "VULN_MARKER" },
+      { ...DISCONFIRM_OK, ranAt },
+      {
+        path: pocPath,
+        exitCode: 0,
+        ranAt,
+        sandbox: true,
+        completed: true,
+        output: "CONTROL_REACHED",
+      },
+      "VULN_MARKER",
+      "CONTROL_REACHED",
+    );
+    assert.strictEqual(ok.record.status, "confirmed");
+  });
+
+  it("checks markers on the UNTRUNCATED output (rawOutput), not the display slice", () => {
+    const rec = addCase({
+      title: "Truncation cheat",
+      status: "investigating",
+      evidence: "observed",
+      confidence: "high",
+      impact: "leak",
+      severity: "medium",
+      poc: "/tmp/poc.sh",
+      target: "example-app",
+      disconfirmation: "Tried; held.",
+    });
+    const pocPath = join(tempDir, "poc.sh");
+    writeFileSync(pocPath, "#!/bin/sh\necho VULN_MARKER", "utf8");
+    const ranAt = new Date().toISOString();
+    // Control output: liveness marker first, then 5000 chars of filler, then
+    // the vuln marker — all past the 4000-char display slice. The ledger must
+    // catch it on rawOutput.
+    const padded = `CONTROL_REACHED\n${"x".repeat(5000)}\nVULN_MARKER`;
+    assert.throws(
+      () =>
+        promoteFindingResult(
+          rec.id,
+          {
+            path: pocPath,
+            exitCode: 0,
+            ranAt,
+            sandbox: true,
+            completed: true,
+            output: "VULN_MARKER",
+            rawOutput: "VULN_MARKER",
+          },
+          { ...DISCONFIRM_OK, ranAt },
+          {
+            path: pocPath,
+            exitCode: 1,
+            ranAt,
+            sandbox: true,
+            completed: true,
+            output: padded.slice(0, 4000),
+            rawOutput: padded,
+          },
+          "VULN_MARKER",
+          "CONTROL_REACHED",
+        ),
+      /does not contain the marker/,
+    );
+    // Sanity: the display slice alone would have passed (marker past the window).
+    assert.ok(!padded.slice(0, 4000).includes("VULN_MARKER"));
+  });
+
+  it("requires the verification marker in PoC output at the ledger level (no !marker escape)", () => {
+    const rec = addCase({
+      title: "Ledger marker",
+      status: "investigating",
+      evidence: "observed",
+      confidence: "high",
+      impact: "leak",
+      severity: "medium",
+      poc: "/tmp/poc.sh",
+      target: "example-app",
+      disconfirmation: "Tried; held.",
+    });
+    const pocPath = join(tempDir, "poc.sh");
+    writeFileSync(pocPath, "#!/bin/sh\necho VULN_MARKER", "utf8");
+    const ranAt = new Date().toISOString();
+    // Exit 0 + completed but NO marker in output → blocked at the ledger.
+    assert.throws(
+      () =>
+        promoteFindingResult(
+          rec.id,
+          { path: pocPath, exitCode: 0, ranAt, sandbox: true, completed: true, output: "nothing" },
+          { ...DISCONFIRM_OK, ranAt },
+          {
+            path: pocPath,
+            exitCode: 1,
+            ranAt,
+            sandbox: true,
+            completed: true,
+            output: "CONTROL_REACHED",
+          },
+          "VULN_MARKER",
+          "CONTROL_REACHED",
+        ),
+      /does not contain the verification marker/,
+    );
+    // Omitting the marker param entirely fails closed too (liveness still
+    // supplied so the marker check is what fires).
+    assert.throws(
+      () =>
+        promoteFindingResult(
+          rec.id,
+          {
+            path: pocPath,
+            exitCode: 0,
+            ranAt,
+            sandbox: true,
+            completed: true,
+            output: "VULN_MARKER",
+          },
+          { ...DISCONFIRM_OK, ranAt },
+          {
+            path: pocPath,
+            exitCode: 1,
+            ranAt,
+            sandbox: true,
+            completed: true,
+            output: "CONTROL_REACHED",
+          },
+          undefined,
+          "CONTROL_REACHED",
+        ),
+      /requires verificationMarker/,
+    );
+  });
+
+  it("blocks observation items that are the same file as the PoC or postdate the repro", () => {
+    // Built WITHOUT the helper's default observation so item order is controlled.
+    const res = ledgerAddCaseResult({
+      title: "Observation provenance",
+      status: "investigating",
+      evidence: "observed",
+      confidence: "high",
+      impact: "leak",
+      severity: "medium",
+      poc: "/tmp/poc.sh",
+      target: "example-app",
+      disconfirmation: "Tried; held.",
+      disproveIf: ["test: finding is actually intended behavior"],
+    });
+    const rec = res.record;
+    const pocPath = join(tempDir, "poc.sh");
+    writeFileSync(pocPath, "#!/bin/sh\necho VULN_MARKER", "utf8");
+    const ranAt = new Date().toISOString();
+    const run = (obs: Parameters<typeof promoteFindingResult>[1]) =>
+      promoteFindingResult(
+        rec.id,
+        obs,
+        { ...DISCONFIRM_OK, ranAt },
+        {
+          path: pocPath,
+          exitCode: 1,
+          ranAt,
+          sandbox: true,
+          completed: true,
+          output: "CONTROL_REACHED",
+        },
+        "VULN_MARKER",
+        "CONTROL_REACHED",
+      );
+    const pocVerification = {
+      path: pocPath,
+      exitCode: 0,
+      ranAt,
+      sandbox: true,
+      completed: true,
+      output: "VULN_MARKER",
+    };
+    // Observation = the same file as the PoC (identical sha256).
+    addEvidenceItemResult(rec.id, {
+      role: "observation",
+      summary: "same file as poc",
+      artifactPath: pocPath,
+    });
+    assert.throws(() => run(pocVerification), /same file as the PoC/);
+    // Observation recorded AFTER the repro ran (ranAt predates the item).
+    const obsPath = join(tempDir, "obs.txt");
+    writeFileSync(obsPath, "observed signal", "utf8");
+    addEvidenceItemResult(rec.id, {
+      role: "observation",
+      summary: "postdated",
+      artifactPath: obsPath,
+    });
+    // The same-file offender is first in line on this case; the postdated
+    // check is exercised on a fresh case whose ONLY observation is created
+    // with a real timestamp while the repro ranAt is in the past.
+    const res2 = ledgerAddCaseResult({
+      title: "Observation provenance 2",
+      status: "investigating",
+      evidence: "observed",
+      confidence: "high",
+      impact: "leak",
+      severity: "medium",
+      poc: "/tmp/poc.sh",
+      target: "example-app",
+      disconfirmation: "Tried; held.",
+      disproveIf: ["test: finding is actually intended behavior"],
+    });
+    // The observation item is created with a REAL timestamp (2026+); promote
+    // with a ranAt in the past → the observation postdates the repro.
+    addEvidenceItemResult(res2.record.id, {
+      role: "observation",
+      summary: "initial signal",
+      artifactPath: obsPath,
+    });
+    assert.throws(
+      () =>
+        promoteFindingResult(
+          res2.record.id,
+          { ...pocVerification, ranAt: "2020-01-01T00:00:00Z" },
+          { ...DISCONFIRM_OK, ranAt: "2020-01-01T00:00:00Z" },
+          {
+            path: pocPath,
+            exitCode: 1,
+            ranAt: "2020-01-01T00:00:00Z",
+            sandbox: true,
+            completed: true,
+            output: "CONTROL_REACHED",
+          },
+          "VULN_MARKER",
+          "CONTROL_REACHED",
+        ),
+      /after the PoC ran/,
+    );
+  });
+
+  it("report content gate: blocks undersized / section-less / identifier-leaking reports", () => {
+    const rec = addCase({
+      title: "Report gate",
+      status: "investigating",
+      evidence: "observed",
+      confidence: "high",
+      impact: "leak",
+      severity: "medium",
+      poc: "/tmp/poc.sh",
+      target: "example-app",
+      disconfirmation: "Tried; held.",
+    });
+    promote(rec.id, {
+      path: "/tmp/poc.sh",
+      exitCode: 0,
+      ranAt: "2024-01-01T00:00:00Z",
+      sandbox: true,
+    });
+    const { path } = writeCaseContext(rec.id);
+
+    // Empty/undersized file → blocked.
+    writeFileSync(path, "# Report\n", "utf8");
+    assert.throws(
+      () => updateCaseResult(rec.id, { status: "reported" }),
+      /too small|missing required section/,
+    );
+    // Real sections but leaking the case id → blocked (padded past the size floor).
+    writeFileSync(
+      path,
+      `# Report for ${rec.id}\n\n## Summary\nStored XSS in chat; payload renders without encoding.\n\n## Impact\nScript execution in victim browser; token theft.\n\n## Remediation\nEncode output at the sink; add a strict CSP.\n`,
+      "utf8",
+    );
+    assert.throws(
+      () => updateCaseResult(rec.id, { status: "reported" }),
+      /forbidden internal identifier/,
+    );
+    // A clean report → transition commits AND reportedAt is stamped at commit time.
+    writeGoodReport(path);
+    const done = updateCaseResult(rec.id, { status: "reported" });
+    assert.strictEqual(done.record.status, "reported");
+    assert.ok(done.record.reportedAt, "reportedAt stamped on the transition");
+    // CaseContext does NOT stamp reportedAt while still confirmed.
+    const fresh = addCase({
+      title: "No premature stamp",
+      status: "investigating",
+      evidence: "observed",
+      confidence: "high",
+      impact: "leak",
+      severity: "medium",
+      poc: "/tmp/poc.sh",
+      target: "example-app",
+      disconfirmation: "Tried; held.",
+    });
+    promote(fresh.id, {
+      path: "/tmp/poc.sh",
+      exitCode: 0,
+      ranAt: "2024-01-01T00:00:00Z",
+      sandbox: true,
+    });
+    writeCaseContext(fresh.id);
+    const afterCtx = readCasefile().find((c) => c.id === fresh.id)!;
+    assert.strictEqual(afterCtx.reportedAt, undefined, "reportedAt NOT stamped by CaseContext");
   });
 });

@@ -36,10 +36,20 @@ const REDIRECT_LIST = ["follow", "manual"];
 
 // ── Session / cookie jar ─────────────────────────────────
 
-// Module-level cookie jar (hostname → "k1=v1; k2=v2") persists across
+// Module-level cookie jar (host:port → "k1=v1; k2=v2") persists across
 // http_request calls within a Pi session (extension is loaded once per
 // session). Cleared on session_shutdown.
 const cookieJar = new Map<string, string>();
+
+/**
+ * Jar key includes the port: two apps on the same hostname with different
+ * ports (localhost:3000 vs localhost:4000) must not share session cookies.
+ * Default ports are normalized so "http://x:80" and "http://x" share a jar.
+ */
+function hostKey(url: URL): string {
+  const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  return `${url.hostname.toLowerCase()}:${port}`;
+}
 
 // ── Cookie helpers ───────────────────────────────────────
 
@@ -56,10 +66,10 @@ function hasHeader(headers: Record<string, string>, name: string): boolean {
 }
 
 function injectCookieHeader(
-  hostname: string,
+  host: string,
   existing: Record<string, string>,
 ): Record<string, string> {
-  const sessionCookies = cookieJar.get(hostname);
+  const sessionCookies = cookieJar.get(host);
 
   if (!sessionCookies) return { ...existing };
   const cookieKey = findHeaderKey(existing, "cookie");
@@ -78,14 +88,14 @@ function injectCookieHeader(
   return { ...existing, [cookieKey]: [...merged].map(([k, v]) => `${k}=${v}`).join("; ") };
 }
 
-function storeResponseCookies(hostname: string, res: Response): void {
+function storeResponseCookies(host: string, res: Response): void {
   const raw = (res.headers as any).getSetCookie?.() as string[] | undefined;
   if (!raw) return;
   // Parse the existing jar into a name→value map so a rotated Set-Cookie
   // (same name, new value) replaces rather than appends — servers expect
   // the latest value to win, and duplicate Cookie pairs are ambiguous.
   const current = new Map<string, string>();
-  for (const pair of (cookieJar.get(hostname) || "").split(";")) {
+  for (const pair of (cookieJar.get(host) || "").split(";")) {
     const eq = pair.indexOf("=");
     if (eq > 0) current.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
   }
@@ -95,7 +105,7 @@ function storeResponseCookies(hostname: string, res: Response): void {
     if (eq <= 0) continue;
     current.set(segment.slice(0, eq).trim(), segment.slice(eq + 1).trim());
   }
-  cookieJar.set(hostname, [...current].map(([k, v]) => `${k}=${v}`).join("; "));
+  cookieJar.set(host, [...current].map(([k, v]) => `${k}=${v}`).join("; "));
 }
 
 // ── TLS bypass ────────────────────────────────
@@ -120,6 +130,12 @@ function getInsecureDispatcher(): unknown {
 
 // ── Body reader (streaming, capped) ─────────────────────
 
+/**
+ * Read the response body, capped at maxBytes BYTES (not chars). Chunks are
+ * accumulated as bytes and the reader is stopped at the cap, then decoded
+ * once — the old char-count slice could exceed the byte cap by 3x on
+ * multi-byte UTF-8 and could split a surrogate pair.
+ */
 async function readBody(
   res: Response,
   maxBytes: number,
@@ -127,37 +143,42 @@ async function readBody(
   const reader = res.body?.getReader();
   if (!reader) {
     const text = await res.text();
-    const truncated = text.length > maxBytes;
-    return { text: truncated ? text.slice(0, maxBytes) : text, truncated };
+    if (text.length <= maxBytes) return { text, truncated: false };
+    // Non-streaming path (no body reader): trim to the byte cap.
+    const buf = Buffer.from(text);
+    const capped = buf.subarray(0, maxBytes);
+    let out = capped.toString("utf8");
+    // Drop a trailing U+FFFD left by a split multi-byte sequence.
+    if (out.endsWith("\uFFFD")) out = out.slice(0, -1);
+    return { text: out, truncated: true };
   }
 
-  const decoder = new TextDecoder();
-  let result = "";
+  const chunks: Uint8Array[] = [];
   let received = 0;
   let truncated = false;
 
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    received += value.byteLength;
-    result += decoder.decode(value, { stream: true });
-    if (received >= maxBytes) {
+    if (received + value.byteLength > maxBytes) {
+      chunks.push(value.subarray(0, maxBytes - received));
+      received = maxBytes;
       truncated = true;
       break;
     }
+    chunks.push(value);
+    received += value.byteLength;
   }
-  result += decoder.decode(); // flush
 
-  if (result.length > maxBytes) {
-    result = result.slice(0, maxBytes);
-    truncated = true;
-  }
   try {
-    reader.cancel();
+    await reader.cancel();
   } catch {
     /* ignore */
   }
-  return { text: result, truncated };
+  const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+  let text = buf.toString("utf8");
+  if (truncated && text.endsWith("\uFFFD")) text = text.slice(0, -1);
+  return { text, truncated };
 }
 
 // ── Tool ─────────────────────────────────────────────────
@@ -284,10 +305,8 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
         const verifyTls = params.verifyTls !== false;
 
         // ── Build headers ────────────────────────────────────
-        const mergedHeaders = injectCookieHeader(
-          parsed.hostname.toLowerCase(),
-          params.headers || {},
-        );
+        const jarKey = hostKey(parsed);
+        const mergedHeaders = injectCookieHeader(jarKey, params.headers || {});
 
         if (params.contentType && !hasHeader(mergedHeaders, "content-type")) {
           mergedHeaders["content-type"] = params.contentType;
@@ -340,7 +359,7 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
         const timingMs = Date.now() - start;
 
         // ── Store response cookies ──────────────────────────
-        storeResponseCookies(parsed.hostname.toLowerCase(), res);
+        storeResponseCookies(jarKey, res);
 
         // ── Read body ────────────────────────────────────────
         const { text: responseBody, truncated } = await readBody(res, maxBody);
@@ -357,7 +376,7 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
         }
 
         // ── Current cookies stored for this host ────────────
-        const cookiesOnHost = cookieJar.get(parsed.hostname.toLowerCase()) || "";
+        const cookiesOnHost = cookieJar.get(jarKey) || "";
 
         // ── Build curl-style transcript for content ─────────
         const pathAndQuery = parsed.pathname + (parsed.search || "");

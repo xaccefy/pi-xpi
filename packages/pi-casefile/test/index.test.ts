@@ -54,6 +54,8 @@ type FakePi = {
 let tempDir: string;
 let pocScriptPath: string;
 let controlScriptPath: string;
+let observationArtifactPath: string;
+let disconfirmationScriptPath: string;
 let casefileExtension: (pi: any) => void;
 
 // CaseAdd now requires disproveIf (falsification conditions); the tool-level
@@ -70,6 +72,7 @@ async function addCase(pi: FakePi, fields: Record<string, unknown>) {
       case_id: result.details.record.id,
       role: "observation",
       summary: "test fixture: initial observed signal",
+      artifact_path: observationArtifactPath,
     }).catch(() => undefined);
   }
   return result;
@@ -102,11 +105,27 @@ beforeEach(async () => {
   tempDir = await mkdtemp(join(tmpdir(), "casefile-index-test-"));
   setCasefilePath(join(tempDir, "casefile.db"));
   setScratchpadRoot(tempDir);
-  pocScriptPath = join(tempDir, "poc.sh");
-  writeFileSync(pocScriptPath, "#!/bin/sh\nprintf 'ok'", "utf8");
-  controlScriptPath = join(tempDir, "control.sh");
-  writeFileSync(controlScriptPath, "#!/bin/sh\necho 'control target clean'", "utf8");
+  pocScriptPath = join(tempDir, "shared.sh");
+  // Same-file contract: the control must be the SAME script as the PoC
+  // (sha256-equal; the only permitted difference is PI_POC_MODE). The shared
+  // fixture branches: poc mode prints the marker, control mode prints the
+  // liveness marker only, disconfirmation is a separate exit-1 script.
+  writeFileSync(
+    pocScriptPath,
+    "#!/bin/sh\nif [ \"$PI_POC_MODE\" = \"control\" ]; then\n  echo 'CONTROL_REACHED_1'\n  exit 0\nfi\nprintf 'ok'",
+    "utf8",
+  );
+  controlScriptPath = pocScriptPath;
+  observationArtifactPath = join(tempDir, "observation.txt");
+  writeFileSync(observationArtifactPath, "observed signal (fixture)", "utf8");
+  disconfirmationScriptPath = join(tempDir, "disconf.sh");
+  writeFileSync(disconfirmationScriptPath, "#!/bin/sh\nexit 1", "utf8");
   process.env.PI_POC_ROOT = tempDir;
+  // Local (host) execution is operator-gated; the test harness FORCE_LOCAL
+  // so promote tests run hermetically without Docker even when Docker is
+  // installed — production still prefers the host-network sandbox.
+  process.env.PI_POC_ALLOW_LOCAL = "1";
+  process.env.PI_POC_FORCE_LOCAL = "1";
   // Hermeticity: the before_agent_start handler skips injection when
   // PI_SUBAGENT_CHILD=1 (the harness sets it when running inside pi-subagents);
   // without this, the whole XP-mode suite fails under subagent execution.
@@ -118,6 +137,8 @@ afterEach(async () => {
   setCasefilePath(undefined);
   setScratchpadRoot(undefined);
   delete process.env.PI_POC_ROOT;
+  delete process.env.PI_POC_ALLOW_LOCAL;
+  delete process.env.PI_POC_FORCE_LOCAL;
   await rm(tempDir, { recursive: true, force: true });
 });
 
@@ -205,6 +226,8 @@ describe("casefile extension", () => {
       poc_path: pocScriptPath,
       verification_marker: "ok",
       control_path: controlScriptPath,
+      control_liveness_marker: "CONTROL_REACHED_1",
+      disconfirmation_path: disconfirmationScriptPath,
       local: true,
     });
     expect(promoted.details.record.status).toBe("confirmed");
@@ -237,7 +260,7 @@ describe("casefile extension", () => {
     expect(contextText).toContain("Linked Cases");
   });
 
-  test("PromoteFinding requires control_path for live findings (local:true)", async () => {
+  test("PromoteFinding requires control_path + control_liveness_marker for EVERY promotion (sandboxed and live)", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
 
@@ -254,14 +277,83 @@ describe("casefile extension", () => {
     });
     const id = added.details.record.id;
 
-    const result = await executeTool(pi, "PromoteFinding", {
+    // Missing control_path — blocked even WITHOUT local:true (the default
+    // sandboxed mode used to skip the control entirely; now it is mandatory).
+    const noControl = await executeTool(pi, "PromoteFinding", {
+      id,
+      poc_path: pocScriptPath,
+      verification_marker: "ok",
+      control_liveness_marker: "CONTROL_REACHED_1",
+    });
+    expect(noControl.isError).toBe(true);
+    expect(noControl.content[0].text).toContain("control_path");
+    expect(noControl.details.missingControl).toBe(true);
+    expect(noControl.details.record.status).toBe("investigating");
+
+    // Same for live findings.
+    const noControlLive = await executeTool(pi, "PromoteFinding", {
       id,
       poc_path: pocScriptPath,
       verification_marker: "ok",
       local: true,
     });
+    expect(noControlLive.isError).toBe(true);
+    expect(noControlLive.content[0].text).toContain("control_path");
+    expect(noControlLive.details.record.status).toBe("investigating");
+
+    // Missing control_liveness_marker — blocked before any PoC run.
+    const noLiveness = await executeTool(pi, "PromoteFinding", {
+      id,
+      poc_path: pocScriptPath,
+      verification_marker: "ok",
+      control_path: controlScriptPath,
+    });
+    expect(noLiveness.isError).toBe(true);
+    expect(noLiveness.content[0].text).toContain("control_liveness_marker");
+    expect(noLiveness.details.missingLivenessMarker).toBe(true);
+    expect(noLiveness.details.record.status).toBe("investigating");
+
+    // A liveness marker identical to the verification marker is rejected.
+    const sameMarker = await executeTool(pi, "PromoteFinding", {
+      id,
+      poc_path: pocScriptPath,
+      verification_marker: "ok",
+      control_path: controlScriptPath,
+      control_liveness_marker: "ok",
+    });
+    expect(sameMarker.isError).toBe(true);
+    expect(sameMarker.details.livenessEqualsMarker).toBe(true);
+    expect(sameMarker.details.record.status).toBe("investigating");
+  });
+
+  test("PromoteFinding requires disconfirmation_path for severity high/critical", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+
+    const added = await addCase(pi, {
+      title: "High severity without disconfirmation script",
+      status: "investigating",
+      evidence: "reflected input",
+      confidence: "high",
+      severity: "high",
+      poc: "send payload, check reflection",
+      impact: "script execution",
+      target: "example-app",
+      disconfirmation: "tried without payload; no reflection",
+    });
+    const id = added.details.record.id;
+
+    const result = await executeTool(pi, "PromoteFinding", {
+      id,
+      poc_path: pocScriptPath,
+      verification_marker: "ok",
+      control_path: controlScriptPath,
+      control_liveness_marker: "CONTROL_REACHED_1",
+      local: true,
+    });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("control_path");
+    expect(result.content[0].text).toContain("disconfirmation_path");
+    expect(result.details.missingDisconfirmation).toBe(true);
     expect(result.details.record.status).toBe("investigating");
   });
 
@@ -282,17 +374,24 @@ describe("casefile extension", () => {
     });
     const id = added.details.record.id;
 
-    // The control script echoes the marker unconditionally — the same way a
+    // The control script is the SAME file as the PoC (same-file contract) but
+    // its control branch echoes the marker unconditionally — the way a
     // cheating PoC prints it without the vulnerable condition. The harness
     // must block promotion even though the PoC run itself "succeeded".
-    const cheatControl = join(tempDir, "cheat-control.sh");
-    writeFileSync(cheatControl, "#!/bin/sh\nprintf 'ok'", "utf8");
+    const cheatScript = join(tempDir, "cheat.sh");
+    writeFileSync(
+      cheatScript,
+      "#!/bin/sh\nif [ \"$PI_POC_MODE\" = \"control\" ]; then\n  printf 'ok'\n  echo 'CONTROL_REACHED_1'\n  exit 0\nfi\nprintf 'ok'",
+      "utf8",
+    );
 
     const result = await executeTool(pi, "PromoteFinding", {
       id,
-      poc_path: pocScriptPath,
+      poc_path: cheatScript,
       verification_marker: "ok",
-      control_path: cheatControl,
+      control_path: cheatScript,
+      control_liveness_marker: "CONTROL_REACHED_1",
+      disconfirmation_path: disconfirmationScriptPath,
       local: true,
     });
     expect(result.isError).toBe(true);
@@ -320,20 +419,112 @@ describe("casefile extension", () => {
 
     // A control script that kills itself never runs to completion — the gate
     // must NOT treat "no marker in crash output" as a clean control verdict.
+    // Same-file contract: poc and control are the SAME script.
     const crashControl = join(tempDir, "crash-control.sh");
-    writeFileSync(crashControl, "#!/bin/sh\nkill -9 $$\n", "utf8");
+    writeFileSync(
+      crashControl,
+      '#!/bin/sh\nif [ "$PI_POC_MODE" = "control" ]; then\n  kill -9 $$\nfi\nprintf \'ok\'',
+      "utf8",
+    );
 
     const result = await executeTool(pi, "PromoteFinding", {
       id,
-      poc_path: pocScriptPath,
+      poc_path: crashControl,
       verification_marker: "ok",
       control_path: crashControl,
+      control_liveness_marker: "CONTROL_REACHED_1",
+      disconfirmation_path: disconfirmationScriptPath,
       local: true,
     });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("did NOT complete");
     expect(result.details.controlCrashed).toBe(true);
     expect(result.details.record.status).toBe("investigating");
+  });
+
+  test("PromoteFinding blocks a control that completed WITHOUT the liveness marker", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+
+    const added = await addCase(pi, {
+      title: "Dead control",
+      status: "investigating",
+      evidence: "reflected input",
+      confidence: "high",
+      severity: "medium",
+      poc: "send payload, check reflection",
+      impact: "script execution",
+      target: "example-app",
+      disconfirmation: "tried without payload; no reflection",
+    });
+    const id = added.details.record.id;
+
+    // The control exits cleanly and never prints the vuln marker — but it also
+    // never reaches the control target (no liveness marker). A control pointed
+    // at an unreachable host / wrong port / early exit is NOT a clean verdict.
+    // Same-file contract: poc and control are the SAME script.
+    const deadControl = join(tempDir, "dead-control.sh");
+    writeFileSync(
+      deadControl,
+      '#!/bin/sh\nif [ "$PI_POC_MODE" = "control" ]; then\n  exit 0\nfi\nprintf \'ok\'',
+      "utf8",
+    );
+
+    const result = await executeTool(pi, "PromoteFinding", {
+      id,
+      poc_path: deadControl,
+      verification_marker: "ok",
+      control_path: deadControl,
+      control_liveness_marker: "CONTROL_REACHED_1",
+      disconfirmation_path: disconfirmationScriptPath,
+      local: true,
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("CONTROL CHECK FAILED");
+    expect(result.content[0].text).toContain("control_liveness_marker");
+    expect(result.details.controlLivenessMissing).toBe(true);
+    expect(result.details.record.status).toBe("investigating");
+  });
+
+  test("CoverageReport renders unbacked cells distinctly", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+
+    const added = await addCase(pi, { title: "Unbacked coverage", status: "hypothesis" });
+    const id = added.details.record.id;
+
+    // Backed cell: artifact-backed observation evidence item on the case.
+    const ev = await executeTool(pi, "EvidenceAdd", {
+      case_id: id,
+      role: "observation",
+      summary: "probe log",
+      artifact_path: observationArtifactPath,
+    });
+    await executeTool(pi, "CoverageAdd", {
+      case_id: id,
+      asset: "example-app",
+      class: "sql-injection",
+      scope: "local",
+      note: "payloads on all params; no injection",
+      evidence_item_id: ev.details.item.id,
+    });
+    // Unbacked cell: no evidence link.
+    await executeTool(pi, "CoverageAdd", {
+      case_id: id,
+      asset: "example-app",
+      class: "ssti",
+      scope: "local",
+      note: "no reflection",
+    });
+
+    const report = await executeTool(pi, "CoverageReport", { case_id: id });
+    const text = report.content[0].text;
+    const sqliLine = text.split("\n").find((l: string) => l.includes("sql-injection"))!;
+    const sstiLine = text.split("\n").find((l: string) => l.includes("ssti"))!;
+    expect(sqliLine).toContain("sql-injection");
+    expect(sqliLine).not.toContain("⚠ unbacked");
+    expect(sstiLine).toContain("ssti");
+    expect(sstiLine).toContain("⚠ unbacked");
   });
 
   test("PromoteFinding blocks a crashed disconfirmation script (crash is not survived disproof)", async () => {
@@ -362,6 +553,7 @@ describe("casefile extension", () => {
       verification_marker: "ok",
       disconfirmation_path: crashDisconf,
       control_path: controlScriptPath,
+      control_liveness_marker: "CONTROL_REACHED_1",
       local: true,
     });
     expect(result.isError).toBe(true);
@@ -443,6 +635,8 @@ describe("casefile extension", () => {
       poc_path: pocScriptPath,
       verification_marker: "VULN_CONFIRMED_not_present",
       control_path: controlScriptPath,
+      control_liveness_marker: "CONTROL_REACHED_1",
+      disconfirmation_path: disconfirmationScriptPath,
       local: true,
     });
     expect(result.isError).toBe(true);
@@ -715,6 +909,15 @@ describe("casefile extension", () => {
         evidence: "Duplicate",
         confidence: "low",
       });
+      // Killing an investigating case now requires ARTIFACT-BACKED refutation
+      // evidence (a keyword or prose-only item is not enough once the case
+      // advanced past hypothesis).
+      await executeTool(pi, "EvidenceAdd", {
+        case_id: killed.details.record.id,
+        role: "refutation",
+        summary: "Re-checked: this lead duplicates an existing case; no new evidence.",
+        artifact_path: observationArtifactPath,
+      });
       await executeTool(pi, "CaseUpdate", {
         id: killed.details.record.id,
         status: "killed",
@@ -737,11 +940,19 @@ describe("casefile extension", () => {
         poc_path: pocScriptPath,
         verification_marker: "ok",
         control_path: controlScriptPath,
+        control_liveness_marker: "CONTROL_REACHED_1",
+        disconfirmation_path: disconfirmationScriptPath,
         local: true,
       });
       const ctxResult = await executeTool(pi, "CaseContext", { id: reported.details.record.id });
-      // The reporter agent writes the report file before the case flips to reported.
-      writeFileSync(ctxResult.details.path, "# Report\nrepro\n", "utf8");
+      // The reporter agent writes the report file (passing the content gate:
+      // non-trivial size, required sections, no internal identifiers) before
+      // the case flips to reported.
+      writeFileSync(
+        ctxResult.details.path,
+        `# Already reported\n\n## Summary\nThe finding was resolved before reporting; pre-patch versions were vulnerable.\n\n## Vulnerability Details\nThe export endpoint allowed unauthorized access to resources.\n\n## Steps to Reproduce\n1. Authenticate as a regular user.\n2. Request a resource owned by another user.\n\n## Impact\nUnauthorized disclosure of resources; now patched.\n\n## Remediation\nPatch shipped; the endpoint now enforces ownership checks.\n`,
+        "utf8",
+      );
       await executeTool(pi, "CaseUpdate", {
         id: reported.details.record.id,
         status: "reported",
@@ -938,6 +1149,8 @@ describe("casefile extension", () => {
       poc_path: pocScriptPath,
       verification_marker: "ok",
       control_path: controlScriptPath,
+      control_liveness_marker: "CONTROL_REACHED_1",
+      disconfirmation_path: disconfirmationScriptPath,
       local: true,
     });
 

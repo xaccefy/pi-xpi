@@ -34,6 +34,7 @@
     "agents/",
     "skills/",
     "schemas/",
+    "docs/",
     "install.sh",
     "README.md",
     "LICENSE"

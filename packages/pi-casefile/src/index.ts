@@ -6,6 +6,7 @@
  * Event: before_agent_start — injects cyber workflow once per session, refreshes the active case list per prompt
  */
 
+import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -55,7 +56,7 @@ import {
   writeCaseContext,
 } from "./ledger.ts";
 import { pipeline_submit, SUBMIT_STAGES, type SubmitStage } from "./pipeline-submit.ts";
-import { type PocRun, runPoc } from "./poc-runner.ts";
+import { type PocRun, type PocRunOptions, runPoc } from "./poc-runner.ts";
 import {
   PHASE_ORDER,
   type ScratchpadPhase,
@@ -171,16 +172,24 @@ const PromoteSchema = Type.Object(
     disconfirmation_path: Type.Optional(
       Type.String({
         description:
-          "Absolute path to a disconfirmation script that tries to disprove the finding; must exit non-zero (failure to disprove)",
+          "Absolute path to a disconfirmation script that tries to disprove the finding; must exit non-zero (failure to disprove). REQUIRED for severity high/critical findings.",
       }),
     ),
-    control_path: Type.Optional(
-      Type.String({
+    control_path: Type.String({
+      description:
+        "REQUIRED for EVERY promotion (sandboxed and live alike): absolute path to a control-target script that runs the SAME PoC against a control that lacks the vulnerability (patched replica, second account, baseline endpoint). The harness blocks promotion if the verification_marker appears in the control output — an unconditional-marker/mock PoC cannot pass. Best form: the same parameterized script, branching on the PI_POC_MODE env var (poc | control) the harness sets on every run.",
+    }),
+    control_liveness_marker: Type.String({
+      minLength: 1,
+      description:
+        "REQUIRED for EVERY promotion: a unique string the control script must print AFTER successfully reaching/exercising the control target (e.g. 'CONTROL_REACHED_<case-id>'). The harness blocks promotion if the control output lacks it — a control that never reached its target (unreachable host, wrong port, early exit) is not a clean verdict. Must differ from verification_marker.",
+    }),
+    local: Type.Optional(
+      Type.Boolean({
         description:
-          "Absolute path to a control-target script: runs the SAME PoC against a control that lacks the vulnerability. The harness checks the control run's output — if the verification_marker appears there, promotion is BLOCKED (the PoC prints the marker without the vulnerable condition). REQUIRED when local:true (live findings).",
+          "Run with network access (Docker sandbox with --network host — still read-only FS, dropped capabilities, unprivileged user) instead of the isolated --network none sandbox. True host execution is NOT agent-selectable: it requires the operator to set PI_POC_ALLOW_LOCAL=1, and is used only as a fallback when Docker is unavailable.",
       }),
     ),
-    local: Type.Optional(Type.Boolean({ description: "Run locally instead of in Docker sandbox" })),
   },
   { additionalProperties: false },
 );
@@ -890,6 +899,12 @@ export default function casefileExtension(pi: ExtensionAPI) {
         description:
           "Short note of the tests ACTUALLY RUN and the verdict: techniques tried · result · key gap. A verdict guessed without testing can hide a real issue.",
       }),
+      evidence_item_id: Type.Optional(
+        Type.String({
+          description:
+            "Evidence item id backing this tested verdict (must be an artifact-backed EvidenceAdd item on this case). Cells without a backing item render as 'unbacked' in CoverageReport — 'tested' claims must be machine-checkable, not prose-only.",
+        }),
+      ),
     },
     { additionalProperties: false },
   );
@@ -914,6 +929,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
         class: params.class as string,
         scope: (params.scope ?? "local") as CoverageScope,
         note: params.note as string,
+        evidenceItemId: params.evidence_item_id as string | undefined,
       });
       const record = getCaseById(params.case_id as string)!;
       return {
@@ -979,7 +995,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
         lines.push(`\n## ${asset}`);
         for (const cell of summary.byAsset[asset] ?? []) {
           lines.push(
-            `- [${cell.scope}] ${cell.class} — ${cell.note}${cell.testedBy ? ` (by ${cell.testedBy})` : ""}`,
+            `- [${cell.scope}] ${cell.class} — ${cell.note}${cell.testedBy ? ` (by ${cell.testedBy})` : ""}` +
+              (cell.evidenceItemId
+                ? ""
+                : " ⚠ unbacked (link an artifact-backed evidence item via CoverageAdd evidence_item_id)"),
           );
         }
       }
@@ -1009,15 +1028,16 @@ export default function casefileExtension(pi: ExtensionAPI) {
     name: "PromoteFinding",
     label: "Promote Finding",
     description:
-      "Run an on-disk PoC script (Docker sandbox or local) and, on exit 0 + verification marker present in output, promote an investigating case to confirmed. The verification_marker proves the exploit actually worked — exit code 0 alone is NOT sufficient. For live findings (local:true) a control_path script is REQUIRED: the same PoC run against a control lacking the vuln must NOT print the marker — this blocks unconditional-marker and mock-target cheats. Optionally run a disconfirmation script that must exit non-0 (finding survived the attempt to disprove).",
+      "Run an on-disk PoC script (Docker sandbox or host-network sandbox) and, on exit 0 + verification marker present in output, promote an investigating case to confirmed. The verification_marker proves the exploit actually worked — exit code 0 alone is NOT sufficient. EVERY promotion (sandboxed and live alike) REQUIRES: (1) a disconfirmation_path script that must exit non-zero (the finding survived the attempt to disprove it); (2) a control_path that is the SAME script as the PoC (sha256-enforced — a separately written control file is rejected), run in control mode via PI_POC_MODE; (3) a control_liveness_marker the control must print after reaching its target. The harness blocks promotion if the vuln marker appears in the (untruncated) control output, if the liveness marker is absent, or if the control/disconfirmation scripts crash. Host execution is never agent-selectable — local:true uses a host-network Docker sandbox; true host runs need the operator's PI_POC_ALLOW_LOCAL=1.",
     promptSnippet: "Run a PoC and promote an investigating case to confirmed",
     promptGuidelines: [
       "Use PromoteFinding when an investigating case has a concrete PoC script on disk and you are ready to prove it.",
-      "Prerequisites: status='investigating' and non-empty poc, evidence, impact, severity, target, disconfirmation, plus an EvidenceAdd 'observation' item on the case (the initial signal) — the PoC gate auto-records the reproduction item.",
-      "Default sandbox: docker run --rm --network none. Use local:true for network-dependent bugs.",
+      "Prerequisites: status='investigating' and non-empty poc, evidence, impact, severity, target, disconfirmation, plus an artifact-backed EvidenceAdd 'observation' item on the case (the initial signal, with artifact_path) — the PoC gate auto-records the reproduction item.",
+      "Default sandbox: docker run --rm --network none. Use local:true for network-dependent bugs (host-network sandbox; host execution needs operator PI_POC_ALLOW_LOCAL=1).",
       "Gate: exit 0 AND verification_marker in the PoC output. The marker (e.g. 'VULN_CONFIRMED_<case-id>') must be printed only AFTER the exploit is verified (data extracted, callback received, payload reflected) — never unconditionally or before the exploit check. The marker check prevents fluke exit 0 (script crashed early) and mocked PoCs (target faked) from passing.",
-      "control_path (REQUIRED for local:true): a script that runs the SAME PoC against a control lacking the vuln (patched replica, second account, baseline endpoint). The harness blocks promotion if the verification_marker appears in the control run's output — an unconditional-marker PoC cannot pass this.",
-      "disconfirmation_path: a script that tries to disprove the finding; if it exits 0, promotion is blocked.",
+      "control_path (REQUIRED for EVERY promotion): the SAME script as poc_path (sha256-equality is ENFORCED — a separately written control file is rejected). One parameterized script — read the target from the PI_POC_TARGET env var and branch on PI_POC_MODE (poc | control) — the control run is literally the same script in control mode against a control lacking the vuln (patched replica, second account, baseline endpoint). The harness blocks promotion if the verification_marker appears in the control run's output (checked on the untruncated output) — an unconditional-marker PoC cannot pass this.",
+      "control_liveness_marker (REQUIRED): a unique string the control script prints only AFTER reaching/exercising the control target (e.g. 'CONTROL_REACHED_<case-id>'). The harness blocks promotion if the control output lacks it — a control pointed at an unreachable host, wrong port, or exiting before the check is NOT a clean verdict.",
+      "disconfirmation_path: a script that tries to disprove the finding; if it exits 0, promotion is blocked. REQUIRED for EVERY promotion — the prose disconfirmation field is not enough at any severity (a case filed low/medium must not skip the run and be re-raised afterwards).",
       "Never CaseUpdate status='confirmed' directly — it is rejected. Always use PromoteFinding.",
     ],
     parameters: PromoteSchema,
@@ -1025,9 +1045,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
     async execute(_id, params, _signal, _onUpdate, _ctx) {
       // Validate promotability BEFORE running the PoC — a sandboxed run can take
       // 30s (plus first-time image pull), so fail cheap when the case can't
-      // advance anyway (missing, wrong status, missing required fields).
+      // advance anyway (missing, wrong status, missing required fields, missing
+      // artifact-backed observation evidence).
       const caseId = params.id as string;
-      assertPromotable(caseId);
+      const current = assertPromotable(caseId);
 
       // Shared blocked-promotion shape: the case stays investigating and the
       // caller gets the record back for context.
@@ -1048,20 +1069,100 @@ export default function casefileExtension(pi: ExtensionAPI) {
         );
       }
 
-      // Live findings require control_path — check BEFORE paying for the PoC
-      // run (an agent that forgot the control script shouldn't burn a 30s
-      // sandboxed run to be told).
-      if (params.local === true && !params.control_path) {
+      // Control-target anti-cheat is mandatory for EVERY promotion — sandboxed
+      // and live alike. It is the only deterministic check that the marker is
+      // target-dependent; skipping it for the default sandboxed mode would let
+      // an unconditional-marker PoC pass untouched. Check BEFORE paying for the
+      // PoC run.
+      const controlPath = (params.control_path as string | undefined)?.trim();
+      if (!controlPath) {
         return fail(
-          "Live findings (local:true) require control_path: a script that runs the same PoC " +
-            "against a control lacking the vuln. The harness verifies the verification_marker is " +
-            "absent from the control run's output — that is what proves the marker is target-dependent. " +
-            "Write the control script and retry.",
+          "control_path is REQUIRED for every promotion (sandboxed and live alike): a script that runs " +
+            "the SAME PoC against a control lacking the vuln (patched replica, second account, baseline endpoint). " +
+            "The harness verifies the verification_marker is absent from the control run's output — that is what " +
+            "proves the marker is target-dependent. Write the control script and retry.",
           { missingControl: true },
         );
       }
 
-      const run = runPoc(params.poc_path as string, params.local !== true);
+      // The control must ALSO prove it reached its target: without a liveness
+      // marker, a control pointed at an unreachable host / wrong port / early
+      // exit would show "marker absent" for reasons unrelated to the vuln.
+      const livenessMarker = (params.control_liveness_marker as string | undefined)?.trim();
+      if (!livenessMarker) {
+        return fail(
+          "control_liveness_marker is REQUIRED for every promotion: a unique string the control script " +
+            "prints ONLY AFTER reaching/exercising the control target (e.g. 'CONTROL_REACHED_<case-id>'). " +
+            "The harness blocks promotion if the control output lacks it — a control that never reached its " +
+            "target proves nothing. Must differ from verification_marker.",
+          { missingLivenessMarker: true },
+        );
+      }
+      if (livenessMarker === marker) {
+        return fail(
+          "control_liveness_marker must differ from verification_marker — the liveness marker proves the " +
+            "control reached its target, the verification marker proves the vuln fired. Use distinct strings.",
+          { livenessEqualsMarker: true },
+        );
+      }
+
+      // EXECUTED disconfirmation is required for EVERY promotion — the prose
+      // `disconfirmation` field cannot carry the disprove-attempt. Making it
+      // unconditional (not severity-keyed) also kills the ordering attack:
+      // a case filed as low/medium could previously skip the run, promote,
+      // then be re-raised to high/critical with no executed disproof.
+      const disconfirmationPath = (params.disconfirmation_path as string | undefined)?.trim();
+      if (!disconfirmationPath) {
+        return fail(
+          "disconfirmation_path is REQUIRED for every promotion: a script that tries to " +
+            "disprove the finding and must exit non-zero (the finding survived the attempt). " +
+            "The prose disconfirmation field is not enough. Write the disconfirmation script and retry.",
+          { missingDisconfirmation: true },
+        );
+      }
+
+      // Same-file contract (anti-cheat): the control must be the SAME script as
+      // the PoC, differing only via the harness-set PI_POC_MODE env var. Two
+      // agent-written files (poc prints the marker unconditionally, control
+      // prints the liveness marker) pass every string check — the "same script"
+      // recommendation in the docs is now enforced: sha256(control) must equal
+      // sha256(poc). Hash BEFORE any run so a mismatch fails cheap.
+      const pocPath = (params.poc_path as string | undefined)?.trim() ?? "";
+      let pocHash: string | undefined;
+      let controlHash: string | undefined;
+      try {
+        pocHash = createHash("sha256").update(readFileSync(pocPath)).digest("hex");
+        controlHash = createHash("sha256").update(readFileSync(controlPath)).digest("hex");
+      } catch (e) {
+        return fail(
+          `Cannot read PoC/control scripts for the same-file check: ${(e as Error).message}`,
+          { sameFileCheckFailed: true },
+        );
+      }
+      if (pocHash !== controlHash) {
+        return fail(
+          "CONTROL CHECK FAILED: control_path must be the SAME script as poc_path " +
+            "(sha256 mismatch). The control run is only meaningful as the same PoC " +
+            "pointed at a control target via PI_POC_MODE=control — a separately written " +
+            "control file proves nothing (the model writes both files). Parameterize " +
+            "one script: branch on PI_POC_MODE (poc | control) and read the target from " +
+            "PI_POC_TARGET. Case remains investigating.",
+          { run: undefined, controlHashMismatch: true },
+        );
+      }
+
+      // local:true now means "network access": with the operator's
+      // PI_POC_ALLOW_LOCAL=1 opt-in the run executes on the host; WITHOUT the
+      // opt-in it uses a Docker sandbox with --network host (same FS/cap/user
+      // isolation) and fails closed when Docker is unavailable too. Host
+      // execution is never agent-selectable on its own.
+      const runOptions = (pocMode: string): PocRunOptions => ({
+        network: params.local === true ? "host" : "none",
+        local: params.local === true,
+        env: { PI_POC_MODE: pocMode, PI_POC_TARGET: current.target ?? "" },
+      });
+
+      const run = runPoc(pocPath, runOptions("poc"));
 
       // Fail closed without throwing: non-zero PoC must leave the case investigating.
       if (run.exitCode !== 0) {
@@ -1081,11 +1182,12 @@ export default function casefileExtension(pi: ExtensionAPI) {
       }
 
       // Verification marker check: exit code 0 alone is NOT sufficient.
-      // The PoC must print the verification_marker to stdout, proving the
-      // exploit actually worked — not just that the script ran. This blocks
-      // fluke exit 0 (crash before real logic) and mocked PoCs that don't
-      // actually exploit the target.
-      if (!run.output.includes(marker)) {
+      // The PoC must print the verification_marker, proving the exploit
+      // actually worked — not just that the script ran. The check runs on
+      // rawOutput (untruncated) so a script printing its marker past the
+      // 4000-char display window cannot hide it.
+      const pocOut = run.rawOutput ?? run.output;
+      if (!pocOut.includes(marker)) {
         return fail(
           `PoC exited 0 but the verification marker "${marker}" was NOT found in the output.\n` +
             `This means the script ran but did not prove exploitation. The marker must be printed only AFTER the PoC verifies the exploit worked (data extracted, callback received, payload reflected, etc.).\n` +
@@ -1094,10 +1196,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
         );
       }
 
-      // Run disconfirmation script if provided — must exit NON-0 (finding survived the attempt to disprove).
+      // Run disconfirmation script — must exit NON-0 (finding survived the attempt to disprove).
       let disconfirmationRun: PocRun | undefined;
-      if (params.disconfirmation_path) {
-        disconfirmationRun = runPoc(params.disconfirmation_path as string, params.local !== true);
+      if (disconfirmationPath) {
+        disconfirmationRun = runPoc(disconfirmationPath, runOptions("disconfirmation"));
         if (!disconfirmationRun.completed) {
           return fail(
             `Disconfirmation script did NOT complete (spawn error, killed, or timeout — no completion marker). ` +
@@ -1118,30 +1220,47 @@ export default function casefileExtension(pi: ExtensionAPI) {
       // Control-target anti-cheat check: the same PoC pointed at a control that
       // lacks the vuln must NOT print the marker. The control script is
       // agent-written, but the marker-absence check is harness-side and
-      // deterministic — the model cannot pass it by asserting success.
-      let controlRun: PocRun | undefined;
-      if (params.control_path) {
-        controlRun = runPoc(params.control_path as string, params.local !== true);
-        if (!controlRun.completed) {
-          return fail(
-            `CONTROL CHECK FAILED: the control-target script did NOT complete (spawn error, killed, or timeout). ` +
-              `A control run that never executed proves nothing about the marker — fix the control script and retry.\n` +
-              `Control output:\n${controlRun.output}`,
-            { run, controlRun, controlCrashed: true },
-          );
-        }
-        if (controlRun.output.includes(marker)) {
-          return fail(
-            `CONTROL CHECK FAILED: the verification marker "${marker}" appeared in the control-target run. ` +
-              `The PoC prints the marker without the vulnerable condition — a cheating PoC (unconditional marker) ` +
-              `or a broken check. Case remains investigating.\nControl output:\n${controlRun.output}`,
-            { run, controlRun, controlCheated: true },
-          );
-        }
+      // deterministic — the model cannot pass it by asserting success. The
+      // liveness-marker check closes the "control pointed at an unreachable
+      // host / exited early" hole: the control must prove it reached its target.
+      const controlRun = runPoc(controlPath, runOptions("control"));
+      if (!controlRun.completed) {
+        return fail(
+          `CONTROL CHECK FAILED: the control-target script did NOT complete (spawn error, killed, or timeout). ` +
+            `A control run that never executed proves nothing about the marker — fix the control script and retry.\n` +
+            `Control output:\n${controlRun.output}`,
+          { run, controlRun, controlCrashed: true },
+        );
+      }
+      // Marker-absence + liveness checks run on the UNTRUNCATED control output.
+      const controlOut = controlRun.rawOutput ?? controlRun.output;
+      if (controlOut.includes(marker)) {
+        return fail(
+          `CONTROL CHECK FAILED: the verification marker "${marker}" appeared in the control-target run. ` +
+            `The PoC prints the marker without the vulnerable condition — a cheating PoC (unconditional marker) ` +
+            `or a broken check. Case remains investigating.\nControl output:\n${controlRun.output}`,
+          { run, controlRun, controlCheated: true },
+        );
+      }
+      if (!controlOut.includes(livenessMarker)) {
+        return fail(
+          `CONTROL CHECK FAILED: the control-target run completed but the control_liveness_marker "${livenessMarker}" ` +
+            `was NOT found in its output. The control must print the liveness marker only AFTER reaching/exercising ` +
+            `the control target — an unreachable host, wrong port, or early exit is not a valid control verdict. ` +
+            `Case remains investigating.\nControl output:\n${controlRun.output}`,
+          { run, controlRun, controlLivenessMissing: true },
+        );
       }
 
       // PocRun is structurally a PocVerification — pass the runs straight through.
-      const result = promoteFindingResult(caseId, run, disconfirmationRun, controlRun, marker);
+      const result = promoteFindingResult(
+        caseId,
+        run,
+        disconfirmationRun,
+        controlRun,
+        marker,
+        livenessMarker,
+      );
       const record = result.record;
       return {
         content: [

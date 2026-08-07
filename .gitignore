@@ -26,4 +26,7 @@ Thumbs.db
 # Editor
 *.swp
 *.swo
-*~
+*~.review-output/
+
+# Subagent review scratch (round-2 findings raw reports)
+.review-output/
