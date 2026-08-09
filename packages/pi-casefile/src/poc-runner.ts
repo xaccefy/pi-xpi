@@ -34,6 +34,12 @@ export type PocRun = {
   rawOutput?: string;
   /** True when `output` was truncated for display (rawOutput has more). */
   truncated?: boolean;
+  /** True iff child output capture was complete. False on maxBuffer/timeouts/spawn failures. */
+  outputComplete?: boolean;
+  /** Harness mode used for this run. */
+  mode?: string;
+  /** Harness target used for this run. */
+  target?: string;
   /**
    * True when the run never started because of harness infrastructure
    * failure (e.g. sandbox image pull failed) — set only by the runner,
@@ -106,8 +112,6 @@ const EXTENSION_MAP: Record<string, string> = {
 };
 
 const OUTPUT_MAX_CHARS = 4000;
-/** Sanitized output is kept whole (for marker checks) up to this size. */
-const RAW_OUTPUT_MAX_CHARS = 4 * 1024 * 1024;
 const TIMEOUT_MS = 30_000;
 /** Completion sentinel echoed after the PoC command inside the sandbox shell. */
 function makeSentinel(): string {
@@ -278,9 +282,16 @@ function sanitizeOutput(output: string): string {
 
 /** Split sanitized output into the raw (whole) and display (sliced) halves. */
 function splitOutput(raw: string): { rawOutput: string; output: string; truncated: boolean } {
-  const rawOutput = raw.slice(0, RAW_OUTPUT_MAX_CHARS);
   const truncated = raw.length > OUTPUT_MAX_CHARS;
-  return { rawOutput, output: raw.slice(0, OUTPUT_MAX_CHARS), truncated };
+  return { rawOutput: raw, output: raw.slice(0, OUTPUT_MAX_CHARS), truncated };
+}
+
+function runProvenance(env?: Record<string, string>): Pick<PocRun, "mode" | "target"> {
+  return { mode: env?.PI_POC_MODE, target: env?.PI_POC_TARGET };
+}
+
+function outputWasComplete(result: { error?: Error; signal: string | null }): boolean {
+  return !result.error && result.signal === null;
 }
 
 /** Reject control characters in harness-supplied PoC env values. */
@@ -427,6 +438,8 @@ function runSandboxed(
         sandbox: true,
         completed: false,
         infraError: true,
+        outputComplete: false,
+        ...runProvenance(env),
       };
     }
     copyFileSync(pocPath, `${workspaceDir}/${sourceName}`);
@@ -463,6 +476,8 @@ function runSandboxed(
       ranAt,
       sandbox: true,
       completed,
+      outputComplete: outputWasComplete(result),
+      ...runProvenance(env),
     };
   } finally {
     // Best-effort: remove any container still running after a timeout/kill.
@@ -521,6 +536,8 @@ function runLocal(pocPath: string, language: PocLanguage, env?: Record<string, s
     ranAt,
     sandbox: false,
     completed,
+    outputComplete: outputWasComplete(result),
+    ...runProvenance(env),
   };
 }
 

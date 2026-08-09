@@ -5,8 +5,8 @@
  * No API key required.
  */
 
-import { Type } from "@sinclair/typebox";
 import { TtlLruCache } from "@xaccefy/pi-shared";
+import { Type } from "typebox";
 
 const DEEPWIKI_MCP_URL = "https://mcp.deepwiki.com/mcp";
 const DEEPWIKI_TOOL = "ask_question";

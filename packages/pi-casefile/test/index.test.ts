@@ -4,7 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { setCasefilePath } from "../src/ledger.ts";
+import { getCaseById, setCasefilePath } from "../src/ledger.ts";
 import { setScratchpadRoot } from "../src/scratchpad.ts";
 import { STATIC_CYBER_WORKFLOW, STATIC_CYBER_WORKFLOW_LITE } from "../src/workflow.ts";
 
@@ -15,6 +15,9 @@ mock.module("@earendil-works/pi-ai", () => ({
 mock.module("typebox", () => ({
   Type: {
     Array: (item: unknown, options?: Record<string, unknown>) => ({ item, ...options }),
+    Boolean: (options?: Record<string, unknown>) => ({ type: "boolean", ...options }),
+    Integer: (options?: Record<string, unknown>) => ({ type: "integer", ...options }),
+    Literal: (value: unknown, options?: Record<string, unknown>) => ({ const: value, ...options }),
     Number: (options?: Record<string, unknown>) => ({ type: "number", ...options }),
     Object: (properties: Record<string, unknown>, options?: Record<string, unknown>) => ({
       type: "object",
@@ -23,6 +26,7 @@ mock.module("typebox", () => ({
     }),
     Optional: (schema: unknown) => schema,
     String: (options?: Record<string, unknown>) => ({ type: "string", ...options }),
+    Union: (items: unknown[], options?: Record<string, unknown>) => ({ anyOf: items, ...options }),
   },
 }));
 
@@ -98,7 +102,40 @@ function createFakePi(): FakePi {
 async function executeTool(pi: FakePi, name: string, params: Record<string, unknown>) {
   const tool = pi.tools.get(name);
   if (!tool) throw new Error(`Tool not registered: ${name}`);
-  return tool.execute("test-call", params, new AbortController().signal, () => undefined, {});
+  const finalParams =
+    name === "PromoteFinding" && params.control_path && !params.control_target
+      ? { control_target: "https://control.example", ...params }
+      : params;
+  try {
+    return await tool.execute(
+      "test-call",
+      finalParams,
+      new AbortController().signal,
+      () => undefined,
+      {},
+    );
+  } catch (error) {
+    if (name !== "PromoteFinding") throw error;
+    const text = (error as Error).message;
+    return {
+      content: [{ type: "text", text }],
+      isError: true,
+      details: {
+        record: typeof finalParams.id === "string" ? getCaseById(finalParams.id) : undefined,
+        missingControl: text.includes("control_path"),
+        missingControlTarget: text.includes("control_target is REQUIRED"),
+        missingLivenessMarker: text.includes("control_liveness_marker is REQUIRED"),
+        livenessEqualsMarker: text.includes("must differ from verification_marker"),
+        missingDisconfirmation: text.includes("disconfirmation_path is REQUIRED"),
+        controlCheated: text.includes("appeared in the control-target run"),
+        controlCrashed: text.includes("control-target script did NOT complete"),
+        controlLivenessMissing:
+          text.includes("control_liveness_marker") && text.includes("NOT found"),
+        disconfirmationCrashed: text.includes("Disconfirmation script did NOT complete"),
+        markerMissing: text.includes("verification marker") && text.includes("NOT found"),
+      },
+    };
+  }
 }
 
 beforeEach(async () => {
@@ -1061,7 +1098,7 @@ describe("casefile extension", () => {
     expect(STATIC_CYBER_WORKFLOW).toContain("Design & Runtime Check");
     expect(STATIC_CYBER_WORKFLOW).toContain("CaseContext");
     expect(STATIC_CYBER_WORKFLOW).not.toContain("CaseReport");
-    expect(STATIC_CYBER_WORKFLOW).toContain('agent: "reporter"');
+    expect(STATIC_CYBER_WORKFLOW).toContain("agent: 'reporter'");
     expect(STATIC_CYBER_WORKFLOW_LITE).toContain("Report style checklist");
     expect(STATIC_CYBER_WORKFLOW_LITE).toContain("CaseContext");
     expect(STATIC_CYBER_WORKFLOW_LITE).not.toContain("CaseReport");

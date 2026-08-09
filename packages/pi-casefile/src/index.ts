@@ -11,7 +11,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 
 import {
   addCaseResult,
@@ -109,6 +109,11 @@ const CommonFields = {
         "Falsification conditions — what would disprove this hypothesis (REQUIRED on CaseAdd)",
     }),
   ),
+  disconfirmation: Type.Optional(
+    Type.String({
+      description: "Documented attempt to disprove the finding before confirmation",
+    }),
+  ),
 };
 
 // ── Tool: CaseAdd ─────────────────────────────────────────────────────
@@ -169,15 +174,18 @@ const PromoteSchema = Type.Object(
       description:
         "Unique string the PoC must print AFTER verifying the exploit worked (data extracted, callback received, payload reflected). The gate checks output contains this marker — exit code 0 alone is NOT sufficient; the marker prevents fluke exit 0 and mocked PoCs. Example: 'VULN_CONFIRMED_<case-id>'. Never print it unconditionally or before the exploit check.",
     }),
-    disconfirmation_path: Type.Optional(
-      Type.String({
-        description:
-          "Absolute path to a disconfirmation script that tries to disprove the finding; must exit non-zero (failure to disprove). REQUIRED for severity high/critical findings.",
-      }),
-    ),
+    disconfirmation_path: Type.String({
+      description:
+        "REQUIRED for EVERY promotion: absolute path to a disconfirmation script that tries to disprove the finding; it must complete and exit non-zero (finding survived disproof).",
+    }),
     control_path: Type.String({
       description:
-        "REQUIRED for EVERY promotion (sandboxed and live alike): absolute path to a control-target script that runs the SAME PoC against a control that lacks the vulnerability (patched replica, second account, baseline endpoint). The harness blocks promotion if the verification_marker appears in the control output — an unconditional-marker/mock PoC cannot pass. Best form: the same parameterized script, branching on the PI_POC_MODE env var (poc | control) the harness sets on every run.",
+        "REQUIRED for EVERY promotion: absolute path to the SAME script as poc_path (sha256-enforced). The harness runs it in control mode against control_target and blocks if verification_marker appears.",
+    }),
+    control_target: Type.String({
+      minLength: 1,
+      description:
+        "REQUIRED for EVERY promotion: target passed to the same PoC in control mode. Must be distinct from the case target and lack the vulnerability (patched replica, second account, baseline endpoint).",
     }),
     control_liveness_marker: Type.String({
       minLength: 1,
@@ -692,16 +700,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
         ) {
           hint = `\n\nHint: A database access error occurred on the casefile SQLite ledger.\nTo troubleshoot:\n  1. Check filesystem read/write permissions for the database path: ${getCasefilePath()}.\n  2. If using a locked folder, you can override the ledger location by setting:\n     export PI_CASEFILE_PATH=/your/writable/directory/casefile.db`;
         }
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `${spec.name} failed: ${message}${hint}`,
-            },
-          ],
-          isError: true,
-          details: { error: message },
-        };
+        throw new Error(`${spec.name} failed: ${message}${hint}`, { cause: err });
       }
     };
     originalRegisterTool(spec);
@@ -1028,15 +1027,15 @@ export default function casefileExtension(pi: ExtensionAPI) {
     name: "PromoteFinding",
     label: "Promote Finding",
     description:
-      "Run an on-disk PoC script (Docker sandbox or host-network sandbox) and, on exit 0 + verification marker present in output, promote an investigating case to confirmed. The verification_marker proves the exploit actually worked — exit code 0 alone is NOT sufficient. EVERY promotion (sandboxed and live alike) REQUIRES: (1) a disconfirmation_path script that must exit non-zero (the finding survived the attempt to disprove it); (2) a control_path that is the SAME script as the PoC (sha256-enforced — a separately written control file is rejected), run in control mode via PI_POC_MODE; (3) a control_liveness_marker the control must print after reaching its target. The harness blocks promotion if the vuln marker appears in the (untruncated) control output, if the liveness marker is absent, or if the control/disconfirmation scripts crash. Host execution is never agent-selectable — local:true uses a host-network Docker sandbox; true host runs need the operator's PI_POC_ALLOW_LOCAL=1.",
+      "Run an on-disk PoC script (Docker sandbox or host-network sandbox) and, on exit 0 + verification marker present in output, promote an investigating case to confirmed. The verification_marker proves the exploit worked — exit code 0 alone is NOT sufficient. EVERY promotion REQUIRES disconfirmation_path, same-script control_path, distinct control_target, and control_liveness_marker. The harness blocks promotion if output capture is incomplete, if the control prints the vuln marker, if liveness is absent, or if control/disconfirmation crash. Host execution is never agent-selectable — local:true uses a host-network Docker sandbox; true host runs need PI_POC_ALLOW_LOCAL=1.",
     promptSnippet: "Run a PoC and promote an investigating case to confirmed",
     promptGuidelines: [
       "Use PromoteFinding when an investigating case has a concrete PoC script on disk and you are ready to prove it.",
       "Prerequisites: status='investigating' and non-empty poc, evidence, impact, severity, target, disconfirmation, plus an artifact-backed EvidenceAdd 'observation' item on the case (the initial signal, with artifact_path) — the PoC gate auto-records the reproduction item.",
       "Default sandbox: docker run --rm --network none. Use local:true for network-dependent bugs (host-network sandbox; host execution needs operator PI_POC_ALLOW_LOCAL=1).",
       "Gate: exit 0 AND verification_marker in the PoC output. The marker (e.g. 'VULN_CONFIRMED_<case-id>') must be printed only AFTER the exploit is verified (data extracted, callback received, payload reflected) — never unconditionally or before the exploit check. The marker check prevents fluke exit 0 (script crashed early) and mocked PoCs (target faked) from passing.",
-      "control_path (REQUIRED for EVERY promotion): the SAME script as poc_path (sha256-equality is ENFORCED — a separately written control file is rejected). One parameterized script — read the target from the PI_POC_TARGET env var and branch on PI_POC_MODE (poc | control) — the control run is literally the same script in control mode against a control lacking the vuln (patched replica, second account, baseline endpoint). The harness blocks promotion if the verification_marker appears in the control run's output (checked on the untruncated output) — an unconditional-marker PoC cannot pass this.",
-      "control_liveness_marker (REQUIRED): a unique string the control script prints only AFTER reaching/exercising the control target (e.g. 'CONTROL_REACHED_<case-id>'). The harness blocks promotion if the control output lacks it — a control pointed at an unreachable host, wrong port, or exiting before the check is NOT a clean verdict.",
+      "control_path (REQUIRED): the SAME script as poc_path (sha256-equality is ENFORCED). The harness runs it with PI_POC_MODE=control and PI_POC_TARGET=control_target. The control must not print the verification marker and must print the liveness marker.",
+      "control_target + control_liveness_marker (REQUIRED): control_target is the distinct baseline target. The liveness marker is printed only AFTER reaching/exercising it; absent liveness blocks promotion.",
       "disconfirmation_path: a script that tries to disprove the finding; if it exits 0, promotion is blocked. REQUIRED for EVERY promotion — the prose disconfirmation field is not enough at any severity (a case filed low/medium must not skip the run and be re-raised afterwards).",
       "Never CaseUpdate status='confirmed' directly — it is rejected. Always use PromoteFinding.",
     ],
@@ -1052,11 +1051,9 @@ export default function casefileExtension(pi: ExtensionAPI) {
 
       // Shared blocked-promotion shape: the case stays investigating and the
       // caller gets the record back for context.
-      const fail = (text: string, extra?: Record<string, unknown>) => ({
-        content: [{ type: "text" as const, text }],
-        isError: true,
-        details: { record: getCaseById(caseId), ...extra },
-      });
+      const fail = (text: string, _extra?: Record<string, unknown>): never => {
+        throw new Error(text);
+      };
 
       // Reject empty/whitespace markers BEFORE any PoC run — it's a param
       // error, so fail cheap instead of burning a (up to 30s) sandboxed run.
@@ -1082,6 +1079,20 @@ export default function casefileExtension(pi: ExtensionAPI) {
             "The harness verifies the verification_marker is absent from the control run's output — that is what " +
             "proves the marker is target-dependent. Write the control script and retry.",
           { missingControl: true },
+        );
+      }
+
+      const controlTarget = (params.control_target as string | undefined)?.trim();
+      if (!controlTarget) {
+        return fail(
+          "control_target is REQUIRED for every promotion: a distinct baseline target that lacks the vulnerability.",
+          { missingControlTarget: true },
+        );
+      }
+      if (controlTarget === current.target) {
+        return fail(
+          "control_target must differ from the case target; a control run against the vulnerable target proves nothing.",
+          { controlTargetEqualsCaseTarget: true },
         );
       }
 
@@ -1143,10 +1154,8 @@ export default function casefileExtension(pi: ExtensionAPI) {
         return fail(
           "CONTROL CHECK FAILED: control_path must be the SAME script as poc_path " +
             "(sha256 mismatch). The control run is only meaningful as the same PoC " +
-            "pointed at a control target via PI_POC_MODE=control — a separately written " +
-            "control file proves nothing (the model writes both files). Parameterize " +
-            "one script: branch on PI_POC_MODE (poc | control) and read the target from " +
-            "PI_POC_TARGET. Case remains investigating.",
+            "pointed at a distinct control_target via PI_POC_MODE=control and PI_POC_TARGET. " +
+            "A separately written control file proves nothing. Case remains investigating.",
           { run: undefined, controlHashMismatch: true },
         );
       }
@@ -1156,13 +1165,14 @@ export default function casefileExtension(pi: ExtensionAPI) {
       // opt-in it uses a Docker sandbox with --network host (same FS/cap/user
       // isolation) and fails closed when Docker is unavailable too. Host
       // execution is never agent-selectable on its own.
-      const runOptions = (pocMode: string): PocRunOptions => ({
+      const runOptions = (pocMode: string, target: string): PocRunOptions => ({
         network: params.local === true ? "host" : "none",
         local: params.local === true,
-        env: { PI_POC_MODE: pocMode, PI_POC_TARGET: current.target ?? "" },
+        env: { PI_POC_MODE: pocMode, PI_POC_TARGET: target },
       });
 
-      const run = runPoc(pocPath, runOptions("poc"));
+      const caseTarget = current.target ?? "";
+      const run = runPoc(pocPath, runOptions("poc", caseTarget));
 
       // Fail closed without throwing: non-zero PoC must leave the case investigating.
       if (run.exitCode !== 0) {
@@ -1174,9 +1184,9 @@ export default function casefileExtension(pi: ExtensionAPI) {
 
       // Defense-in-depth: exit 0 implies the run completed (sandbox wrapper /
       // local spawn semantics), but never trust a run the runner says crashed.
-      if (!run.completed) {
+      if (!run.completed || !run.outputComplete) {
         return fail(
-          `PoC did NOT complete (spawn error, killed, or timeout). Case remains investigating.\nOutput:\n${run.output}`,
+          `PoC did NOT complete or output capture was incomplete. Case remains investigating.\nOutput:\n${run.output}`,
           { run, pocCrashed: true },
         );
       }
@@ -1199,8 +1209,8 @@ export default function casefileExtension(pi: ExtensionAPI) {
       // Run disconfirmation script — must exit NON-0 (finding survived the attempt to disprove).
       let disconfirmationRun: PocRun | undefined;
       if (disconfirmationPath) {
-        disconfirmationRun = runPoc(disconfirmationPath, runOptions("disconfirmation"));
-        if (!disconfirmationRun.completed) {
+        disconfirmationRun = runPoc(disconfirmationPath, runOptions("disconfirmation", caseTarget));
+        if (!disconfirmationRun.completed || !disconfirmationRun.outputComplete) {
           return fail(
             `Disconfirmation script did NOT complete (spawn error, killed, or timeout — no completion marker). ` +
               `A crash is not a survived disproof: fix the disconfirmation script and retry.\n` +
@@ -1223,8 +1233,8 @@ export default function casefileExtension(pi: ExtensionAPI) {
       // deterministic — the model cannot pass it by asserting success. The
       // liveness-marker check closes the "control pointed at an unreachable
       // host / exited early" hole: the control must prove it reached its target.
-      const controlRun = runPoc(controlPath, runOptions("control"));
-      if (!controlRun.completed) {
+      const controlRun = runPoc(controlPath, runOptions("control", controlTarget));
+      if (!controlRun.completed || !controlRun.outputComplete) {
         return fail(
           `CONTROL CHECK FAILED: the control-target script did NOT complete (spawn error, killed, or timeout). ` +
             `A control run that never executed proves nothing about the marker — fix the control script and retry.\n` +
@@ -1660,9 +1670,9 @@ export default function casefileExtension(pi: ExtensionAPI) {
           : result.verdict === "repair"
             ? `REPAIR (attempt ${result.repair_attempt}/2) — fix these and re-submit:\n  - ${result.errors.join("\n  - ")}`
             : `REJECTED — ${result.errors.join("\n")}`;
+      if (result.verdict !== "accepted") throw new Error(statusLine);
       return {
         content: [{ type: "text", text: statusLine }],
-        isError: result.verdict !== "accepted",
         details: result as unknown as Record<string, unknown>,
       };
     },

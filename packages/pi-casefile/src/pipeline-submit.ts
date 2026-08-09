@@ -18,7 +18,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { getRunDir, getScratchpadRoot, scratchpad_write } from "./scratchpad.ts";
 
@@ -204,19 +204,43 @@ function statePath(runId: string): string {
 function readState(runId: string): SubmitState {
   const p = statePath(runId);
   if (!existsSync(p)) return { repairs: {}, accepted_findings: [] };
-  try {
-    const raw = JSON.parse(readFileSync(p, "utf8")) as Partial<SubmitState>;
-    return {
-      repairs: raw.repairs ?? {},
-      accepted_findings: raw.accepted_findings ?? [],
-    };
-  } catch {
-    return { repairs: {}, accepted_findings: [] };
+  const raw = JSON.parse(readFileSync(p, "utf8")) as Partial<SubmitState>;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error(`Corrupt pipeline-submit state for ${runId}: root must be an object`);
   }
+  const repairs = raw.repairs ?? {};
+  if (typeof repairs !== "object" || repairs === null || Array.isArray(repairs)) {
+    throw new Error(`Corrupt pipeline-submit state for ${runId}: repairs must be an object`);
+  }
+  for (const [k, v] of Object.entries(repairs)) {
+    if (typeof k !== "string" || typeof v !== "number" || !Number.isInteger(v) || v < 0) {
+      throw new Error(`Corrupt pipeline-submit state for ${runId}: invalid repair counter`);
+    }
+  }
+  const accepted = raw.accepted_findings ?? [];
+  if (!Array.isArray(accepted)) {
+    throw new Error(
+      `Corrupt pipeline-submit state for ${runId}: accepted_findings must be an array`,
+    );
+  }
+  for (const [i, item] of accepted.entries()) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      throw new Error(
+        `Corrupt pipeline-submit state for ${runId}: accepted_findings[${i}] invalid`,
+      );
+    }
+  }
+  return {
+    repairs: repairs as Record<string, number>,
+    accepted_findings: accepted as FindingRef[],
+  };
 }
 
 function writeState(runId: string, state: SubmitState): void {
-  writeFileSync(statePath(runId), JSON.stringify(state, null, 2), "utf8");
+  const p = statePath(runId);
+  const tmp = `${p}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, JSON.stringify(state, null, 2), "utf8");
+  renameSync(tmp, p);
 }
 
 /** Project root containing the scratchpad (file-existence checks resolve here). */
@@ -270,6 +294,109 @@ function submissionKey(stage: SubmitStage, obj: Record<string, unknown>): string
 
 function isNonEmptyString(v: unknown): v is string {
   return typeof v === "string" && v.trim().length > 0;
+}
+
+function requireStringArray(errors: string[], path: string, value: unknown, minItems = 0): void {
+  if (!Array.isArray(value)) {
+    errors.push(`${path}: missing or not an array`);
+    return;
+  }
+  if (value.length < minItems) errors.push(`${path}: needs at least ${minItems} item(s)`);
+  value.forEach((item, i) => {
+    if (!isNonEmptyString(item)) errors.push(`${path}[${i}]: missing or empty string`);
+  });
+}
+
+function asObject(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function validateReport(errors: string[], obj: Record<string, unknown>): void {
+  const findingSeverities = ["info", "low", "medium", "high", "critical"];
+  if (Array.isArray(obj.findings)) {
+    obj.findings.forEach((item, i) => {
+      const finding = asObject(item);
+      if (!finding) {
+        errors.push(`findings[${i}]: not an object`);
+        return;
+      }
+      for (const field of ["id", "vuln_class", "severity", "status"] as const) {
+        if (!isNonEmptyString(finding[field]))
+          errors.push(`findings[${i}].${field}: missing or empty`);
+      }
+      if (!isNonEmptyString(finding.file) && !isNonEmptyString(finding.endpoint)) {
+        errors.push(`findings[${i}]: provide file or endpoint`);
+      }
+      if (isNonEmptyString(finding.severity) && !findingSeverities.includes(finding.severity)) {
+        errors.push(`findings[${i}].severity: invalid value`);
+      }
+      if (isNonEmptyString(finding.status) && !["confirmed", "reported"].includes(finding.status)) {
+        errors.push(`findings[${i}].status: invalid value`);
+      }
+      if (finding.chain_with !== undefined)
+        requireStringArray(errors, `findings[${i}].chain_with`, finding.chain_with);
+    });
+  }
+
+  const coverage = asObject(obj.coverage);
+  if (coverage) {
+    const allowed = ["COVERED", "SKIPPED", "NOT_FOUND", "INCOMPLETE"];
+    for (const [key, value] of Object.entries(coverage)) {
+      if (!/^[a-z-]+$/.test(key)) errors.push(`coverage.${key}: invalid class key`);
+      if (typeof value !== "string" || !allowed.includes(value)) {
+        errors.push(`coverage.${key}: must be one of { ${allowed.join(" | ")} }`);
+      }
+    }
+  }
+
+  if (obj.chains !== undefined) {
+    if (!Array.isArray(obj.chains)) {
+      errors.push("chains: not an array");
+    } else {
+      obj.chains.forEach((item, i) => {
+        const chain = asObject(item);
+        if (!chain) {
+          errors.push(`chains[${i}]: not an object`);
+          return;
+        }
+        if (chain.title !== undefined && !isNonEmptyString(chain.title))
+          errors.push(`chains[${i}].title: missing or empty`);
+        if (chain.steps !== undefined)
+          requireStringArray(errors, `chains[${i}].steps`, chain.steps);
+        if (
+          chain.severity !== undefined &&
+          (!isNonEmptyString(chain.severity) ||
+            !(CHAIN_SEVERITIES as readonly string[]).includes(chain.severity))
+        ) {
+          errors.push(`chains[${i}].severity: invalid value`);
+        }
+        if (chain.blocked_by_controls !== undefined) {
+          requireStringArray(errors, `chains[${i}].blocked_by_controls`, chain.blocked_by_controls);
+        }
+      });
+    }
+  }
+
+  if (obj.patches_applied !== undefined) {
+    if (!Array.isArray(obj.patches_applied)) {
+      errors.push("patches_applied: not an array");
+    } else {
+      obj.patches_applied.forEach((item, i) => {
+        const patch = asObject(item);
+        if (!patch) {
+          errors.push(`patches_applied[${i}]: not an object`);
+          return;
+        }
+        for (const field of ["finding_id", "diff_summary", "re_attack_result"] as const) {
+          if (patch[field] !== undefined && !isNonEmptyString(patch[field])) {
+            errors.push(`patches_applied[${i}].${field}: missing or empty`);
+          }
+        }
+      });
+    }
+  }
 }
 
 function validateStage(stage: SubmitStage, obj: Record<string, unknown>): string[] {
@@ -334,10 +461,78 @@ function validateStage(stage: SubmitStage, obj: Record<string, unknown>): string
     }
   }
 
-  // Chain items have their own inner contract (≥2 steps, severity enum).
+  if (stage === "trace") {
+    requireStringArray(errors, "call_chain", obj.call_chain, 1);
+    if (Array.isArray(obj.defenses_checked)) {
+      obj.defenses_checked.forEach((item, i) => {
+        const defense = asObject(item);
+        if (!defense) {
+          errors.push(`defenses_checked[${i}]: not an object`);
+          return;
+        }
+        if (!isNonEmptyString(defense.defense))
+          errors.push(`defenses_checked[${i}].defense: missing or empty`);
+        if (!isNonEmptyString(defense.location))
+          errors.push(`defenses_checked[${i}].location: missing or empty`);
+        if (
+          !isNonEmptyString(defense.verdict) ||
+          !["bypassed", "blocked", "not-present"].includes(defense.verdict)
+        ) {
+          errors.push(`defenses_checked[${i}].verdict: must be bypassed, blocked, or not-present`);
+        }
+      });
+    }
+  }
+
+  if (stage === "skeptic") {
+    requireStringArray(errors, "evidence_reviewed", obj.evidence_reviewed, 1);
+    if (obj.verdict === "DISPROVEN" && isNonEmptyString(obj.disproval_reason)) {
+      const allowed = [
+        "unreachable",
+        "framework_protection",
+        "input_validation_blocks",
+        "requires_privilege_attacker_lacks",
+        "intended_behavior",
+        "overstated_impact",
+        "duplicate",
+        "test_artifact",
+        "out_of_scope",
+      ];
+      if (!allowed.includes(obj.disproval_reason)) errors.push("disproval_reason: invalid value");
+    }
+  }
+
+  if (stage === "validate") {
+    if (obj.status === "killed" && isNonEmptyString(obj.kill_reason)) {
+      const allowed = [
+        "unreachable",
+        "framework_protection",
+        "input_validation_blocks",
+        "requires_privilege_attacker_lacks",
+        "poc_failed_3x",
+        "no_real_impact",
+        "intended_behavior",
+        "duplicate",
+      ];
+      if (!allowed.includes(obj.kill_reason)) errors.push("kill_reason: invalid value");
+    }
+    if (
+      obj.refinement_attempts !== undefined &&
+      (!Number.isInteger(obj.refinement_attempts) ||
+        (obj.refinement_attempts as number) < 1 ||
+        (obj.refinement_attempts as number) > 3)
+    ) {
+      errors.push("refinement_attempts: must be an integer from 1 to 3");
+    }
+  }
+
   if (stage === "chain" && Array.isArray(obj.chains)) {
     obj.chains.forEach((c, i) => {
-      const chain = c as Record<string, unknown>;
+      const chain = asObject(c);
+      if (!chain) {
+        errors.push(`chains[${i}]: not an object`);
+        return;
+      }
       if (!isNonEmptyString(chain.title)) errors.push(`chains[${i}].title: missing or empty`);
       if (
         !isNonEmptyString(chain.severity) ||
@@ -345,13 +540,16 @@ function validateStage(stage: SubmitStage, obj: Record<string, unknown>): string
       ) {
         errors.push(`chains[${i}].severity: must be one of { ${CHAIN_SEVERITIES.join(" | ")} }`);
       }
-      if (!Array.isArray(chain.steps) || chain.steps.length < 2) {
-        errors.push(`chains[${i}].steps: needs at least 2 case IDs`);
+      requireStringArray(errors, `chains[${i}].steps`, chain.steps, 2);
+      if (chain.blocked_by_controls !== undefined) {
+        requireStringArray(errors, `chains[${i}].blocked_by_controls`, chain.blocked_by_controls);
       }
       if (!isNonEmptyString(chain.narrative))
         errors.push(`chains[${i}].narrative: missing or empty`);
     });
   }
+
+  if (stage === "report") validateReport(errors, obj);
 
   return errors;
 }

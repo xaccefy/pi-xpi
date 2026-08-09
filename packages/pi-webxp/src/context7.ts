@@ -6,8 +6,8 @@
  * Step 2: fetch docs via /{id}?type=txt&tokens=...&topic=...
  */
 
-import { Type } from "@sinclair/typebox";
 import { TtlLruCache } from "@xaccefy/pi-shared";
+import { Type } from "typebox";
 
 const CONTEXT7_API = "https://context7.com/api";
 const STEP_TIMEOUT_MS = 20_000;

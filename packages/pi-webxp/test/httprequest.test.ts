@@ -73,6 +73,22 @@ describe("pi-webxp: http_request", () => {
         } as unknown as Response;
       }
 
+      if (urlStr.includes("/redirect-private")) {
+        return {
+          ok: true,
+          status: 302,
+          statusText: "Found",
+          url: urlStr,
+          headers: {
+            entries: () => [["location", "http://127.0.0.1/admin"]] as [string, string][],
+            get: (name: string) => (name === "location" ? "http://127.0.0.1/admin" : null),
+            getSetCookie: () => [],
+          },
+          text: async () => "",
+          body: null,
+        } as unknown as Response;
+      }
+
       if (urlStr.includes("/redirect")) {
         return {
           ok: true,
@@ -179,7 +195,7 @@ describe("pi-webxp: http_request", () => {
       () => {},
       {},
     );
-    assert.equal(result.isError, false);
+    assert.ok(!("isError" in result));
     const details = result.details as { status: number; body: string };
     assert.equal(details.status, 200);
     assert.equal(details.body, "OK");
@@ -204,7 +220,7 @@ describe("pi-webxp: http_request", () => {
       () => {},
       {},
     );
-    assert.equal((loginResult as any).isError, false);
+    assert.ok(!("isError" in (loginResult as any)));
 
     // Step 2: GET protected — cookie should be injected automatically
     const protectedResult = await tool.execute(
@@ -214,7 +230,7 @@ describe("pi-webxp: http_request", () => {
       () => {},
       {},
     );
-    assert.equal((protectedResult as any).isError, false);
+    assert.ok(!("isError" in (protectedResult as any)));
     const protectedDetails = (protectedResult as any).details;
     assert.equal(protectedDetails.status, 200);
     assert.ok(protectedDetails.cookiesOnHost.includes("session=abc123"));
@@ -241,7 +257,7 @@ describe("pi-webxp: http_request", () => {
       () => {},
       {},
     );
-    assert.equal((result as any).isError, false);
+    assert.ok(!("isError" in (result as any)));
     const cookiesOnHost = (result as any).details.cookiesOnHost;
     assert.ok(
       !cookiesOnHost.includes("session="),
@@ -308,7 +324,7 @@ describe("pi-webxp: http_request", () => {
     );
     const text = (second as any).content[0].text;
     // The request transcript should have a Cookie header
-    assert.ok(text.includes("> cookie:"), "Cookie header injected into request transcript");
+    assert.ok(text.includes("> Cookie:"), "Cookie header injected into request transcript");
   });
 
   // ── redirect manual ─────────────────────────────────────
@@ -329,20 +345,29 @@ describe("pi-webxp: http_request", () => {
 
   // ── redirect follow ─────────────────────────────────────
 
+  it("blocks private/internal redirect hops by default", async () => {
+    const tool = api.tools.find((t) => t.name === "http_request")!;
+    await assert.rejects(
+      () =>
+        tool.execute(
+          "call-1",
+          { url: "https://example.com/redirect-private", redirect: "follow" },
+          null,
+          () => {},
+          {},
+        ),
+      /private\/internal host/,
+    );
+  });
+
   // ── SSRF block ──────────────────────────────────────────
 
   it("blocks private/internal hosts by default", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
-    const result = await tool.execute(
-      "call-1",
-      { url: "http://127.0.0.1:8080/admin" },
-      null,
-      () => {},
-      {},
+    await assert.rejects(
+      () => tool.execute("call-1", { url: "http://127.0.0.1:8080/admin" }, null, () => {}, {}),
+      /private\/internal host/,
     );
-    assert.equal((result as any).isError, true);
-    assert.ok((result as any).content[0].text.includes("Blocked"), "Response mentions the block");
-    assert.equal((result as any).details.error, "ssrf_blocked");
   });
 
   it("allows private hosts when allowPrivateHosts=true", async () => {
@@ -355,22 +380,17 @@ describe("pi-webxp: http_request", () => {
       {},
     );
     // fetch was mocked to return "OK" for unknown URLs, so this should succeed
-    assert.equal((result as any).isError, false, "Request allowed with allowPrivateHosts=true");
+    assert.ok(!("isError" in (result as any)), "Request allowed with allowPrivateHosts=true");
   });
 
   // ── protocol gate ───────────────────────────────────────
 
   it("rejects non-http(s) URLs", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
-    const result = await tool.execute(
-      "call-1",
-      { url: "ftp://example.com/file" },
-      null,
-      () => {},
-      {},
+    await assert.rejects(
+      () => tool.execute("call-1", { url: "ftp://example.com/file" }, null, () => {}, {}),
+      /not allowed/,
     );
-    assert.equal((result as any).isError, true);
-    assert.ok((result as any).content[0].text.includes("not allowed"));
   });
 
   // ── body truncation ─────────────────────────────────────
@@ -445,7 +465,7 @@ describe("pi-webxp: http_request", () => {
 
   // ── case-variant header handling ────────────────────────
 
-  it("merges jar cookies into a caller's capitalized Cookie header (no duplicate key)", async () => {
+  it("treats a caller's capitalized Cookie header as authoritative", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
     // Seed the jar.
     await tool.execute("call-1", { url: "https://example.com/login" }, null, () => {}, {});
@@ -469,7 +489,7 @@ describe("pi-webxp: http_request", () => {
     );
     globalThis.fetch = prevFetch;
 
-    assert.ok(!(result as any).isError, "request succeeded");
+    assert.ok(!("isError" in (result as any)), "request succeeded");
     // Exactly one cookie header key, whatever its case.
     const cookieKeys = Object.keys(sentHeaders).filter((k) => k.toLowerCase() === "cookie");
     assert.strictEqual(
@@ -478,7 +498,10 @@ describe("pi-webxp: http_request", () => {
       `one cookie header, got keys: ${Object.keys(sentHeaders)}`,
     );
     const value = sentHeaders[cookieKeys[0]];
-    assert.ok(value.includes("session=abc123"), "jar cookie merged in");
+    assert.ok(
+      !value.includes("session=abc123"),
+      "caller Cookie overrides jar on the first request",
+    );
     assert.ok(value.includes("user_pref=dark"), "caller cookie preserved");
   });
 
@@ -517,9 +540,8 @@ describe("pi-webxp: http_request", () => {
 
   // ── TLS bypass ──────────────────────────────────────────
 
-  it("verifyTls=false does not silently re-verify (Bun: tls option set; Node w/o undici: loud error)", async () => {
+  it("verifyTls=false wires the TLS bypass on the real request path", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
-    const isBun = typeof (globalThis as any).Bun !== "undefined";
 
     let sentInit: (RequestInit & { tls?: unknown; dispatcher?: unknown }) | undefined;
     const prevFetch = globalThis.fetch;
@@ -528,7 +550,7 @@ describe("pi-webxp: http_request", () => {
       return prevFetch(url as string, init);
     }) as typeof fetch;
 
-    const result = await tool.execute(
+    await tool.execute(
       "call-1",
       { url: "https://example.com/api", verifyTls: false },
       null,
@@ -537,15 +559,24 @@ describe("pi-webxp: http_request", () => {
     );
     globalThis.fetch = prevFetch;
 
-    if (isBun) {
-      assert.ok(!(result as any).isError, "request succeeded");
-      assert.deepStrictEqual(sentInit?.tls, { rejectUnauthorized: false });
-    } else if (!(result as any).isError) {
-      assert.ok(sentInit && "dispatcher" in sentInit, "undici dispatcher attached");
-    } else {
-      // No undici available: must fail loudly, not silently verify.
-      const text = (result as any).content[0].text;
-      assert.ok(text.includes("TLS bypass is unavailable"), "loud failure message");
-    }
+    // Bun's fetch ignores the dispatcher, so the bypass must ride the `tls`
+    // init option — assert it is actually set when verifyTls:false.
+    const bunTls = (sentInit as any)?.tls;
+    assert.ok(
+      bunTls && bunTls.rejectUnauthorized === false,
+      `tls bypass missing on request init: ${JSON.stringify(sentInit)}`,
+    );
+    // Node path: the guarded dispatcher must ALSO carry rejectUnauthorized:false.
+    assert.ok(sentInit && "dispatcher" in sentInit, "guarded dispatcher attached (Node path)");
+
+    // Default (verifyTls unset) must NOT set the tls bypass.
+    sentInit = undefined;
+    globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
+      sentInit = init;
+      return prevFetch(url as string, init);
+    }) as typeof fetch;
+    await tool.execute("call-2", { url: "https://example.com/api" }, null, () => {}, {});
+    globalThis.fetch = prevFetch;
+    assert.strictEqual((sentInit as any)?.tls, undefined, "no TLS bypass by default");
   });
 });

@@ -44,13 +44,7 @@ export default function piWebxp(pi: ExtensionAPI) {
         try {
           return await tool.execute(_id, params as Record<string, unknown>, signal);
         } catch (error) {
-          return {
-            content: [
-              { type: "text" as const, text: `${tool.label} error: ${(error as Error).message}` },
-            ],
-            isError: true,
-            details: {},
-          };
+          throw new Error(`${tool.label} error: ${(error as Error).message}`, { cause: error });
         }
       },
 
@@ -63,8 +57,8 @@ export default function piWebxp(pi: ExtensionAPI) {
         );
       },
 
-      renderResult(result, _options, theme) {
-        if ((result as { isError?: boolean }).isError) {
+      renderResult(result, _options, theme, context) {
+        if (context.isError) {
           return new Text(theme.fg("error", `✗ ${tool.label} failed`), 0, 0);
         }
         const details = result.details as Record<string, string> | undefined;

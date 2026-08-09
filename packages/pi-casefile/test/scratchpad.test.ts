@@ -1,5 +1,12 @@
 import assert from "node:assert";
-import { existsSync, mkdtempSync, readdirSync, readFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +22,7 @@ import {
   scratchpad_phase_done,
   scratchpad_read,
   scratchpad_resume,
+  scratchpad_runs,
   scratchpad_write,
   setScratchpadRoot,
 } from "../src/scratchpad.ts";
@@ -97,9 +105,10 @@ describe("scratchpad", () => {
     for (const id of [".", "..", "..."]) {
       assert.throws(() => scratchpad_init(id), /Invalid run_id/);
     }
-    // But separators elsewhere sanitize into a normal safe dir name.
+    // But separators elsewhere sanitize into a unique safe dir name.
     scratchpad_init("https://target.example.com/api");
-    assert.ok(existsSync(join(tempDir, ".scratchpad", "https___target.example.com_api")));
+    const dirs = readdirSync(join(tempDir, ".scratchpad"));
+    assert.ok(dirs.some((d) => d.startsWith("https___target.example.com_api-")));
   });
 
   it("rejects dot-only artifact names on write and read (no EISDIR escape)", () => {
@@ -199,6 +208,32 @@ describe("scratchpad", () => {
     }
     const resume = scratchpad_resume("run-1")!;
     assert.strictEqual(resume.next_phase, null);
+  });
+
+  it("scratchpad_runs surfaces pre-hash-suffix (legacy) run directories", () => {
+    // Runs created before the hash-suffix naming used sanitizeName(runId) as
+    // the directory (e.g. "a/b" → "a_b"). They must still be discoverable
+    // even though getRunDir now returns "a_b-<hash>".
+    scratchpad_init("run-1");
+    const legacyDir = join(getScratchpadRoot(tempDir), "a_b");
+    mkdirSync(legacyDir, { recursive: true });
+    writeFileSync(
+      join(legacyDir, "state.json"),
+      JSON.stringify({
+        run_id: "a/b",
+        project_root: tempDir,
+        created_at: "2025-01-01T00:00:00.000Z",
+        last_updated: "2025-01-01T00:00:00.000Z",
+        last_phase_at: null,
+        completed_phases: ["recon"],
+        phase_ids: {},
+        phase_summaries: {},
+      }),
+      "utf8",
+    );
+    const runs = scratchpad_runs(tempDir);
+    assert.ok(runs.includes("a/b"), `legacy run missing from discovery: ${runs}`);
+    assert.ok(runs.includes("run-1"), "new-style run still discovered");
   });
 
   it("clear removes a single run without touching others", () => {

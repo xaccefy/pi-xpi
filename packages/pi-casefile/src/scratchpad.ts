@@ -24,7 +24,16 @@
  * `--fresh` clears it via scratchpad_clear().
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -152,9 +161,21 @@ function sanitizeName(name: string, label: string): string {
   return safe;
 }
 
+function runDirName(runId: string): string {
+  const safe = sanitizeName(runId, "run_id");
+  if (safe === runId) return safe;
+  const suffix = createHash("sha256").update(runId).digest("hex").slice(0, 12);
+  return `${safe.slice(0, 80)}-${suffix}`;
+}
+
+/** Pre-hash-suffix naming used by older scratchpad versions (sanitize only). */
+function legacyRunDirName(runId: string): string {
+  return sanitizeName(runId, "run_id");
+}
+
 /** The directory for a specific run. */
 export function getRunDir(runId: string, projectRoot?: string): string {
-  return join(getScratchpadRoot(projectRoot), sanitizeName(runId, "run_id"));
+  return join(getScratchpadRoot(projectRoot), runDirName(runId));
 }
 
 /** The state.json path for a run. */
@@ -187,23 +208,42 @@ function ensureRunDirs(runDir: string): void {
 function readCheckpointRaw(runId: string, projectRoot?: string): ScratchpadCheckpoint | null {
   const statePath = getStatePath(runId, projectRoot);
   if (!existsSync(statePath)) return null;
-  try {
-    const raw = readFileSync(statePath, "utf8");
-    const cp = JSON.parse(raw) as ScratchpadCheckpoint;
-    // Backfill maps for phases not yet checkpointed (defensive).
-    if (!cp.phase_ids) cp.phase_ids = {} as Record<ScratchpadPhase, string[]>;
-    if (!cp.phase_summaries) cp.phase_summaries = {} as Record<ScratchpadPhase, string>;
-    return cp;
-  } catch {
-    return null;
+  const raw = readFileSync(statePath, "utf8");
+  const cp = JSON.parse(raw) as ScratchpadCheckpoint;
+  if (typeof cp !== "object" || cp === null || Array.isArray(cp)) {
+    throw new Error(`Corrupt scratchpad state for ${runId}: root must be an object`);
   }
+  if (cp.run_id !== runId) {
+    throw new Error(`Corrupt scratchpad state for ${runId}: state belongs to ${cp.run_id}`);
+  }
+  if (!Array.isArray(cp.completed_phases)) {
+    throw new Error(`Corrupt scratchpad state for ${runId}: completed_phases must be an array`);
+  }
+  for (const phase of cp.completed_phases) {
+    if (!PHASE_ORDER.includes(phase)) {
+      throw new Error(`Corrupt scratchpad state for ${runId}: invalid phase ${phase}`);
+    }
+  }
+  if (!cp.phase_ids || typeof cp.phase_ids !== "object" || Array.isArray(cp.phase_ids)) {
+    cp.phase_ids = {} as Record<ScratchpadPhase, string[]>;
+  }
+  if (
+    !cp.phase_summaries ||
+    typeof cp.phase_summaries !== "object" ||
+    Array.isArray(cp.phase_summaries)
+  ) {
+    cp.phase_summaries = {} as Record<ScratchpadPhase, string>;
+  }
+  return cp;
 }
 
 function writeCheckpointRaw(cp: ScratchpadCheckpoint, projectRoot?: string): void {
   cp.last_updated = new Date().toISOString();
   const statePath = getStatePath(cp.run_id, projectRoot);
   ensureRunDirs(getRunDir(cp.run_id, projectRoot));
-  writeFileSync(statePath, JSON.stringify(cp, null, 2), "utf8");
+  const tmp = `${statePath}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, JSON.stringify(cp, null, 2), "utf8");
+  renameSync(tmp, statePath);
 }
 
 // ── Public API ───────────────────────────────────────────────────────
@@ -268,6 +308,32 @@ export function scratchpad_read(
 /**
  * List all artifacts written for a phase.
  */
+export function scratchpad_runs(projectRoot?: string): string[] {
+  const root = getScratchpadRoot(projectRoot);
+  if (!existsSync(root)) return [];
+  const out: string[] = [];
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const state = join(root, entry.name, "state.json");
+    if (!existsSync(state)) continue;
+    try {
+      const cp = JSON.parse(readFileSync(state, "utf8")) as { run_id?: unknown };
+      if (typeof cp.run_id !== "string") continue;
+      if (getRunDir(cp.run_id, projectRoot) === join(root, entry.name)) {
+        out.push(cp.run_id);
+      } else if (join(root, legacyRunDirName(cp.run_id)) === join(root, entry.name)) {
+        // Runs created before the hash-suffix naming used sanitizeName(runId)
+        // as the directory; keep surfacing them in bundle discovery. Safe ids
+        // were never suffixed, so only legacy unsafe ids can land here.
+        out.push(cp.run_id);
+      }
+    } catch {
+      // Corrupt runs are ignored during report bundle discovery; direct resume still fails closed.
+    }
+  }
+  return out;
+}
+
 export function scratchpad_list(
   runId: string,
   phase: ScratchpadPhase,

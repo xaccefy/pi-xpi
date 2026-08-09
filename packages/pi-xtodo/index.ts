@@ -15,7 +15,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { DynamicBorder, type ExtensionAPI, keyText } from "@earendil-works/pi-coding-agent";
 import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { Type } from "@sinclair/typebox";
+import { Type } from "typebox";
 
 // ---------------------------------------------------------------------------
 // Identity
@@ -660,11 +660,10 @@ export default function registerTodo(pi: ExtensionAPI) {
       const action = params.action as TaskAction;
       const state = getSessionState(sessionId);
       const result = applyMutation(state, action, params);
-      if (!result.error) {
-        setSessionState(sessionId, result.state);
-        saveState(sessionId, result.state);
-        refreshWidget(ctx, sessionId);
-      }
+      if (result.error) throw new Error(result.error);
+      setSessionState(sessionId, result.state);
+      saveState(sessionId, result.state);
+      refreshWidget(ctx, sessionId);
       return {
         content: [{ type: "text", text: result.text }],
         details: {
@@ -672,15 +671,13 @@ export default function registerTodo(pi: ExtensionAPI) {
           params,
           tasks: result.state.tasks,
           nextId: result.state.nextId,
-          error: result.error,
         } satisfies TaskDetails,
-        isError: !!result.error,
       };
     },
-    renderResult: (result: any, options: any, theme: any) => {
+    renderResult: (result: any, options: any, theme: any, context: any) => {
       const d = result.details as TaskDetails | undefined;
       const text: string = result.content?.[0]?.text ?? "";
-      if (d?.error) {
+      if (context?.isError) {
         return new Text(`${theme.fg("error", "✗")} ${theme.fg("error", text)}`, 0, 0);
       }
       const glyph = d ? ACTION_GLYPH[d.action] : "•";

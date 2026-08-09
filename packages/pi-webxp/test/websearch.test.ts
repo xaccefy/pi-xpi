@@ -173,70 +173,59 @@ describe("pi-webxp: web_search/web_fetch", () => {
     assert.strictEqual(result.details.results[0].title, "Retry OK");
   });
 
-  it("web_fetch SPA fallback uses chromium when static shell is thin", async () => {
-    const { mkdtempSync, writeFileSync, chmodSync, rmSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
-    const { __resetChromiumPathCacheForTests } = await import("../src/websearch.ts");
-
-    const dir = mkdtempSync(join(tmpdir(), "xpi-fake-chrome-"));
-    const fakeChrome = join(dir, "chromium");
-    // Fake chromium: ignore flags, print a rendered SPA DOM on stdout.
-    writeFileSync(
-      fakeChrome,
-      `#!/bin/sh\ncat <<'HTML'\n<html><body><main><h1>Rendered SPA</h1><p>Body content from browser pass with enough text to prefer over shell.</p></main></body></html>\nHTML\n`,
+  it("web_fetch blocks private/internal hosts (SSRF guard)", async () => {
+    const pi = new MockExtensionAPI();
+    piWebxp(pi as any);
+    const fetchTool = pi.tools.find((t) => t.name === "web_fetch");
+    await assert.rejects(
+      () => fetchTool.execute("c1", { url: "http://127.0.0.1:8080/admin" }, null, null, null),
+      /private\/internal host/,
     );
-    chmodSync(fakeChrome, 0o755);
+    await assert.rejects(
+      () => fetchTool.execute("c2", { url: "http://[::ffff:10.0.0.1]/x" }, null, null, null),
+      /private\/internal host/,
+    );
+  });
 
-    const prevChrome = process.env.PI_CHROMIUM_PATH;
-    process.env.PI_CHROMIUM_PATH = fakeChrome;
-    __resetChromiumPathCacheForTests();
+  it("web_fetch keeps thin SPA shells inside the daemon result", async () => {
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const urlStr = url.toString();
+      if (urlStr.endsWith("/health")) {
+        return {
+          ok: true,
+          json: async () => ({ status: "ok", data: { daemon: "running" } }),
+        } as Response;
+      }
+      if (urlStr.endsWith("/fetch-web")) {
+        return {
+          ok: true,
+          json: async () => ({
+            status: "ok",
+            data: {
+              contentType: "text/html; charset=utf-8",
+              retrievalMethod: "request",
+              content: "Loading...",
+            },
+          }),
+        } as Response;
+      }
+      return { ok: false, status: 404 } as Response;
+    }) as any;
 
-    try {
-      globalThis.fetch = (async (url: string | URL | Request) => {
-        const urlStr = url.toString();
-        if (urlStr.endsWith("/health")) {
-          return {
-            ok: true,
-            json: async () => ({ status: "ok", data: { daemon: "running" } }),
-          } as Response;
-        }
-        if (urlStr.endsWith("/fetch-web")) {
-          return {
-            ok: true,
-            json: async () => ({
-              status: "ok",
-              data: {
-                contentType: "text/html; charset=utf-8",
-                retrievalMethod: "request",
-                content: "Loading...",
-              },
-            }),
-          } as Response;
-        }
-        return { ok: false, status: 404 } as Response;
-      }) as any;
+    const pi = new MockExtensionAPI();
+    piWebxp(pi as any);
+    const fetchTool = pi.tools.find((t) => t.name === "web_fetch");
+    assert.ok(fetchTool);
 
-      const pi = new MockExtensionAPI();
-      piWebxp(pi as any);
-      const fetchTool = pi.tools.find((t) => t.name === "web_fetch");
-      assert.ok(fetchTool);
-
-      const result = await fetchTool.execute(
-        "call-spa",
-        { url: "https://example.com/app" },
-        null,
-        null,
-        null,
-      );
-      assert.ok(result.content[0].text.includes("Rendered SPA"));
-      assert.strictEqual(result.details.renderedBy, "chromium");
-    } finally {
-      if (prevChrome === undefined) delete process.env.PI_CHROMIUM_PATH;
-      else process.env.PI_CHROMIUM_PATH = prevChrome;
-      __resetChromiumPathCacheForTests();
-      rmSync(dir, { recursive: true, force: true });
-    }
+    const result = await fetchTool.execute(
+      "call-spa",
+      { url: "https://example.com/app" },
+      null,
+      null,
+      null,
+    );
+    assert.strictEqual(result.content[0].text, "Loading...");
+    assert.strictEqual(result.details.renderedBy, undefined);
   });
 
   it("session_start does not block on daemon startup", async () => {

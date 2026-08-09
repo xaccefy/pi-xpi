@@ -9,7 +9,7 @@ description: Vulnerability discovery pipeline — the REQUIRED workflow whenever
 
 **You are the pipeline coordinator.** You do NOT hunt, trace, or write PoCs yourself. You dispatch specialist subagents via the `subagent` tool and orchestrate their outputs.
 
-- Every HUNT, TRACE, SKEPTIC, VALIDATE, CHAIN, and PATCH stage runs as a `subagent({agent: "...", task: "..."})` call — never inline.
+- Every HUNT, TRACE, SKEPTIC, VALIDATE, CHAIN, and PATCH stage launches through `subagent({ workflowScript: "return runs.run('stable-key', { agent: '...', task: '...' })", context: "fresh", async: true })` — never inline.
 - You own: casefile state, scratchpad checkpoints, schema validation at stage boundaries, coverage aggregation, advance/kill/retry decisions.
 - Reading source or probing endpoints yourself = **stop** — that's the subagent's job. Dispatch, validate against the schema, record.
 - You do yourself only: RECON (below) and REPORT (aggregate subagent outputs into the pipeline summary). The per-case report file is written by the **reporter** subagent (CaseContext → dispatch reporter → verify its output).
@@ -101,9 +101,9 @@ Every stage output must pass the `PipelineSubmit` gate before the next stage. It
 **Fail-closed (never bendy):**
 - Unparseable/schema-invalid SKEPTIC output = **UNDETERMINED**, never DISPROVEN — repair or re-dispatch; only schema-valid `verdict: DISPROVEN` kills.
 - A TRACER that errors or fails validation = **UNREACHABLE** — the finding does not advance.
-- Attach `outputSchema` (the schema JSON from `schemas/`) to every subagent dispatch.
+- Agent prompts state their schema contract. If you have the schema object, pass it as the child `outputSchema`; PipelineSubmit still validates every returned value.
 
-**Subagent crash handling (mandatory):** a subagent that dies (SIGABRT, OOM, timeout, process error) is a RETRY, not a verdict. Re-dispatch the same task ONCE with a stronger model (`subagent({agent: ..., model: "<stronger>", task: ...})` — repetition-loop runs are a known failure mode on cheap models). If it crashes again, record `blocked: <agent> crashed` in the pipeline-run case and continue with the next stage — never silently drop the stage.
+**Subagent crash handling (mandatory):** a crash (SIGABRT, OOM, timeout, process error) is a RETRY, not a verdict. Launch one new workflowScript with the same specialist task, a new stable attempt key, and a stronger model. If it crashes again, record `blocked: <agent> crashed` in the pipeline-run case and continue — never silently drop the stage.
 
 ## Agent Dispatch Patterns
 
@@ -120,16 +120,19 @@ RECON owns the coverage floor: hunts can only cover what recon found. Shallow re
 
 HUNT tasks reference this inventory; all coverage judgements are measured against it.
 
-**HARD GATE — RECON → HUNT:** inventory recorded → STOP all inline reading/probing. Your very next tool call MUST be a HUNT \`subagent({ tasks: [...] })\` dispatch, one auditor per attack class. Mapping a sink, reading a handler, or probing an endpoint beyond the recon inventory is HUNT work — stop, note it as a hunt task, and dispatch. Recon that bleeds into hunting is a pipeline violation, not progress.
+**HARD GATE — RECON → HUNT:** inventory recorded → STOP all inline reading/probing. Your next tool call MUST launch one async workflowScript whose `runs.all([...])` dispatches one auditor per attack class. When completion is delivered, submit each output through PipelineSubmit. Mapping a sink, reading a handler, or probing beyond the inventory is HUNT work.
 
 ### HUNT: One agent per attack class (parallel)
 
-```
-subagent({ tasks: [
-  { agent: "auditor", task: "Hunt for <class> vulnerabilities in <target/subsystem>. ...",
-    outputSchema: <contents of schemas/stage-finding.json> },
-  { agent: "auditor", task: "Hunt for <class2> ...", outputSchema: <...stage-finding.json> },
-]})
+```js
+subagent({
+  workflowScript: `return runs.all([
+    { key: "<run>-hunt-<class>-1", agent: "auditor", task: "Hunt for <class> vulnerabilities in <target/subsystem>. Output the Stage Finding contract." },
+    { key: "<run>-hunt-<class2>-1", agent: "auditor", task: "Hunt for <class2> vulnerabilities. Output the Stage Finding contract." }
+  ])`,
+  context: "fresh",
+  async: true
+})
 ```
 
 Coverage is per-entry-point, not a single tri-state. A class is `NOT_FOUND` only when EVERY recon entry point that can carry its input was examined:
@@ -145,9 +148,12 @@ Any unchecked entry point = `INCOMPLETE`, never `NOT_FOUND`.
 
 ### TRACE: One agent per finding
 
-```
-subagent({ agent: "tracer", task: "Trace whether attacker input reaches the sink at <file:line>. ...",
-  outputSchema: <contents of schemas/stage-trace.json> })
+```js
+subagent({
+  workflowScript: `return runs.run("<run>-trace-<case>-1", { agent: "tracer", task: "Trace whether attacker input reaches the sink at <file:line>. Output the Stage Trace contract." })`,
+  context: "fresh",
+  async: true
+})
 ```
 
 Only `TRACE RESULT: REACHABLE` advances.
@@ -158,44 +164,40 @@ Only `TRACE RESULT: REACHABLE` advances.
 
 For every REACHABLE `confidence: high` finding (severity is assigned only at VALIDATE), dispatch the skeptic — it re-reads source independently, trusting neither auditor nor tracer:
 
-```
-subagent({ agent: "skeptic",
-  task: "Disprove finding <case-id>. vuln_class=<class>, sink=<file:line>, entry_point=<entry>.
-         Trace result: REACHABLE via <call_chain>. Auditor evidence: <evidence>.
-         Target: <target>. Scope instruction: <scope_instruction from program scope table — verbatim, or 'unrestricted'>.
-         First verify the finding is in scope per the instruction. Then read the source yourself and try to disprove it.
-         ALSO search for the design decision: docs/README/comments near the sink, changelog files readable with read-only
-         tools (NO bash — you have none; if git history must be checked, note it and the exploit agent verifies commits),
-         and whether the runtime/framework version already mitigates the path. Intended behavior → DISPROVEN intended_behavior;
-         runtime already blocks it → DISPROVEN framework_protection; neither found → say so in disconfirmation_attempt.
-         ALSO audit the PoC script the exploit agent wrote (before it runs): read it for unconditional verification-marker
-         prints, trivially-true checks (accepting any 200, grepping always-present strings), hardcoded expected values,
-         and local mocks of the target. Report the audit in disconfirmation_attempt.
-         Output conforming to schemas/stage-skeptic.json.",
-  turnBudget: { maxTurns: 12, graceTurns: 2 },
-  outputSchema: <contents of schemas/stage-skeptic.json> })
+```js
+subagent({
+  workflowScript: `return runs.run("<run>-skeptic-<case>-1", {
+    agent: "skeptic",
+    task: "Disprove <case-id>. Include the traced call chain, auditor evidence, target, and verbatim scope instruction. Verify scope, re-read source or re-probe, search docs/runtime protections, audit any PoC for unconditional markers or mocks, and output the Stage Skeptic contract."
+  })`,
+  context: "fresh",
+  async: true
+})
 ```
 
 Validate: finding_id, verdict (CONFIRMED|DISPROVEN), reasoning, evidence_reviewed; DISPROVEN must have disproval_reason.
 
 **Verdict handling:**
 - **CONFIRMED** — write the skeptic's `disconfirmation_attempt` into the case's `disconfirmation` via `CaseUpdate(id, { disconfirmation: <attempt> })`; finding advances to VALIDATE.
-- **DISPROVEN** — kill directly: `CaseUpdate(id, { status: "killed", nextStep: "killed: skeptic-disproven — <disproval_reason>" })`. No tie-breaker.
+- **DISPROVEN** — first add the skeptic output as `EvidenceAdd(role: "refutation", artifact_path: <saved skeptic artifact>)`, then `CaseUpdate(id, { status: "killed", nextStep: "killed: skeptic-disproven — <disproval_reason>" })`. No tie-breaker.
 
 The skeptic's `disconfirmation_attempt` IS the case's disconfirmation record — satisfies the pre-CONFIRMED gate; stronger than self-disconfirmation (independent agent).
 
 ### VALIDATE: One agent per traced finding
 
-```
-subagent({ agent: "exploit", task: "Phase 1: EXPLOIT. Finding <case-id>. ...",
-  outputSchema: <contents of schemas/stage-validation.json> })
+```js
+subagent({
+  workflowScript: `return runs.run("<run>-validate-<case>-1", { agent: "exploit", task: "Phase 1: EXPLOIT. Finding <case-id>. Output the Stage Validation contract." })`,
+  context: "fresh",
+  async: true
+})
 ```
 
 The exploit agent runs the PoC through `PromoteFinding` (you do not). The case must be `investigating` with poc/evidence/impact/severity/target/disconfirmation before the gate accepts a run — the exploit agent does that CaseUpdate (keeping the skeptic's `disconfirmation` if present) before its first PromoteFinding call. Non-skeptic findings: the exploit agent writes its own disconfirmation.
 
 **Evidence chain closure (before PromoteFinding):** promotion now REQUIRES an **artifact-backed** `observation` evidence item (EvidenceAdd role=observation with `artifact_path` — the initial signal, stored with its SHA-256) in addition to the reproduction item the gate auto-writes. A summary-only observation is agent prose and is rejected. If the case lacks one, the ledger rejects promotion with "Evidence chain incomplete". Record the observation (probe response, source snippet, log file) when the case is first created or when it reaches investigating — not at the last minute.
 
-**Anti-cheat control gate (PromoteFinding, REQUIRED for EVERY promotion — sandboxed and live alike):** `control_path` + `control_liveness_marker` are mandatory. The control script runs the SAME PoC against a control lacking the vuln (patched replica, second account, baseline endpoint) — best as ONE parameterized script branching on the `PI_POC_MODE` env var (`poc` | `control`) the harness sets on every run. The harness blocks promotion if the verification_marker appears in the control run's output (unconditional-marker/mock cheat) OR if the control_liveness_marker is absent (the control never reached its target — unreachable host, wrong port, early exit); results are stored as `controlVerified` on the case and rendered in the context bundle. This is what proves the marker is target-dependent, not an unconditional print. `local: true` uses a host-network Docker sandbox; true host execution is operator-gated (`PI_POC_ALLOW_LOCAL=1`). Record observation/refutation/impact artifacts via EvidenceAdd (role-typed, hashed; the promotion observation must be artifact-backed). The harness ALSO blocks when the control or disconfirmation script crashes (killed/timeout/spawn error — no completion marker): a crash is not a clean control verdict and not a survived disproof; fix the script and retry. High/critical findings additionally require an executed disconfirmation run.
+**Differential control gate (PromoteFinding, REQUIRED for EVERY promotion):** `control_path`, a distinct `control_target`, `control_liveness_marker`, and `disconfirmation_path` are mandatory. `control_path` must contain the same bytes as the PoC. The harness runs that script with `PI_POC_MODE=poc` and the case target, then `PI_POC_MODE=control` and `control_target`. The control must complete, print the liveness marker after reaching the baseline, and omit the verification marker. The PoC and control outputs must be fully captured. `local: true` uses a host-network Docker sandbox; true host execution remains operator-gated by `PI_POC_ALLOW_LOCAL=1`. A crashed or truncated run proves nothing and blocks promotion. Every severity requires the executed disconfirmation run.
 
 **Design & runtime check (VALIDATE, before promoting):** the case must carry the non-intentionality evidence — the skeptic's disconfirmation includes the docs/git-history/runtime search. For non-skeptic findings, the exploit agent searches docs, git history, and runtime/framework docs before promoting: documented intent → kill `intended_behavior`; runtime mitigates → kill `framework_protection`; neither → keep the notes in `disconfirmation` as non-intentionality proof.
 
@@ -203,12 +205,12 @@ The exploit agent runs the PoC through `PromoteFinding` (you do not). The case m
 
 For each `INCOMPLETE` class, dispatch an auditor targeting the unchecked entries:
 
-```
-subagent({ agent: "auditor",
-  task: "Hunt for <class> in <target>. Previous hunts found nothing.
-           ALREADY CHECKED — do not re-tread: <checked list>.
-           UNCHECKED — examine each: <unchecked list>.
-           Use exploit_search for this class." })
+```js
+subagent({
+  workflowScript: `return runs.run("<run>-gapfill-<class>-<attempt>", { agent: "auditor", task: "Hunt for <class> in <target>. Already checked: <checked>. Examine each unchecked entry: <unchecked>. Use exploit_search." })`,
+  context: "fresh",
+  async: true
+})
 ```
 
 Loop terminates when zero `INCOMPLETE` remain, or after 3 iterations (safety cap). Never freeze a class as `NOT_FOUND` while entry points are unchecked — report `INCOMPLETE` if the cap hits.
@@ -217,7 +219,7 @@ Loop terminates when zero `INCOMPLETE` remain, or after 3 iterations (safety cap
 
 ### FEEDBACK: Convert traces into new hunt tasks
 
-Each TRACE that revealed untested attack surface (a subsystem in the call chain never audited) → dispatch: `subagent({ agent: "auditor", task: "Audit this subsystem: <subsystem>. The trace revealed it as untested attack surface." })`
+Each TRACE that reveals untested surface gets a new stable-key workflowScript dispatch to an auditor scoped to that subsystem.
 
 ## Coverage Tracking
 
@@ -242,12 +244,12 @@ assumptions: [
 
 After all validations pass:
 
-```
-subagent({ agent: "chain",
-  task: "Analyze confirmed findings for pipeline run <pipeline-case-id>.
-           Tag: <pipeline-tag>. Target: <target>.
-           Find exploit chains across ALL confirmed findings.",
-  outputSchema: <contents of schemas/stage-chain.json> })
+```js
+subagent({
+  workflowScript: `return runs.run("<run>-chain-1", { agent: "chain", task: "Analyze all confirmed findings for pipeline run <pipeline-case-id>. Tag: <pipeline-tag>. Target: <target>. Output the Stage Chain contract." })`,
+  context: "fresh",
+  async: true
+})
 ```
 
 Validate: chains[] with title, severity, steps, narrative; ≥2 steps each. Record chains via CaseLink. Chain failure → don't block; emit report without chains.

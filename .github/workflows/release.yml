@@ -47,17 +47,22 @@ jobs:
         run: bun install --frozen-lockfile
         timeout-minutes: 5
 
-      - name: Typecheck
-        run: bun run typecheck
-        timeout-minutes: 5
-
-      - name: Test
-        run: bun test --isolate
-        timeout-minutes: 10
-
       - name: Version bump (${{ inputs.bump }})
         run: bun run version:${{ inputs.bump }}
 
+      - name: Validate release tree
+        run: |
+          set -euo pipefail
+          bun install --frozen-lockfile
+          bun run typecheck
+          bun test --isolate
+          bunx @biomejs/biome ci . --diagnostic-level=error
+          npm pack -ws --dry-run --json --ignore-scripts > /tmp/workspace-packs.json
+          npm pack --dry-run --json --ignore-scripts > /tmp/umbrella-pack.json
+          unexpected="$(git diff --name-only | grep -Ev '^(package.json|bun.lock|packages/[^/]+/package.json)$' || true)"
+          test -z "$unexpected" || { echo "Unexpected release changes:"; echo "$unexpected"; exit 1; }
+          test -n "$(git diff --name-only)" || { echo "Version bump produced no changes"; exit 1; }
+        timeout-minutes: 15
 
       - name: Configure npm auth
         run: |
@@ -70,29 +75,30 @@ jobs:
         run: 'echo "Authenticated to npm as: $(npm whoami)"'
         timeout-minutes: 2
 
-      - name: Publish all workspaces + umbrella
-        run: |
-          set -euo pipefail
-          npm publish -ws --access public
-          npm publish --access public
-        timeout-minutes: 15
-
-      - name: Commit version bumps, tag, and push
+      - name: Commit and tag release candidate
         timeout-minutes: 5
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           VERSION="$(node -p "require('./package.json').version")"
-          git add package.json packages/*/package.json
-          # CHANGELOG.md files may not exist in every package yet — add what exists.
-          find . -maxdepth 2 -name CHANGELOG.md -not -path "./node_modules/*" -print0 | xargs -0 -r git add --
-          if git diff --cached --quiet; then
-            echo "No version file changes to commit"
-          else
-            git commit -m "chore: release v${VERSION}"
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1 || git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" >/dev/null 2>&1; then
+            echo "Tag v${VERSION} already exists"
+            exit 1
           fi
-          git tag "v${VERSION}" || true
-          # checkout leaves us on a detached HEAD — name the dst ref explicitly.
+          git add package.json bun.lock packages/*/package.json
+          git diff --cached --quiet && { echo "No version files changed"; exit 1; }
+          git commit -m "chore: release v${VERSION}"
+          git tag "v${VERSION}"
+
+      - name: Publish workspaces in dependency order, then umbrella
+        run: bun run publish:all
+        timeout-minutes: 15
+
+      - name: Push release commit and tag
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          VERSION="$(node -p "require('./package.json').version")"
           git push origin HEAD:main
           git push origin "v${VERSION}"

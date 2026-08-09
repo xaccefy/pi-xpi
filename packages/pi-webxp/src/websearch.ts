@@ -7,12 +7,12 @@
  */
 
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
-import { Type } from "@sinclair/typebox";
 import { abortableSleep } from "@xaccefy/pi-shared";
+import { Type } from "typebox";
+import { isPublicHttpHost } from "./network-safety.ts";
 
 /** Retriable HTTP statuses for daemon calls (408/429/5xx). */
 function isTransientHttpStatus(status: number): boolean {
@@ -217,41 +217,9 @@ function validateAndParseUrl(input: string): URL {
   }
 }
 
-// ── SPA / client-rendered page fallback ──────────────────────────────
-// Static HTML fetch returns the loading shell for SPAs. When the daemon
-// only got a thin shell, re-render with system chromium --dump-dom.
-// Daemon already SSRF-checked the URL; we only block private host literals.
-// Exported for unit tests (pure helpers + injectable chromium resolver).
-
-let cachedChromiumPath: string | null | undefined;
-/** Test-only: reset cached chromium path between cases. */
-export function __resetChromiumPathCacheForTests(): void {
-  cachedChromiumPath = undefined;
-}
-
-export function resolveChromiumPath(
-  exists: (p: string) => boolean = existsSync,
-  envPath: string | undefined = process.env.PI_CHROMIUM_PATH,
-): string | null {
-  if (cachedChromiumPath !== undefined) return cachedChromiumPath;
-  const candidates = [
-    envPath,
-    "/usr/bin/chromium",
-    "/usr/sbin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-    "/usr/bin/google-chrome-stable",
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-  ].filter(Boolean) as string[];
-  for (const candidate of candidates) {
-    if (exists(candidate)) {
-      cachedChromiumPath = candidate;
-      return candidate;
-    }
-  }
-  cachedChromiumPath = null;
-  return null;
-}
+// ── SPA / client-rendered page detection ─────────────────────────────
+// Thin SPA shells are reported as-is. Local Chromium fallback was removed so
+// WebXP never runs untrusted pages outside the daemon's guarded fetch path.
 
 const SPA_SHELL_MARKERS = [
   /enable javascript/i,
@@ -273,116 +241,8 @@ export function looksLikeSpaShell(
   return SPA_SHELL_MARKERS.some((re) => re.test(trimmed));
 }
 
-/** Block private/local host literals (daemon already did public DNS for the URL). */
-export function isPublicHttpHost(parsed: URL): boolean {
-  // Normalize: some runtimes keep brackets on IPv6 hostnames ("[::1]").
-  let host = parsed.hostname.toLowerCase();
-  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
-  if (host === "localhost" || host.endsWith(".localhost")) return false;
-  if (host === "0.0.0.0" || host === "::1" || host === "::") return false;
-  // IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) — extract the embedded IPv4 and
-  // run the same private-range checks, otherwise it bypasses SSRF filtering.
-  // Node's URL parser normalizes ::ffff:127.0.0.1 to hex form ::ffff:7f00:1.
-  const mapped = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
-  if (mapped) {
-    host = mapped[1];
-  } else {
-    const hexMapped = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
-    if (hexMapped) {
-      const g1 = parseInt(hexMapped[1], 16);
-      const g2 = parseInt(hexMapped[2], 16);
-      host = `${(g1 >> 8) & 0xff}.${g1 & 0xff}.${(g2 >> 8) & 0xff}.${g2 & 0xff}`;
-    }
-  }
-  // IPv6 ULA (fc00::/7) and link-local (fe80::/10)
-  if (/^f[cd][0-9a-f]{0,2}:/i.test(host) || host.startsWith("fe80:")) return false;
-  if (
-    /^127\./.test(host) ||
-    /^10\./.test(host) ||
-    /^192\.168\./.test(host) ||
-    /^169\.254\./.test(host) ||
-    /^172\.(1[6-9]|2\d|3[01])\./.test(host)
-  ) {
-    return false;
-  }
-  return true;
-}
-
-export async function renderSpaDom(
-  url: string,
-  chromiumPath: string,
-  parentSignal?: AbortSignal,
-  timeoutMs: number = REQUEST_TIMEOUT_MS,
-): Promise<string> {
-  const args = [
-    "--headless",
-    "--no-sandbox",
-    "--disable-gpu",
-    "--disable-dev-shm-usage",
-    "--virtual-time-budget=8000",
-    "--dump-dom",
-    url,
-  ];
-  return new Promise<string>((resolve, reject) => {
-    const proc = spawn(chromiumPath, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const finish = (fn: () => void) => {
-      if (settled) return;
-      settled = true;
-      if (timer !== undefined) clearTimeout(timer);
-      if (parentSignal) parentSignal.removeEventListener("abort", onAbort);
-      fn();
-    };
-    const onAbort = () => {
-      try {
-        proc.kill("SIGKILL");
-      } catch {
-        // ignore
-      }
-      finish(() => reject(new Error("chromium render aborted")));
-    };
-    timer = setTimeout(onAbort, timeoutMs);
-    if (parentSignal) {
-      if (parentSignal.aborted) {
-        onAbort();
-        return;
-      }
-      parentSignal.addEventListener("abort", onAbort);
-    }
-    proc.stdout.on("data", (chunk) => (stdout += chunk.toString()));
-    proc.stderr.on("data", (chunk) => (stderr += chunk.toString()));
-    proc.on("error", (err) => finish(() => reject(err)));
-    proc.on("close", (code) => {
-      if (code === 0 && stdout.trim()) finish(() => resolve(stdout));
-      else finish(() => reject(new Error(`chromium exited ${code}: ${stderr.slice(0, 300)}`)));
-    });
-  });
-}
-
-export function htmlToText(html: string): string {
-  let s = html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ");
-  s = s.replace(/<\/(p|div|li|h[1-6]|tr|section|article|main|header|footer)>/gi, "\n");
-  s = s.replace(/<br\s*\/?>/gi, "\n");
-  s = s.replace(/<[^>]+>/g, " ");
-  s = s
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&apos;/g, "'");
-  return s
-    .replace(/[ \t]+/g, " ")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
+/** Re-export the shared SSRF host checker (network-safety) so test imports stay stable. */
+export { isPublicHttpHost } from "./network-safety.ts";
 
 /** Prefer browser text only when it is meaningfully richer than the static shell. */
 export function preferRenderedText(staticText: string, renderedText: string): boolean {
@@ -397,7 +257,7 @@ export function preferRenderedText(staticText: string, renderedText: string): bo
 
 // ── Diagnostic Error Handler ──────────────────────────────────────────
 
-function handleWebsearchError(err: unknown, toolName: string) {
+function handleWebsearchError(err: unknown, toolName: string): never {
   const message = err instanceof Error ? err.message : String(err);
   let hint = "";
   if (
@@ -410,11 +270,7 @@ function handleWebsearchError(err: unknown, toolName: string) {
   ) {
     hint = `\n\nHint: The 'open-websearch' daemon on port ${DAEMON_PORT} could not be reached or failed to start.\nTo troubleshoot:\n  1. Run 'npm install' in the project root to link all dependencies.\n  2. Verify if another server is already bound to port ${DAEMON_PORT}.\n  3. You can manually launch the daemon by running:\n     npx open-websearch serve --port ${DAEMON_PORT}`;
   }
-  return {
-    content: [{ type: "text" as const, text: `${toolName} failed: ${message}${hint}` }],
-    isError: true,
-    details: { error: message },
-  };
+  throw new Error(`${toolName} failed: ${message}${hint}`, { cause: err });
 }
 
 // ── Pi Extension ──────────────────────────────────────────────────────
@@ -509,10 +365,10 @@ export default function websearchExtension(pi: ExtensionAPI) {
       }
     },
 
-    renderResult(result, { expanded }, theme) {
+    renderResult(result, { expanded }, theme, context) {
       const details = result.details as any;
-      if (details?.error) {
-        return new Text(theme.fg("error", `✗ Web Search failed: ${details.error}`), 0, 0);
+      if (context.isError) {
+        return new Text(theme.fg("error", "✗ Web Search failed"), 0, 0);
       }
       const results = details?.results || [];
       const query = details?.query || "";
@@ -562,6 +418,11 @@ export default function websearchExtension(pi: ExtensionAPI) {
           throw new Error("Missing required 'url' parameter");
         }
         const parsedUrl = validateAndParseUrl(params.url);
+        if (!isPublicHttpHost(parsedUrl)) {
+          throw new Error(
+            `Blocked: ${parsedUrl.hostname} is a private/internal host. Use http_request with allowPrivateHosts=true for internal targets.`,
+          );
+        }
         const targetUrl = parsedUrl.toString();
 
         // Match on hostname only — never substring-match the full URL, which would
@@ -588,48 +449,24 @@ export default function websearchExtension(pi: ExtensionAPI) {
         }
 
         const data = body.data;
-        let textContent =
+        const textContent =
           typeof data === "string"
             ? data
             : data.markdown || data.content || data.text || JSON.stringify(data);
 
-        // SPA / client-rendered fallback. The daemon's static extraction
-        // cannot see DOM injected by JavaScript; re-render the already
-        // validated public URL with system chromium when we detect a shell.
-        let renderedBy: string | undefined;
-        if (
-          endpoint === "/fetch-web" &&
-          looksLikeSpaShell(data, textContent) &&
-          isPublicHttpHost(parsedUrl)
-        ) {
-          const chromiumPath = resolveChromiumPath();
-          if (chromiumPath) {
-            try {
-              const renderedHtml = await renderSpaDom(targetUrl, chromiumPath, signal);
-              const renderedText = htmlToText(renderedHtml);
-              if (preferRenderedText(textContent, renderedText)) {
-                textContent = renderedText;
-                renderedBy = "chromium";
-              }
-            } catch {
-              // Chromium render failed; keep the static extraction result.
-            }
-          }
-        }
-
         return {
           content: [{ type: "text" as const, text: textContent }],
-          details: { metadata: data, url: targetUrl, ...(renderedBy ? { renderedBy } : {}) },
+          details: { metadata: data, url: targetUrl },
         };
       } catch (err) {
         return handleWebsearchError(err, "Web fetch");
       }
     },
 
-    renderResult(result, { expanded }, theme) {
+    renderResult(result, { expanded }, theme, context) {
       const details = result.details as any;
-      if (details?.error) {
-        return new Text(theme.fg("error", `✗ Web Fetch failed: ${details.error}`), 0, 0);
+      if (context.isError) {
+        return new Text(theme.fg("error", "✗ Web Fetch failed"), 0, 0);
       }
       const url = details?.url || "";
       const text = (result.content[0] as any)?.text || "";

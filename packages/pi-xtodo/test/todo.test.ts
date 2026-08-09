@@ -39,6 +39,18 @@ describe("pi-xtodo", () => {
   let sessionManager: MockSessionManager;
   let mockCtx: any;
 
+  /**
+   * Run the todo tool but normalize thrown errors (the tool now fails closed by
+   * throwing) back into the legacy error envelope the older assertions use.
+   */
+  async function exec(t: any, id: string, params: any, ctx: any = mockCtx) {
+    try {
+      return await t.execute(id, params, null, null, ctx);
+    } catch (error) {
+      return { isError: true, content: [{ type: "text", text: (error as Error).message }] };
+    }
+  }
+
   beforeEach(() => {
     __resetState();
     pi = new MockExtensionAPI();
@@ -99,13 +111,7 @@ describe("pi-xtodo", () => {
     assert.ok(u2.content[0].text.includes("Updated #1 (in_progress → completed)"));
 
     // illegal transition: completed → in_progress
-    const u3 = await t.execute(
-      "2",
-      { action: "update", id: 1, status: "in_progress" },
-      null,
-      null,
-      mockCtx,
-    );
+    const u3 = await exec(t, "2", { action: "update", id: 1, status: "in_progress" });
     fail(u3, "illegal transition");
     assert.ok(u3.content[0].text.includes("illegal transition"));
 
@@ -141,13 +147,7 @@ describe("pi-xtodo", () => {
     ok(ok1, "B→A link");
 
     // A depends on B → cycle
-    const bad = await t.execute(
-      "4",
-      { action: "update", id: 1, addBlockedBy: [2] },
-      null,
-      null,
-      mockCtx,
-    );
+    const bad = await exec(t, "4", { action: "update", id: 1, addBlockedBy: [2] });
     fail(bad, "self-cycle A→B→A");
     assert.ok(bad.content[0].text.includes("would create a cycle"));
   });
@@ -205,13 +205,7 @@ describe("pi-xtodo", () => {
     await t.execute("1", { action: "create", subject: "Keep" }, null, null, mockCtx);
 
     // empty subject on update
-    const r1 = await t.execute(
-      "2",
-      { action: "update", id: 1, subject: "   " },
-      null,
-      null,
-      mockCtx,
-    );
+    const r1 = await exec(t, "2", { action: "update", id: 1, subject: "   " });
     fail(r1, "empty subject");
     assert.ok(r1.content[0].text.includes("subject cannot be empty"));
 
@@ -220,18 +214,12 @@ describe("pi-xtodo", () => {
     ok(d1, "delete");
 
     // mutation on deleted
-    const r2 = await t.execute(
-      "4",
-      { action: "update", id: 1, subject: "ghost" },
-      null,
-      null,
-      mockCtx,
-    );
+    const r2 = await exec(t, "4", { action: "update", id: 1, subject: "ghost" });
     fail(r2, "mutation on deleted");
     assert.ok(r2.content[0].text.includes("is deleted"));
 
     // re-delete
-    const d2 = await t.execute("5", { action: "delete", id: 1 }, null, null, mockCtx);
+    const d2 = await exec(t, "5", { action: "delete", id: 1 });
     fail(d2, "re-delete");
     assert.ok(d2.content[0].text.includes("is already deleted"));
   });
@@ -298,13 +286,7 @@ describe("pi-xtodo", () => {
       ok(r, `link T${i}→T${i - 1}`);
     }
     // close the ring: T1→T8
-    const cycle = await t.execute(
-      "cycle",
-      { action: "update", id: 1, addBlockedBy: [8] },
-      null,
-      null,
-      mockCtx,
-    );
+    const cycle = await exec(t, "cycle", { action: "update", id: 1, addBlockedBy: [8] });
     fail(cycle, "deep cycle");
     assert.ok(cycle.content[0].text.includes("would create a cycle"));
   });
@@ -340,7 +322,7 @@ describe("pi-xtodo", () => {
   it("id-only update errors with field list", async () => {
     const t = pi.tools[0];
     await t.execute("1", { action: "create", subject: "N" }, null, null, mockCtx);
-    const r = await t.execute("2", { action: "update", id: 1 }, null, null, mockCtx);
+    const r = await exec(t, "2", { action: "update", id: 1 });
     fail(r, "id-only update");
     assert.ok(r.content[0].text.includes("mutable field"));
   });
@@ -395,13 +377,11 @@ describe("pi-xtodo", () => {
     const t = pi.tools[0];
     await t.execute("1", { action: "create", subject: "T" }, null, null, mockCtx);
     for (const bad of [1.5, "2.7", "1e2", 0, -1, "0", "abc"]) {
-      const r = await t.execute(
-        `b-${bad}`,
-        { action: "update", id: bad as any, status: "in_progress" },
-        null,
-        null,
-        mockCtx,
-      );
+      const r = await exec(t, `b-${bad}`, {
+        action: "update",
+        id: bad as any,
+        status: "in_progress",
+      });
       fail(r, `id=${JSON.stringify(bad)}`);
     }
   });
@@ -421,11 +401,11 @@ describe("pi-xtodo", () => {
 
   it("get returns error for missing or missing-id", async () => {
     const t = pi.tools[0];
-    const r1 = await t.execute("1", { action: "get", id: 999 }, null, null, mockCtx);
+    const r1 = await exec(t, "1", { action: "get", id: 999 });
     fail(r1, "missing id");
     assert.ok(r1.content[0].text.includes("not found"));
 
-    const r2 = await t.execute("2", { action: "get" }, null, null, mockCtx);
+    const r2 = await exec(t, "2", { action: "get" });
     fail(r2, "no id param");
     assert.ok(r2.content[0].text.includes("id required"));
   });
@@ -436,36 +416,18 @@ describe("pi-xtodo", () => {
     await t.execute("2", { action: "create", subject: "DelMe" }, null, null, mockCtx);
 
     // self-block
-    const r1 = await t.execute(
-      "3",
-      { action: "update", id: 1, addBlockedBy: [1] },
-      null,
-      null,
-      mockCtx,
-    );
+    const r1 = await exec(t, "3", { action: "update", id: 1, addBlockedBy: [1] });
     fail(r1, "self-block");
     assert.ok(r1.content[0].text.includes("cannot block #1 on itself"));
 
     // non-existent
-    const r2 = await t.execute(
-      "4",
-      { action: "update", id: 1, addBlockedBy: [999] },
-      null,
-      null,
-      mockCtx,
-    );
+    const r2 = await exec(t, "4", { action: "update", id: 1, addBlockedBy: [999] });
     fail(r2, "block on nonexistent");
     assert.ok(r2.content[0].text.includes("not found"));
 
     // deleted
     await t.execute("5", { action: "delete", id: 2 }, null, null, mockCtx);
-    const r3 = await t.execute(
-      "6",
-      { action: "update", id: 1, addBlockedBy: [2] },
-      null,
-      null,
-      mockCtx,
-    );
+    const r3 = await exec(t, "6", { action: "update", id: 1, addBlockedBy: [2] });
     fail(r3, "block on deleted");
     assert.ok(r3.content[0].text.includes("is deleted"));
   });
@@ -674,8 +636,10 @@ describe("pi-xtodo", () => {
 
   it("renderResult highlights errors", async () => {
     const t = pi.tools[0];
-    const r = await t.execute("1", { action: "get", id: 99 }, null, null, mockCtx);
-    const out = stripAnsi(t.renderResult(r, {}, mockTheme).render(120).join("\n"));
+    const r = await exec(t, "1", { action: "get", id: 99 });
+    const out = stripAnsi(
+      t.renderResult(r, {}, mockTheme, { isError: true }).render(120).join("\n"),
+    );
     assert.ok(out.includes("✗"), out);
     assert.ok(out.includes("#99 not found"), out);
   });

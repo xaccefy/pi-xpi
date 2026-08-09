@@ -12,10 +12,10 @@ import {
   getCaseById,
   getCasefilePath,
   addCaseResult as ledgerAddCaseResult,
+  promoteFindingResult as ledgerPromoteFindingResult,
   linkCasesResult,
   listEvidenceItems,
   type PocVerification,
-  promoteFindingResult,
   readCasefile,
   recordCoverageResult,
   searchCases,
@@ -96,16 +96,23 @@ const DISCONFIRM_OK = {
   ranAt: "2024-01-01T00:00:00Z",
   sandbox: true,
   completed: true,
+  outputComplete: true,
+  output: "survived disproof",
+  rawOutput: "survived disproof",
+  mode: "disconfirmation",
 };
 /** Default control verification: SAME script as the PoC (same-file contract),
  * completed, no vuln marker, liveness present. */
 const CONTROL_OK = {
   path: "",
-  exitCode: 1,
+  exitCode: 0,
   ranAt: "2024-01-01T00:00:00Z",
   sandbox: true,
   completed: true,
+  outputComplete: true,
   output: "CONTROL_REACHED",
+  rawOutput: "CONTROL_REACHED",
+  mode: "control",
 };
 
 /**
@@ -117,6 +124,50 @@ const CONTROL_OK = {
  * in the (untruncated) PoC output; (d) an observation item that predates the
  * repro. The helper normalizes path + ranAt so fixtures focus on behavior.
  */
+function promoteFindingResult(
+  id: string,
+  verification: Parameters<typeof ledgerPromoteFindingResult>[1],
+  disconfirmation?: Parameters<typeof ledgerPromoteFindingResult>[2],
+  control?: Parameters<typeof ledgerPromoteFindingResult>[3],
+  marker?: string,
+  liveness?: string,
+) {
+  const effectiveMarker = marker ?? "VULN_MARKER";
+  const effectiveLiveness = liveness ?? "CONTROL_REACHED";
+  const target = getCaseById(id)?.target ?? "target";
+  const fill = <T extends PocVerification | undefined>(
+    v: T,
+    mode: string,
+    runTarget: string,
+  ): T => {
+    if (!v) return v;
+    const output =
+      v.output ??
+      (mode === "poc"
+        ? effectiveMarker
+        : mode === "control"
+          ? effectiveLiveness
+          : "survived disproof");
+    return {
+      ...v,
+      output,
+      rawOutput: v.rawOutput ?? output,
+      completed: v.completed ?? true,
+      outputComplete: v.outputComplete ?? true,
+      mode: v.mode ?? mode,
+      target: v.target ?? runTarget,
+    } as T;
+  };
+  return ledgerPromoteFindingResult(
+    id,
+    fill(verification, "poc", target),
+    fill(disconfirmation, "disconfirmation", target),
+    fill(control, "control", `${target}#control`),
+    arguments.length >= 5 ? marker : effectiveMarker,
+    arguments.length >= 6 ? liveness : effectiveLiveness,
+  );
+}
+
 const promote = (
   id: string,
   verification: Parameters<typeof promoteFindingResult>[1],
@@ -129,6 +180,8 @@ const promote = (
 ) => {
   const marker = opts.marker ?? "VULN_MARKER";
   const liveness = opts.liveness ?? "CONTROL_REACHED";
+  const target = getCaseById(id)?.target ?? "target";
+  const controlTarget = `${target}#control`;
   // Preserve the caller's basename (tests assert the recorded PoC basename).
   const scriptPath = pocScriptPath(basename(verification.path ?? "poc.sh"));
   const v = {
@@ -136,18 +189,26 @@ const promote = (
     path: scriptPath,
     ranAt: new Date().toISOString(),
     output: verification.output ?? marker,
+    rawOutput: verification.rawOutput ?? verification.output ?? marker,
+    completed: verification.completed ?? true,
+    outputComplete: verification.outputComplete ?? true,
+    mode: verification.mode ?? "poc",
+    target: verification.target ?? target,
+  };
+  const disconfirmation = {
+    ...(opts.disconfirmation ?? DISCONFIRM_OK),
+    target,
   };
   const control = opts.control
-    ? { ...opts.control, path: scriptPath }
-    : { ...CONTROL_OK, path: scriptPath, output: liveness };
-  return promoteFindingResult(
-    id,
-    v,
-    opts.disconfirmation ?? DISCONFIRM_OK,
-    control,
-    marker,
-    liveness,
-  );
+    ? { ...opts.control, path: scriptPath, target: opts.control.target ?? controlTarget }
+    : {
+        ...CONTROL_OK,
+        path: scriptPath,
+        output: liveness,
+        rawOutput: liveness,
+        target: controlTarget,
+      };
+  return promoteFindingResult(id, v, disconfirmation, control, marker, liveness);
 };
 
 let tempDir: string;
@@ -701,22 +762,30 @@ describe("casefile sqlite ledger", () => {
       ranAt,
       sandbox: true,
       completed: true,
+      outputComplete: true,
       output: "VULN_MARKER",
+      rawOutput: "VULN_MARKER",
+      mode: "poc",
+      target: "example-app",
     };
     const ctrl = {
       path: scriptPath,
-      exitCode: 1,
+      exitCode: 0,
       ranAt,
       sandbox: true,
       completed: true,
+      outputComplete: true,
       output: "CONTROL_REACHED",
+      rawOutput: "CONTROL_REACHED",
+      mode: "control",
+      target: "example-app#control",
     };
     // Prose disconfirmation alone is not enough — the ledger requires an
     // executed run for EVERY promotion (not just high/critical: a case filed
     // low/medium must not skip the run and be re-raised afterwards).
     assert.throws(
       () => promoteFindingResult(rec.id, poc, undefined, ctrl, "VULN_MARKER", "CONTROL_REACHED"),
-      /disconfirmation run/,
+      /Disconfirmation verification is required|disconfirmation run/,
     );
     // A crashed disconfirmation (completed:false) is not a survived disproof.
     assert.throws(
@@ -730,12 +799,17 @@ describe("casefile sqlite ledger", () => {
             ranAt,
             sandbox: true,
             completed: false,
+            outputComplete: true,
+            output: "survived",
+            rawOutput: "survived",
+            mode: "disconfirmation",
+            target: "example-app",
           },
           ctrl,
           "VULN_MARKER",
           "CONTROL_REACHED",
         ),
-      /disconfirmation run/,
+      /Disconfirmation verification did not complete|disconfirmation run/,
     );
     // With a completed non-zero disconfirmation run the high-severity promote passes.
     const ok = promote(rec.id, {
@@ -891,11 +965,12 @@ describe("casefile sqlite ledger", () => {
       target: "example-app",
       disconfirmation: "Tried to disprove; could not.",
     });
+    const scriptPath = pocScriptPath("live-control.sh");
     // No control at all → blocked (was previously allowed for sandboxed runs).
     assert.throws(
       () =>
         promoteFindingResult(live.id, {
-          path: "/tmp/poc.sh",
+          path: scriptPath,
           exitCode: 0,
           ranAt: "2024-01-01T00:00:00Z",
           sandbox: false,
@@ -907,10 +982,10 @@ describe("casefile sqlite ledger", () => {
       () =>
         promoteFindingResult(
           live.id,
-          { path: "/tmp/poc.sh", exitCode: 0, ranAt: "2024-01-01T00:00:00Z", sandbox: false },
+          { path: scriptPath, exitCode: 0, ranAt: "2024-01-01T00:00:00Z", sandbox: false },
           undefined,
           {
-            path: "/tmp/ctrl.sh",
+            path: scriptPath,
             exitCode: 127,
             ranAt: "2024-01-01T00:00:00Z",
             sandbox: false,
@@ -919,17 +994,17 @@ describe("casefile sqlite ledger", () => {
           },
           "VULN_MARKER",
         ),
-      /require.*control(LivenessMarker|Verification)/,
+      /require.*control(LivenessMarker|Verification)|Control verification did not complete/,
     );
     // …and so is a control whose output contains the marker (unconditional-marker PoC).
     assert.throws(
       () =>
         promoteFindingResult(
           live.id,
-          { path: "/tmp/poc.sh", exitCode: 0, ranAt: "2024-01-01T00:00:00Z", sandbox: false },
-          undefined,
+          { path: scriptPath, exitCode: 0, ranAt: "2024-01-01T00:00:00Z", sandbox: false },
+          { ...DISCONFIRM_OK, ranAt: "2024-01-01T00:00:00Z", sandbox: false },
           {
-            path: "/tmp/ctrl.sh",
+            path: scriptPath,
             exitCode: 1,
             ranAt: "2024-01-01T00:00:00Z",
             sandbox: false,
@@ -946,10 +1021,10 @@ describe("casefile sqlite ledger", () => {
       () =>
         promoteFindingResult(
           live.id,
-          { path: "/tmp/poc.sh", exitCode: 0, ranAt: "2024-01-01T00:00:00Z", sandbox: false },
-          undefined,
+          { path: scriptPath, exitCode: 0, ranAt: "2024-01-01T00:00:00Z", sandbox: false },
+          { ...DISCONFIRM_OK, ranAt: "2024-01-01T00:00:00Z", sandbox: false },
           {
-            path: "/tmp/ctrl.sh",
+            path: scriptPath,
             exitCode: 1,
             ranAt: "2024-01-01T00:00:00Z",
             sandbox: false,
@@ -971,7 +1046,7 @@ describe("casefile sqlite ledger", () => {
     } as unknown as PocVerification;
     assert.throws(
       () => promoteFindingResult(live.id, noSandboxField),
-      /require.*control(LivenessMarker|Verification)/,
+      /require.*control(LivenessMarker|Verification)|PoC verification sandbox flag missing/,
     );
     // A control that RAN, exited non-zero (vuln absent — expected), printed no
     // marker and printed the liveness marker is valid: the finding promotes.
@@ -1597,6 +1672,10 @@ describe("casefile sqlite ledger", () => {
     assert.ok(confirmed.pocVerified, "pocVerified set after promotion");
     assert.ok(confirmed.disconfirmationVerified, "disconfirmationVerified set after promotion");
     assert.ok(confirmed.controlVerified, "controlVerified set after promotion");
+    assert.throws(
+      () => updateCaseResult(record.id, { impact: "different impact" }),
+      /proof-bound field/,
+    );
 
     // Demote back to investigating — both verification artifacts must be cleared.
     updateCaseResult(record.id, { status: "investigating" });
