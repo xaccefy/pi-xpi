@@ -32,7 +32,7 @@ afterEach(async () => {
 describe("poc-runner", () => {
   it("validates paths to prevent traversal", () => {
     const invalidPath = join(tempDir, "../../../etc/passwd");
-    expect(() => runPoc(invalidPath, false)).toThrow(
+    expect(() => runPoc(invalidPath, { local: true })).toThrow(
       /traversal segments|under the project workspace/,
     );
   });
@@ -40,14 +40,14 @@ describe("poc-runner", () => {
   it("fails on unknown extensions", () => {
     const badPoc = join(tempDir, "poc.unknown");
     writeFileSync(badPoc, "echo 1", "utf8");
-    expect(() => runPoc(badPoc, false)).toThrow(/Cannot determine PoC language for/);
+    expect(() => runPoc(badPoc, { local: true })).toThrow(/Cannot determine PoC language for/);
   });
 
   it("runs a shell script locally", () => {
     const shPoc = join(tempDir, "poc.sh");
     writeFileSync(shPoc, "#!/bin/sh\necho 'hello world'", "utf8");
 
-    const result = runPoc(shPoc, false);
+    const result = runPoc(shPoc, { local: true });
 
     expect(result.exitCode).toBe(0);
     expect(result.output).toContain("hello world");
@@ -63,7 +63,7 @@ describe("poc-runner", () => {
     const shPoc = join(tempDir, "poc.sh");
     writeFileSync(shPoc, "#!/bin/sh\necho 'must not run on host'", "utf8");
 
-    const result = runPoc(shPoc, false);
+    const result = runPoc(shPoc, { local: true });
 
     if (result.sandbox) {
       // Docker path: the script ran inside the sandbox (isolation kept), never
@@ -97,7 +97,7 @@ describe("poc-runner", () => {
     // Print ANSI color escape and a null byte
     writeFileSync(shPoc, '#!/bin/sh\nprintf "\\033[31mhello\\033[0m \\000world\\n"', "utf8");
 
-    const result = runPoc(shPoc, false);
+    const result = runPoc(shPoc, { local: true });
 
     // ANSI codes and null byte should be stripped
     expect(result.output).not.toContain("\x1b[31m");
@@ -112,7 +112,7 @@ describe("poc-runner", () => {
     const body = Array.from({ length: 500 }, () => "x".repeat(20)).join("\n");
     writeFileSync(shPoc, `#!/bin/sh\necho "${body}"\necho MARKER_AT_THE_END`, "utf8");
 
-    const result = runPoc(shPoc, false);
+    const result = runPoc(shPoc, { local: true });
 
     expect(result.exitCode).toBe(0);
     expect(result.output).not.toContain("MARKER_AT_THE_END");
@@ -129,7 +129,7 @@ describe("poc-runner", () => {
     const poc = join(tempDir, "poc.txt");
     writeFileSync(poc, "echo hi", "utf8");
 
-    expect(() => runPoc(poc, false)).toThrow(/Cannot determine PoC language/);
+    expect(() => runPoc(poc, { local: true })).toThrow(/Cannot determine PoC language/);
   });
 
   it("fails closed when docker is missing (sandbox path)", () => {
@@ -146,7 +146,7 @@ describe("poc-runner", () => {
     const shPoc = join(tempDir, "poc.sh");
     writeFileSync(shPoc, "#!/bin/sh\necho hi", "utf8");
 
-    const result = runPoc(shPoc, true);
+    const result = runPoc(shPoc, { network: "none" });
     expect(result.exitCode).not.toBe(0);
   });
 
@@ -156,7 +156,7 @@ describe("poc-runner", () => {
     const poc = join(dir, "poc.js");
     writeFileSync(poc, 'process.stdout.write("ok from spaced path")', "utf8");
 
-    const result = runPoc(poc, false);
+    const result = runPoc(poc, { local: true });
     expect(result.exitCode).toBe(0);
     expect(result.output).toContain("ok from spaced path");
     expect(result.output).not.toContain("Cannot find module");

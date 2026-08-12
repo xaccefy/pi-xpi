@@ -1,0 +1,18 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "pi-xpi",
+  "version": "0.8.2",
+  "description": "XPI — offensive security tools for Pi Agent and OMP (fork): casefile ledger with honest-PoC gates, web lookup, exploit technique search, and todo tracking.",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "xpi",
+    "security",
+    "bug-bounty",
+    "pentest",
+    "ctf",
+    "exploit",
+    "web-search"
+  ]
+}

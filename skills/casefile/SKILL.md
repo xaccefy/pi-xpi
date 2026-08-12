@@ -4,6 +4,8 @@ description: Use when tracking security investigations, bug bounty findings, CTF
 license: MIT
 ---
 
+<!-- Mirror of packages/pi-casefile/skills/casefile/SKILL.md — keep both in sync. -->
+
 # Casefile Tracker
 
 Use Casefile to maintain durable security investigation state across agent turns.

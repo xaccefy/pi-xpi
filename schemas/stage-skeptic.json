@@ -48,6 +48,10 @@
     {
       "if": { "properties": { "verdict": { "const": "DISPROVEN" } } },
       "then": { "required": ["disproval_reason"] }
+    },
+    {
+      "if": { "properties": { "verdict": { "const": "CONFIRMED" } } },
+      "then": { "required": ["disconfirmation_attempt"] }
     }
   ]
 }

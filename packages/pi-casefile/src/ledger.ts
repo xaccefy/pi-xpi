@@ -14,6 +14,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import {
+  type ConfirmerVerdict,
+  evidenceNonceMatches,
+  normalizeEvidence,
+  type PoCEvidence,
+  validateConfirmerVerdict,
+} from "./evidence.ts";
+import {
   findWorkspaceRoot,
   getScratchpadRoot,
   PHASE_ORDER,
@@ -157,6 +164,13 @@ export type CaseRecord = {
   id: string;
   title: string;
   status: CaseStatus;
+  /**
+   * True once the case has EVER reached investigating or confirmed. The kill
+   * gate keys off this, not the current status: a demotion
+   * (investigating/confirmed -> hypothesis) must not let an advanced case die
+   * with a keyword in free text instead of artifact-backed refutation evidence.
+   */
+  everAdvanced: boolean;
   confidence: CaseConfidence;
   severity?: CaseSeverity;
   priority?: CasePriority;
@@ -182,8 +196,12 @@ export type CaseRecord = {
   pocVerified?: PocVerificationRecord;
   /** Verification of a disconfirmation run (set only by promoteFindingResult). */
   disconfirmationVerified?: PocVerificationRecord;
-  /** Verification of a control-target run (set only by promoteFindingResult; anti-cheat gate). */
+  /** Verification of a control-target run (set only by the confirmation gate). */
   controlVerified?: PocVerificationRecord;
+  /** Phase-1 evidence bundle awaiting a confirmer verdict (ConfirmFinding). */
+  pendingConfirmation?: PendingConfirmation;
+  /** Last confirmer verdict (CONFIRMED commits the promotion; NOT_CONFIRMED keeps investigating). */
+  confirmerVerdict?: ConfirmerVerdictRecord;
   /** ISO timestamp when CaseContext first wrote the context bundle. */
   reportedAt?: string;
   /** Path to the final report file (set by writeCaseContext; the reporter agent writes the file). */
@@ -209,6 +227,49 @@ export type PocVerificationRecord = {
   mode?: string;
   target?: string;
 };
+
+/** One harness-observed PoC run with its validated, nonce-bound evidence. */
+export type PocEvidenceRun = {
+  mode: "poc" | "control";
+  target: string;
+  /** The run's PI_POC_NONCE — evidence.nonce must equal it (binds evidence to the run). */
+  nonce: string;
+  ranAt: string;
+  exitCode: number;
+  sandbox: boolean;
+  completed: boolean;
+  outputComplete: boolean;
+  /** Display-sliced output (diagnostic; exit codes are not gates). */
+  output: string;
+  evidence: PoCEvidence;
+  evidenceSha256: string;
+  /** Absolute path to the PRESERVED copy of this run's evidence.json (the
+   * runner copies the temp file into a durable .pi/poc-evidence/ dir; the
+   * reproduction item references it so the stored hash stays verifiable). */
+  evidencePath?: string;
+};
+
+/**
+ * Phase-1 bundle PromoteFinding records; ConfirmFinding commits on a verdict.
+ * Contains everything the confirmer reviews and the ledger re-checks.
+ */
+export type PendingConfirmation = {
+  caseId: string;
+  ranAt: string;
+  pocPath: string;
+  /** SHA-256 of the PoC script AT RUN TIME — re-hashed at confirm to catch edits. */
+  pocSha256: string;
+  controlPath: string;
+  controlTarget: string;
+  targetRuns: [PocEvidenceRun, PocEvidenceRun];
+  controlRun: PocEvidenceRun;
+};
+
+/** Persisted confirmer verdict with the commit timestamp. */
+export type ConfirmerVerdictRecord = ConfirmerVerdict & { at: string };
+
+/** Pending confirmation expires after 1h — re-run PromoteFinding for a fresh bundle. */
+export const PENDING_CONFIRM_TTL_MS = 60 * 60 * 1000;
 
 export type CaseInput = {
   title: string;
@@ -239,6 +300,8 @@ type NormalizedCaseInput = Partial<CaseInput> & {
   pocVerified?: CaseRecord["pocVerified"];
   disconfirmationVerified?: CaseRecord["disconfirmationVerified"];
   controlVerified?: CaseRecord["controlVerified"];
+  pendingConfirmation?: CaseRecord["pendingConfirmation"];
+  confirmerVerdict?: CaseRecord["confirmerVerdict"];
   reportedAt?: string;
   reportPath?: string;
 };
@@ -371,6 +434,7 @@ function getDb(): DatabaseSync {
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
       status TEXT NOT NULL,
+      ever_advanced INTEGER NOT NULL DEFAULT 0,
       confidence TEXT NOT NULL,
       severity TEXT,
       priority TEXT,
@@ -390,6 +454,8 @@ function getDb(): DatabaseSync {
       poc_verified_json TEXT, -- JSON object
       disconfirmation TEXT,
       disconfirmation_verified_json TEXT, -- JSON object
+      pending_confirmation_json TEXT, -- JSON object
+      confirmer_verdict_json TEXT, -- JSON object
       reported_at TEXT,
       report_path TEXT,
       created_at TEXT NOT NULL,
@@ -427,6 +493,21 @@ function getDb(): DatabaseSync {
   }
   if (!caseCols.some((c) => c.name === "control_verified_json")) {
     db.exec("ALTER TABLE cases ADD COLUMN control_verified_json TEXT");
+  }
+  if (!caseCols.some((c) => c.name === "pending_confirmation_json")) {
+    db.exec("ALTER TABLE cases ADD COLUMN pending_confirmation_json TEXT");
+  }
+  if (!caseCols.some((c) => c.name === "confirmer_verdict_json")) {
+    db.exec("ALTER TABLE cases ADD COLUMN confirmer_verdict_json TEXT");
+  }
+  if (!caseCols.some((c) => c.name === "ever_advanced")) {
+    db.exec("ALTER TABLE cases ADD COLUMN ever_advanced INTEGER NOT NULL DEFAULT 0");
+    // Backfill: a case that is (or was) past hypothesis has reached an
+    // advanced state. Terminal rows can no longer be mutated, but marking them
+    // keeps the flag consistent for history/context reads.
+    db.exec(
+      "UPDATE cases SET ever_advanced = 1 WHERE status IN ('investigating','confirmed','blocked','killed','reported')",
+    );
   }
 
   // Role-typed, artifact-backed evidence items (Black-cat style evidence chain).
@@ -507,6 +588,7 @@ function mapRow(
     id: row.id,
     title: row.title,
     status: row.status as CaseStatus,
+    everAdvanced: row.ever_advanced === 1,
     confidence: row.confidence as CaseConfidence,
     severity: row.severity as CaseSeverity | undefined,
     priority: row.priority as CasePriority | undefined,
@@ -528,6 +610,8 @@ function mapRow(
     pocVerified: safeParseObject(row.poc_verified_json),
     disconfirmationVerified: safeParseObject(row.disconfirmation_verified_json),
     controlVerified: safeParseObject(row.control_verified_json),
+    pendingConfirmation: safeParseObject(row.pending_confirmation_json),
+    confirmerVerdict: safeParseObject(row.confirmer_verdict_json),
     reportedAt: row.reported_at || undefined,
     reportPath: row.report_path || undefined,
     evidenceItems,
@@ -673,16 +757,20 @@ function validateCase(record: CaseRecord): void {
     );
   }
   // Keep this gate in lockstep with promoteFindingResult: a case may only be
-  // CONFIRMED when it has evidence, a PoC, demonstrated impact, and a severity.
+  // CONFIRMED when it has evidence, a PoC, demonstrated impact, a severity,
+  // and a named target (what host/repo/scope this affects).
   if (
     record.status === "confirmed" &&
     (!record.evidence ||
       !record.poc ||
       !record.impact ||
       !record.severity ||
+      !record.target ||
       !record.disconfirmation)
   ) {
-    throw new Error("Confirmed cases require evidence, poc, impact, severity, and disconfirmation");
+    throw new Error(
+      "Confirmed cases require evidence, poc, impact, severity, target, and disconfirmation",
+    );
   }
   if (record.status === "blocked" && (record.blockers ?? []).length === 0) {
     throw new Error("Blocked cases require at least one blocker");
@@ -788,7 +876,16 @@ export const KILL_REASON_VALUES = [
 ] as const;
 export type KillReason = (typeof KILL_REASON_VALUES)[number];
 
-const KILL_REASON_PATTERN = new RegExp(`\\b(${KILL_REASON_VALUES.join("|")})\\b`, "i");
+/**
+ * Matches a kill reason whether the agent wrote the canonical token
+ * ("out_of_scope"), a spaced form ("out of scope"), or hyphenated
+ * ("out-of-scope") — the underscore spelling is machine vocabulary; free text
+ * must not be rejected just because it reads naturally.
+ */
+const KILL_REASON_PATTERN = new RegExp(
+  `\\b(${KILL_REASON_VALUES.map((v) => v.replace(/_/g, "[ _-]+")).join("|")})\\b`,
+  "i",
+);
 
 function validateTransition(
   from: CaseStatus,
@@ -813,26 +910,32 @@ function validateTransition(
 
   if (to === "killed") {
     // Black-cat rule: a kill must be justified. Valid iff (a) a refutation
-    // evidence item exists for this case, or (b) — only for hypothesis-stage
-    // cases — the update states a kill reason from the KILLED catalog
-    // vocabulary (matches workflow.ts). Once a case reached investigating or
-    // confirmed, a keyword in free text is NOT enough: the kill must be backed
-    // by a real refutation evidence item (EvidenceAdd role=refutation — the
-    // disprove attempt that ended the lead).
+    // evidence item exists for this case, or (b) — only for cases that have
+    // NEVER reached investigating/confirmed — the update states a kill reason
+    // from the KILLED catalog vocabulary (matches workflow.ts). Once a case
+    // reached investigating or confirmed (everAdvanced — immune to demotion
+    // round-trips), a keyword in free text is NOT enough: the kill must be
+    // backed by a real refutation evidence item (EvidenceAdd role=refutation —
+    // the disprove attempt that ended the lead).
     const items = current ? listEvidenceItems(current.id) : [];
     if (!items.some((e) => e.role === "refutation" && e.sha256)) {
-      const advanced = current?.status === "investigating" || current?.status === "confirmed";
-      const text = [update.nextStep, (update.assumptions ?? []).join(" "), update.evidence]
+      const advanced = current?.everAdvanced === true;
+      const text = [
+        update.nextStep,
+        (update.assumptions ?? []).join(" "),
+        (update.blockers ?? []).join(" "),
+        update.evidence,
+      ]
         .filter(Boolean)
         .join(" ");
       if (advanced || !KILL_REASON_PATTERN.test(text)) {
         throw new Error(
           advanced
-            ? "Cannot kill an investigating/confirmed case without ARTIFACT-BACKED refutation evidence: add " +
+            ? "Cannot kill an advanced case (ever reached investigating/confirmed) without ARTIFACT-BACKED refutation evidence: add " +
                 "EvidenceAdd role=refutation with artifact_path (sha256 required — the disprove attempt " +
                 "that ended this lead) before killing."
             : "Cannot kill without justification: add refutation evidence (EvidenceAdd role=refutation, " +
-                "artifact_path recommended) or state a kill reason in assumptions/nextStep " +
+                "artifact_path recommended) or state a kill reason in assumptions/nextStep/blockers " +
                 "(intended_behavior, duplicate, framework_protection, out_of_scope, " +
                 "skeptic-disproven, no_attack_path, ...)",
         );
@@ -923,6 +1026,12 @@ function buildRecord(input: NormalizedCaseInput, existing?: CaseRecord): CaseRec
     id,
     title,
     status: input.status ?? existing?.status ?? "hypothesis",
+    // Once a case has been investigating/confirmed it never forgets — the kill
+    // gate must not be defeatable by demoting first.
+    everAdvanced:
+      existing?.everAdvanced === true ||
+      input.status === "investigating" ||
+      input.status === "confirmed",
     confidence: input.confidence ?? existing?.confidence ?? "low",
     severity: input.severity ?? existing?.severity,
     priority: input.priority ?? existing?.priority,
@@ -948,6 +1057,8 @@ function buildRecord(input: NormalizedCaseInput, existing?: CaseRecord): CaseRec
         : existing?.disconfirmation,
     disconfirmationVerified: input.disconfirmationVerified ?? existing?.disconfirmationVerified,
     controlVerified: input.controlVerified ?? existing?.controlVerified,
+    pendingConfirmation: input.pendingConfirmation ?? existing?.pendingConfirmation,
+    confirmerVerdict: input.confirmerVerdict ?? existing?.confirmerVerdict,
     reportedAt: input.reportedAt ?? existing?.reportedAt,
     reportPath: input.reportPath ?? existing?.reportPath,
     evidenceItems: existing?.evidenceItems ?? [],
@@ -1207,8 +1318,12 @@ function titleTokenRarityWeights(titles: string[]): Map<string, number> {
   const n = titles.length;
   const weights = new Map<string, number>();
   for (const [token, docs] of df) {
-    // +1 smoothing: tokens unique to one doc stay above the baseline.
-    weights.set(token, 1 + Math.log((n + 1) / (docs + 1)));
+    // ln((n+1)/(docs+1)) — NO +1 baseline. A token in every title scores ~0
+    // (ln 1), a token in one title scores ln((n+1)/2) > 1 for n >= 3. The old
+    // `1 + ln(...)` made every weight >= 1, so the weighted half of the hybrid
+    // gate was vacuous (weightedSum >= sharedCount always) and generic
+    // vocabulary could never be down-weighted.
+    weights.set(token, Math.log((n + 1) / (docs + 1)));
   }
   return weights;
 }
@@ -1258,21 +1373,24 @@ function upsertCase(db: DatabaseSync, record: CaseRecord) {
   // wipe case_links when updating an existing primary key.
   const stmt = db.prepare(`
     INSERT INTO cases (
-      id, title, status, confidence, severity, priority, target, endpoint, bugClass,
+      id, title, status, ever_advanced, confidence, severity, priority, target, endpoint, bugClass,
       summary, evidence, impact, nextStep, poc, remediation,
       references_json, blockers_json, tags_json, assumptions_json, poc_verified_json,
       disconfirmation, disconfirmation_verified_json, disprove_if_json, control_verified_json,
+      pending_confirmation_json, confirmer_verdict_json,
       reported_at, report_path, created_at, updated_at
     ) VALUES (
-      ?, ?, ?, ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?, ?, ?,
       ?, ?, ?, ?, ?,
       ?, ?, ?, ?,
+      ?, ?,
       ?, ?, ?, ?
     )
     ON CONFLICT(id) DO UPDATE SET
       title = excluded.title,
       status = excluded.status,
+      ever_advanced = excluded.ever_advanced,
       confidence = excluded.confidence,
       severity = excluded.severity,
       priority = excluded.priority,
@@ -1294,6 +1412,8 @@ function upsertCase(db: DatabaseSync, record: CaseRecord) {
       disconfirmation_verified_json = excluded.disconfirmation_verified_json,
       disprove_if_json = excluded.disprove_if_json,
       control_verified_json = excluded.control_verified_json,
+      pending_confirmation_json = excluded.pending_confirmation_json,
+      confirmer_verdict_json = excluded.confirmer_verdict_json,
       reported_at = excluded.reported_at,
       report_path = excluded.report_path,
       created_at = excluded.created_at,
@@ -1304,6 +1424,7 @@ function upsertCase(db: DatabaseSync, record: CaseRecord) {
     record.id,
     record.title,
     record.status,
+    record.everAdvanced ? 1 : 0,
     record.confidence,
     record.severity || null,
     record.priority || null,
@@ -1325,6 +1446,8 @@ function upsertCase(db: DatabaseSync, record: CaseRecord) {
     record.disconfirmationVerified ? JSON.stringify(record.disconfirmationVerified) : null,
     JSON.stringify(record.disproveIf),
     record.controlVerified ? JSON.stringify(record.controlVerified) : null,
+    record.pendingConfirmation ? JSON.stringify(record.pendingConfirmation) : null,
+    record.confirmerVerdict ? JSON.stringify(record.confirmerVerdict) : null,
     record.reportedAt || null,
     record.reportPath || null,
     record.createdAt,
@@ -1621,6 +1744,8 @@ export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResu
         pocVerified: undefined,
         disconfirmationVerified: undefined,
         controlVerified: undefined,
+        confirmerVerdict: undefined,
+        pendingConfirmation: undefined,
       };
     }
 
@@ -1682,67 +1807,44 @@ export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResu
   });
 }
 
-export type PocVerification = PocVerificationRecord & {
-  /** True iff child output capture was complete. False on maxBuffer/timeouts/spawn failures. */
-  outputComplete?: boolean;
-  /** Harness mode used for the run: poc, control, or disconfirmation. */
-  mode?: string;
-  /** Target passed to the PoC through PI_POC_TARGET. */
-  target?: string;
-  /**
-   * Sanitized but UNTRUNCATED output, used for marker presence/absence
-   * checks. Never persisted to the ledger (stripRaw drops it) — a cheating
-   * script must not hide its marker in the slice, and the DB must not grow
-   * with megabytes of run output.
-   */
-  rawOutput?: string;
-};
-
-/** Drop the transient rawOutput before persisting a verification record. */
-function stripRaw(v: PocVerification): PocVerificationRecord {
-  const { rawOutput: _raw, ...rest } = v;
-  return rest;
+function validateRunEvidence(run: PocEvidenceRun, label: string): void {
+  if (!run.completed) {
+    throw new Error(`${label} did not complete; a crash is not evidence`);
+  }
+  if (!run.outputComplete) {
+    throw new Error(`${label} output capture was incomplete; evidence checks are unsafe`);
+  }
+  if (!run.evidence || !run.evidenceSha256) {
+    throw new Error(
+      `${label} has no evidence.json — the PoC must write evidence to $PI_POC_EVIDENCE_DIR`,
+    );
+  }
+  if (!evidenceNonceMatches(run.evidence, run.nonce)) {
+    throw new Error(`${label} evidence nonce mismatch — evidence not bound to this run`);
+  }
 }
 
-function assertVerificationRecord(
-  label: string,
-  v: PocVerification | undefined,
-  expectedMode: string,
-  expectedTarget: string,
-): asserts v is PocVerification {
-  if (!v) throw new Error(`${label} verification is required`);
-  if (!v.path || typeof v.path !== "string") throw new Error(`${label} verification path missing`);
-  if (!Number.isInteger(v.exitCode)) throw new Error(`${label} verification exitCode invalid`);
-  if (!v.ranAt || Number.isNaN(Date.parse(v.ranAt))) {
-    throw new Error(`${label} verification ranAt must be an ISO timestamp`);
-  }
-  if (typeof v.sandbox !== "boolean") throw new Error(`${label} verification sandbox flag missing`);
-  if (v.completed !== true) throw new Error(`${label} verification did not complete`);
-  if (v.outputComplete !== true) {
+/** Determinism + differential on normalized evidence (nonce/observations stripped). */
+function assertEvidenceDifferential(bundle: PendingConfirmation): void {
+  const [r1, r2] = bundle.targetRuns;
+  if (normalizeEvidence(r1.evidence) !== normalizeEvidence(r2.evidence)) {
     throw new Error(
-      `${label} verification output capture was incomplete; marker checks are unsafe`,
+      "Target runs produced inconsistent evidence — the exploit did not reproduce deterministically",
     );
   }
-  if (typeof v.rawOutput !== "string") {
-    throw new Error(`${label} verification rawOutput is required for full-output marker checks`);
-  }
-  if (v.mode !== expectedMode) {
+  if (normalizeEvidence(r1.evidence) === normalizeEvidence(bundle.controlRun.evidence)) {
     throw new Error(
-      `${label} verification mode mismatch: expected ${expectedMode}, got ${v.mode ?? "unset"}`,
-    );
-  }
-  if (v.target !== expectedTarget) {
-    throw new Error(
-      `${label} verification target mismatch: expected ${expectedTarget}, got ${v.target ?? "unset"}`,
+      "Control run produced identical evidence to the target — the claimed impact is not target-dependent",
     );
   }
 }
 
 /**
- * Gate for promotion to confirmed: case must exist, be investigating, and have
- * poc/evidence/impact/severity. Returns the record when promotable, throws
- * otherwise. Exported so PromoteFinding can validate BEFORE paying for a
- * (potentially slow) sandboxed PoC run.
+ * Gate for phase 1 of promotion: case must exist, be investigating, and have
+ * poc/evidence/impact/severity/target. The disconfirmation is provided by the
+ * confirmer at confirm time, so it is NOT a precondition here. Returns the
+ * record when promotable, throws otherwise. Exported so PromoteFinding can
+ * validate BEFORE paying for (potentially slow) sandboxed PoC runs.
  */
 export function assertPromotable(id: string): CaseRecord {
   const current = getCaseById(id);
@@ -1750,7 +1852,7 @@ export function assertPromotable(id: string): CaseRecord {
     throw new Error(`Case not found: ${id}`);
   }
   if (current.status !== "investigating") {
-    throw new Error(`promote_finding requires an investigating case (current: ${current.status})`);
+    throw new Error(`PromoteFinding requires an investigating case (current: ${current.status})`);
   }
   if (!current.poc) {
     throw new Error("CONFIRMED requires poc; set poc on the case first");
@@ -1769,15 +1871,10 @@ export function assertPromotable(id: string): CaseRecord {
       "CONFIRMED requires target (what host/repo/scope this affects); set target on the case first",
     );
   }
-  if (!current.disconfirmation) {
-    throw new Error(
-      "CONFIRMED requires disconfirmation (your attempt to disprove the finding); set disconfirmation on the case first",
-    );
-  }
   // Evidence-chain closure: the observation item must be ARTIFACT-BACKED. A
   // summary-only observation is agent prose about itself — promotion requires
   // a real file with its SHA-256 as the initial signal. (The reproduction item
-  // is always artifact-backed: the PoC gate writes it from verification.path.)
+  // is always artifact-backed: the gate writes it from the evidence hash.)
   if (!current.evidenceItems.some((e) => e.role === "observation" && e.sha256)) {
     throw new Error(
       "Evidence chain incomplete: CONFIRMED requires an artifact-backed observation evidence item " +
@@ -1788,171 +1885,237 @@ export function assertPromotable(id: string): CaseRecord {
   return current;
 }
 
-export function promoteFindingResult(
-  id: string,
-  verification: PocVerification,
-  disconfirmationVerification?: PocVerification,
-  controlVerification?: PocVerification,
-  marker?: string,
-  controlLivenessMarker?: string,
-): CaseUpdateResult {
+/**
+ * Phase 1: record the harness-observed evidence bundle on the case. The whole
+ * contract is validated here — same-file control, nonce binding, run
+ * completion, determinism across the two target runs, and the target/control
+ * differential — so a bundle that cannot promote is rejected before the
+ * confirmer is ever dispatched.
+ */
+export function storePendingConfirmation(id: string, bundle: PendingConfirmation): CaseRecord {
   const db = getDb();
   return withImmediateTransaction(db, () => {
-    const current = assertPromotable(id);
-    const caseTarget = current.target ?? "";
-
-    // Anti-cheat, enforced at the ledger level (not just the tool) for EVERY
-    // promotion — sandboxed and live alike. The control run must be the same
-    // script against a DISTINCT baseline target, with complete captured output.
-    const liveness = controlLivenessMarker?.trim();
-    if (!liveness) {
+    const current = getCaseById(id);
+    if (!current) throw new Error(`Case not found: ${id}`);
+    if (current.status !== "investigating") {
       throw new Error(
-        "Every promotion requires controlLivenessMarker: a non-empty string the control run must print " +
-          "after reaching its target. PromoteFinding requires control_path + control_liveness_marker.",
+        `Pending confirmation requires an investigating case (current: ${current.status})`,
       );
     }
-    const verificationMarker = marker?.trim();
-    if (!verificationMarker) {
+    if (bundle.caseId !== id) throw new Error("Pending confirmation caseId mismatch");
+    if (bundle.targetRuns.length !== 2 || !bundle.controlRun) {
+      throw new Error("Pending confirmation requires two target runs and one control run");
+    }
+    if (!bundle.pocPath || !bundle.controlPath || !bundle.controlTarget) {
+      throw new Error("Pending confirmation requires pocPath, controlPath, and controlTarget");
+    }
+    // Control-target binding (machine-verified here, not just in the tool
+    // layer): the control run must actually have targeted the declared
+    // control_target, that target must differ from the target runs' target,
+    // and the control target must differ from the case's target — otherwise
+    // "the control demonstrated nothing on the vulnerable target" passes.
+    const targetRunTarget = bundle.targetRuns[0]?.target;
+    if (!targetRunTarget || bundle.targetRuns.some((r) => r.target !== targetRunTarget)) {
       throw new Error(
-        "Every promotion requires verificationMarker: the marker the PoC must print after exploitation. " +
-          "promoteFindingResult refuses to promote on exit 0 alone.",
+        "Pending confirmation requires both target runs against the same case target",
       );
     }
-
-    assertVerificationRecord("PoC", verification, "poc", caseTarget);
-    if (!controlVerification?.target?.trim()) {
-      throw new Error("Every promotion requires a controlVerification target");
-    }
-    if (controlVerification.target === caseTarget) {
+    if (!bundle.controlRun.target || bundle.controlRun.target !== bundle.controlTarget) {
       throw new Error(
-        "Every promotion requires a distinct control target; the control run cannot use the case target",
+        "CONTROL BINDING FAILED: controlRun.target must equal control_target — a control run " +
+          "against a different host than the one declared proves nothing.",
       );
     }
-    assertVerificationRecord("Control", controlVerification, "control", controlVerification.target);
-    assertVerificationRecord(
-      "Disconfirmation",
-      disconfirmationVerification,
-      "disconfirmation",
-      caseTarget,
-    );
-
-    if (verification.exitCode !== 0) {
+    if (bundle.controlRun.target === targetRunTarget) {
       throw new Error(
-        `PoC verification failed (exit ${verification.exitCode}); cannot promote to confirmed`,
+        "CONTROL BINDING FAILED: the control run targeted the same host as the target runs — " +
+          "the claimed impact is not target-dependent.",
       );
     }
-
-    // Same-file contract: the control must be the SAME script as the PoC
-    // (differing only via PI_POC_MODE / PI_POC_TARGET). The tool enforces this
-    // before running; the ledger re-checks so a direct caller cannot bypass it.
+    if (bundle.controlTarget === current.target) {
+      throw new Error(
+        "CONTROL BINDING FAILED: control_target must differ from the case target; a control run " +
+          "against the vulnerable target proves nothing.",
+      );
+    }
+    // Same-file contract re-checked at store time (the tool already checked).
     let pocHash: string | undefined;
     let controlHash: string | undefined;
     try {
-      pocHash = createHash("sha256").update(readFileSync(verification.path)).digest("hex");
-      controlHash = createHash("sha256")
-        .update(readFileSync(controlVerification.path))
-        .digest("hex");
+      pocHash = createHash("sha256").update(readFileSync(bundle.pocPath)).digest("hex");
+      controlHash = createHash("sha256").update(readFileSync(bundle.controlPath)).digest("hex");
     } catch {
       pocHash = undefined;
       controlHash = undefined;
     }
     if (!pocHash || !controlHash || pocHash !== controlHash) {
       throw new Error(
-        "Every promotion requires controlVerification from the SAME script as the PoC " +
-          "(sha256 of controlVerification.path must equal sha256 of verification.path). " +
-          "A separately written control file proves nothing.",
+        "CONTROL CHECK FAILED: control_path must be the SAME script as poc_path " +
+          "(sha256 mismatch). A separately written control file proves nothing.",
       );
     }
+    if (bundle.pocSha256 && bundle.pocSha256 !== pocHash) {
+      throw new Error("pocSha256 does not match the PoC file on disk");
+    }
+    for (const run of [...bundle.targetRuns, bundle.controlRun]) {
+      validateRunEvidence(run, `${run.mode} run`);
+    }
+    assertEvidenceDifferential(bundle);
 
-    const controlOutput = controlVerification.rawOutput ?? "";
-    if (controlOutput.includes(verificationMarker) || !controlOutput.includes(liveness)) {
+    const next = buildRecord({ pendingConfirmation: bundle }, current);
+    validateCase(next);
+    upsertCase(db, next);
+    return next;
+  });
+}
+
+/**
+ * Phase 2: commit (or refuse) the promotion on a confirmer verdict.
+ *
+ * CONFIRMED requires the full bundle to still hold (completion, nonce,
+ * determinism, differential), the PoC script to be unchanged since the runs
+ * (pocSha256 — otherwise the confirmer reviewed different bytes), and a
+ * verdict that re-executed the verify request with a target-only differential
+ * and a disconfirmation attempt. NOT_CONFIRMED records the verdict and keeps
+ * the case investigating — no tie-breaker.
+ */
+export function applyConfirmationResult(
+  id: string,
+  verdictInput: ConfirmerVerdict,
+): CaseUpdateResult {
+  const db = getDb();
+  return withImmediateTransaction(db, () => {
+    const current = getCaseById(id);
+    if (!current) throw new Error(`Case not found: ${id}`);
+    if (current.status !== "investigating") {
+      throw new Error(`ConfirmFinding requires an investigating case (current: ${current.status})`);
+    }
+    const bundle = current.pendingConfirmation;
+    if (!bundle) {
+      throw new Error("No pending confirmation on this case — run PromoteFinding first");
+    }
+    // Fail closed on an unparseable ranAt: Date.parse(garbage) is NaN, and
+    // NaN > TTL is false — a malformed timestamp must NOT make the bundle
+    // immortal. Treat it as expired (re-run PromoteFinding for a fresh one).
+    const ranAtMs = Date.parse(bundle.ranAt);
+    if (!Number.isFinite(ranAtMs) || Date.now() - ranAtMs > PENDING_CONFIRM_TTL_MS) {
       throw new Error(
-        "Every promotion requires a valid controlVerification: a control-target run of the same " +
-          `PoC whose output does not contain the marker "${verificationMarker}"` +
-          ` and whose output DOES contain the control liveness marker "${liveness}"` +
-          " (the control must actually reach its target — a failed/early control is not a clean verdict)" +
-          ". PromoteFinding requires control_path + control_liveness_marker.",
+        "Pending confirmation expired or has an invalid timestamp (1h TTL) — re-run PromoteFinding for a fresh bundle",
       );
     }
+    const parsed = validateConfirmerVerdict(verdictInput);
+    if (!parsed.ok) throw new Error(`Invalid confirmer verdict: ${parsed.error}`);
+    const verdict = parsed.verdict;
+    const recorded: ConfirmerVerdictRecord = { ...verdict, at: new Date().toISOString() };
 
-    const pocOutput = verification.rawOutput ?? "";
-    if (!pocOutput.includes(verificationMarker)) {
-      throw new Error(
-        `PoC verification output does not contain the verification marker "${verificationMarker}"; ` +
-          "exit 0 alone cannot promote to confirmed",
+    if (verdict.verdict === "NOT_CONFIRMED") {
+      const note = `confirmer NOT_CONFIRMED${verdict.model ? ` (${verdict.model})` : ""}: ${verdict.reasoning}`;
+      const next = buildRecord(
+        { confirmerVerdict: recorded, assumptions: [...(current.assumptions ?? []), note] },
+        current,
       );
+      validateCase(next);
+      upsertCase(db, next);
+      return { record: next, changed: true };
     }
 
-    if (disconfirmationVerification.exitCode === 0) {
-      throw new Error(
-        "Every promotion requires an executed disconfirmation run that completed and exited non-zero " +
-          "(the finding survived the attempt to disprove it). PromoteFinding requires disconfirmation_path for every promotion.",
-      );
+    // CONFIRMED — re-validate the whole bundle (defense in depth; the case may
+    // have been touched between phase 1 and the verdict).
+    for (const run of [...bundle.targetRuns, bundle.controlRun]) {
+      validateRunEvidence(run, `${run.mode} run`);
     }
-
-    // Machine-recorded reproduction evidence: the PoC gate itself writes the
-    // artifact-backed evidence item — confirmation is anchored to a real file
-    // with its SHA-256, not to agent prose in the evidence field.
-    let pocSha256: string | undefined;
+    assertEvidenceDifferential(bundle);
+    let pocHash: string | undefined;
     try {
-      pocSha256 = createHash("sha256").update(readFileSync(verification.path)).digest("hex");
+      pocHash = createHash("sha256").update(readFileSync(bundle.pocPath)).digest("hex");
     } catch {
-      pocSha256 = undefined;
+      pocHash = undefined;
+    }
+    if (!pocHash || pocHash !== bundle.pocSha256) {
+      throw new Error(
+        "PoC script changed since the runs — re-run PromoteFinding (the confirmer must review the exact bytes that ran)",
+      );
+    }
+    // The case target must still be the host the PoC ran against, and still
+    // differ from the control target. The evidence proves nothing about a
+    // target the case adopted after the runs.
+    const targetRun = bundle.targetRuns[0];
+    if (!current.target || current.target !== targetRun.target) {
+      throw new Error(
+        "Case target changed since the PoC runs — re-run PromoteFinding against the current target " +
+          `(bundle target: ${targetRun.target}, case target: ${current.target ?? "(none)"}).`,
+      );
+    }
+    if (current.target === bundle.controlTarget) {
+      throw new Error(
+        "Case target now equals the control target — the claimed impact is not target-dependent; " +
+          "re-run PromoteFinding with a distinct control_target.",
+      );
     }
 
-    // Cheap provenance guards on the observation item: it must be a DIFFERENT
-    // file than the PoC (same hash = the model re-used its PoC as "the initial
-    // signal"), a different basename, and it must predate the PoC run.
+    // The observation must predate the repro (provenance guard).
     const observation = current.evidenceItems.find((e) => e.role === "observation" && e.sha256);
-    if (observation) {
-      if (pocSha256 && observation.sha256 === pocSha256) {
-        throw new Error(
-          "Evidence chain invalid: the observation artifact is the same file as the PoC " +
-            "(identical sha256). The initial signal must be a separate captured artifact.",
-        );
-      }
-      if (observation.artifactPath && observation.artifactPath === basename(verification.path)) {
-        throw new Error(
-          "Evidence chain invalid: the observation artifact has the same basename as the PoC file. " +
-            "The initial signal must be a separate captured artifact.",
-        );
-      }
-      if (observation.createdAt > verification.ranAt) {
-        throw new Error(
-          "Evidence chain invalid: the observation item was recorded after the PoC ran " +
-            `(${observation.createdAt} > ${verification.ranAt}). The observation must predate the repro.`,
-        );
-      }
+    if (observation && observation.createdAt > bundle.targetRuns[0].ranAt) {
+      throw new Error(
+        "Evidence chain invalid: the observation item was recorded after the PoC ran " +
+          `(${observation.createdAt} > ${bundle.targetRuns[0].ranAt}). The observation must predate the repro.`,
+      );
     }
+
     const reproductionItem: EvidenceItem = {
-      id: `ev_${stableShortId(`${id}\nreproduction\n${verification.ranAt}`)}`,
+      id: `ev_${stableShortId(`${id}\nreproduction\n${targetRun.ranAt}`)}`,
       caseId: id,
       role: "reproduction",
-      artifactPath: basename(verification.path),
-      sha256: pocSha256,
-      summary: `PoC run exit ${verification.exitCode} (sandbox: ${verification.sandbox}) — verification marker present in output`,
-      createdAt: verification.ranAt,
+      // The runner preserves each run's evidence.json in a durable dir
+      // (.pi/poc-evidence/) — the artifact the hash was computed over still
+      // exists, so the item stays artifact-backed and re-verifiable.
+      artifactPath: targetRun.evidencePath ? basename(targetRun.evidencePath) : "evidence.json",
+      sha256: targetRun.evidenceSha256,
+      summary: `PoC evidence verified (2 target runs + control) — confirmer CONFIRMED${verdict.model ? ` (${verdict.model})` : ""}`,
+      createdAt: targetRun.ranAt,
     };
 
     const newEvidence =
       (current.evidence ? `${current.evidence}\n\n` : "") +
-      `### PoC Execution Capture (${verification.ranAt})\n` +
-      `- **Exit Code:** ${verification.exitCode}\n` +
-      `- **Sandbox:** ${verification.sandbox ? "yes" : "no"}\n` +
-      `- **Target:** ${verification.target}\n` +
-      `#### Execution Output\n\`\`\`\n${verification.output ?? ""}\n\`\`\``;
+      `### PoC Execution Capture (${targetRun.ranAt})\n` +
+      `- **Evidence sha256:** ${targetRun.evidenceSha256}\n` +
+      `- **Target:** ${targetRun.target}\n` +
+      `- **Confirmer:** ${verdict.model ?? "unknown model"} — CONFIRMED\n` +
+      `#### Target Run Output\n\`\`\`\n${targetRun.output ?? ""}\n\`\`\``;
 
     const update: NormalizedCaseInput = {
       status: "confirmed",
-      pocVerified: stripRaw(verification),
-      disconfirmationVerified: stripRaw(disconfirmationVerification),
-      controlVerified: stripRaw(controlVerification),
+      pocVerified: {
+        path: bundle.pocPath,
+        exitCode: targetRun.exitCode,
+        ranAt: targetRun.ranAt,
+        output: targetRun.output,
+        sandbox: targetRun.sandbox,
+        completed: true,
+        outputComplete: true,
+        mode: "poc",
+        target: targetRun.target,
+      },
+      controlVerified: {
+        path: bundle.controlPath,
+        exitCode: bundle.controlRun.exitCode,
+        ranAt: bundle.controlRun.ranAt,
+        output: bundle.controlRun.output,
+        sandbox: bundle.controlRun.sandbox,
+        completed: true,
+        outputComplete: true,
+        mode: "control",
+        target: bundle.controlRun.target,
+      },
+      disconfirmation: verdict.disconfirmation_attempt,
+      confirmerVerdict: recorded,
+      pendingConfirmation: undefined,
       evidence: newEvidence,
     };
 
     const next = buildRecord(update, current);
+    next.pendingConfirmation = undefined; // buildRecord's ?? existing keeps it; clear explicitly
     validateCase(next);
-
     insertEvidenceItem(db, reproductionItem);
     upsertCase(db, next);
     next.evidenceItems = [...(next.evidenceItems ?? []), reproductionItem];
@@ -2360,12 +2523,16 @@ function buildCaseWhere(options: CaseSearchOptions): {
 
   const query = options.query?.trim().toLowerCase();
   if (query) {
-    const likeParam = `%${query}%`;
+    // Escape LIKE wildcards so a query containing % or _ matches literally
+    // instead of acting as a pattern ("100%" must not match "1000"). The
+    // backslash is the escape char, so it is escaped first.
+    const escaped = query.replace(/[\\%_]/g, (m) => `\\${m}`);
+    const likeParam = `%${escaped}%`;
     if (options.field) {
-      where.push(`lower(${options.field}) LIKE ?`);
+      where.push(`lower(${options.field}) LIKE ? ESCAPE '\\'`);
       params.push(likeParam);
     } else {
-      const ors = SEARCH_FIELD_VALUES.map((c) => `lower(${c}) LIKE ?`).join(" OR ");
+      const ors = SEARCH_FIELD_VALUES.map((c) => `lower(${c}) LIKE ? ESCAPE '\\'`).join(" OR ");
       where.push(`(${ors})`);
       for (let i = 0; i < SEARCH_FIELD_VALUES.length; i++) params.push(likeParam);
     }
@@ -2405,8 +2572,12 @@ export function searchCases(options: CaseSearchOptions = {}): {
   total: number;
 } {
   const db = getDb();
-  const limit = Math.max(1, Math.min(options.limit ?? 50, 200));
-  const offset = Math.max(0, options.offset ?? 0);
+  // NaN is not clamped by Math.min/max (it passes through) and SQLite binds it
+  // as NULL, which disables LIMIT — fall back to the default instead.
+  const rawLimit = Number.isFinite(options.limit) ? options.limit : undefined;
+  const rawOffset = Number.isFinite(options.offset) ? options.offset : undefined;
+  const limit = Math.max(1, Math.min(rawLimit ?? 50, 200));
+  const offset = Math.max(0, rawOffset ?? 0);
 
   const { whereSql, orderSql, params } = buildCaseWhere(options);
 
@@ -2496,7 +2667,10 @@ export function formatCaseDetail(record: CaseRecord): string {
     } else if (Array.isArray(val)) {
       display = val.join(", ");
     } else if (typeof val === "object") {
-      display = JSON.stringify(val);
+      // Path-leak guard (consistent with buildCompleteRecord): verification
+      // objects and the pending bundle carry local script/evidence paths —
+      // show basenames only.
+      display = JSON.stringify(redactPaths(val));
     } else {
       display = String(val);
     }
@@ -2528,25 +2702,39 @@ const MAX_ARTIFACT_CHARS = 100_000;
  * must not balloon the report context into megabytes. */
 const MAX_TOTAL_ARTIFACT_CHARS = 400_000;
 
+/**
+ * Recursively redact local filesystem paths to basenames in a serialized
+ * object. Covers the verification records (path), the pending confirmation
+ * bundle (pocPath/controlPath) and preserved evidence copies (evidencePath) —
+ * the context bundle must never leak the researcher's local paths.
+ */
+function redactPaths(value: unknown, seen = new Set<object>()): unknown {
+  if (Array.isArray(value)) return value.map((v) => redactPaths(v, seen));
+  if (typeof value !== "object" || value === null) return value;
+  if (seen.has(value)) return value;
+  seen.add(value);
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (
+      typeof v === "string" &&
+      (k === "path" || k === "pocPath" || k === "controlPath" || k === "evidencePath")
+    ) {
+      out[k] = basename(v) || v;
+    } else {
+      out[k] = redactPaths(v, seen);
+    }
+  }
+  return out;
+}
+
 function buildCompleteRecord(current: CaseRecord): string {
   const rows: string[] = [];
   for (const [k, v] of Object.entries(current)) {
     if (v === undefined || v === null || v === "") continue;
-    let display = typeof v === "object" ? JSON.stringify(v, null, 2) : String(v);
-    // Path-leak guard: the verification objects carry the researcher's local
-    // PoC/disconfirmation/control script paths — show basenames only (the dedicated
-    // log sections below already render them as basenames).
-    if (
-      (k === "pocVerified" || k === "disconfirmationVerified" || k === "controlVerified") &&
-      v &&
-      typeof v === "object"
-    ) {
-      const redacted = {
-        ...(v as Record<string, unknown>),
-        path: basename((v as { path?: string }).path ?? ""),
-      };
-      display = JSON.stringify(redacted, null, 2);
-    }
+    // Path-leak guard: verification objects + the pending bundle carry the
+    // researcher's local PoC/disconfirmation/control/evidence paths — show
+    // basenames only (the dedicated log sections do the same).
+    const display = typeof v === "object" ? JSON.stringify(redactPaths(v), null, 2) : String(v);
     rows.push(`- **${k}:** ${display.replace(/\n/g, "\n  ")}`);
   }
   return rows.join("\n");
@@ -2702,13 +2890,13 @@ export function writeCaseContext(id: string): {
     current.pocVerified
       ? mdSection(
           "PoC Verification Log",
-          `### PoC Run Verification\n- **Timestamp:** ${current.pocVerified.ranAt}\n- **Script:** \`${basename(current.pocVerified.path)}\`\n- **Sandbox:** ${current.pocVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.pocVerified.exitCode}\n\n#### Output\n\`\`\`\n${current.pocVerified.output ?? ""}\n\`\`\``,
+          `### PoC Run Verification\n- **Timestamp:** ${current.pocVerified.ranAt}\n- **Script:** \`${basename(current.pocVerified.path)}\`\n- **Sandbox:** ${current.pocVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.pocVerified.exitCode}\n- **Target:** ${current.pocVerified.target ?? "not recorded"}\n\n#### Output\n\`\`\`\n${current.pocVerified.output ?? ""}\n\`\`\``,
         )
       : undefined,
     current.controlVerified
       ? mdSection(
           "Control-Target Check (anti-cheat)",
-          `### Control Run Verification\n- **Timestamp:** ${current.controlVerified.ranAt}\n- **Script:** \`${basename(current.controlVerified.path)}\`\n- **Sandbox:** ${current.controlVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.controlVerified.exitCode}\n- **Marker on control:** absent (required) — same PoC against a target lacking the vuln did NOT print the verification marker.\n\n#### Output\n\`\`\`\n${current.controlVerified.output ?? ""}\n\`\`\``,
+          `### Control Run Verification\n- **Timestamp:** ${current.controlVerified.ranAt}\n- **Script:** \`${basename(current.controlVerified.path)}\`\n- **Sandbox:** ${current.controlVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.controlVerified.exitCode}\n- **Control target:** ${current.controlVerified.target ?? "not recorded"}\n- **Differential (machine-checked):** control evidence differs from the target runs' evidence — the claimed impact is target-dependent (assertEvidenceDifferential, re-checked at confirm).\n- **Note:** exit codes and output markers are diagnostics, not gates; the machine floor is the evidence differential + the confirmer's re-execution.\n\n#### Output\n\`\`\`\n${current.controlVerified.output ?? ""}\n\`\`\``,
         )
       : undefined,
     mdSection("Disconfirmation Attempt", current.disconfirmation),

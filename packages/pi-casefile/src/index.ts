@@ -12,10 +12,16 @@ import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-
+import {
+  CONFIRM_DIFFERENTIAL_VALUES,
+  CONFIRM_VERDICT_VALUES,
+  type ConfirmerVerdict,
+  SEVERITY_MATCH_VALUES,
+} from "./evidence.ts";
 import {
   addCaseResult,
   addEvidenceItemResult,
+  applyConfirmationResult,
   assertPromotable,
   type CaseConfidence,
   type CaseInput,
@@ -41,8 +47,9 @@ import {
   getCasefilePath,
   LINK_KIND_VALUES,
   linkCasesResult,
+  type PendingConfirmation,
+  type PocEvidenceRun,
   PRIORITY_VALUES,
-  promoteFindingResult,
   readActiveCases,
   readCasefile,
   recordCoverageResult,
@@ -50,6 +57,7 @@ import {
   SEVERITY_VALUES,
   STATUS_VALUES,
   searchCases,
+  storePendingConfirmation,
   suggestChains,
   unlinkCasesResult,
   updateCaseResult,
@@ -58,6 +66,7 @@ import {
 import { pipeline_submit, SUBMIT_STAGES, type SubmitStage } from "./pipeline-submit.ts";
 import { type PocRun, type PocRunOptions, runPoc } from "./poc-runner.ts";
 import {
+  detectWorkspaceRoot,
   PHASE_ORDER,
   type ScratchpadPhase,
   type ScratchpadResume,
@@ -68,8 +77,13 @@ import {
   scratchpad_read,
   scratchpad_resume,
   scratchpad_write,
+  setScratchpadRoot,
 } from "./scratchpad.ts";
-import { STATIC_CYBER_WORKFLOW, STATIC_CYBER_WORKFLOW_LITE } from "./workflow.ts";
+import {
+  STATIC_CYBER_WORKFLOW,
+  STATIC_CYBER_WORKFLOW_LITE,
+  STATIC_CYBER_WORKFLOW_OMP,
+} from "./workflow.ts";
 
 // ── Schemas ───────────────────────────────────────────────────────────
 
@@ -161,7 +175,14 @@ const EvidenceAddSchema = Type.Object(
   { additionalProperties: false },
 );
 
-// ── Tool: PromoteFinding ─────────────────────────────────────────────
+// ── Tool: PromoteFinding (phase 1) / ConfirmFinding (phase 2) ──────────
+//
+// Confirmation is TWO-PHASE because tools cannot dispatch subagents: the
+// coordinator runs PromoteFinding (harness runs the PoC 2x + control,
+// validates nonce-bound evidence.json, records the bundle), dispatches the
+// confirmer subagent (fresh context, re-executes the verify request), then
+// commits the verdict via ConfirmFinding. Exit codes and markers are
+// diagnostics — the gate is evidence + verdict.
 
 const PromoteSchema = Type.Object(
   {
@@ -169,34 +190,65 @@ const PromoteSchema = Type.Object(
     poc_path: Type.String({
       description: "Absolute path to the PoC script on disk",
     }),
-    verification_marker: Type.String({
-      minLength: 1,
-      description:
-        "Unique string the PoC must print AFTER verifying the exploit worked (data extracted, callback received, payload reflected). The gate checks output contains this marker — exit code 0 alone is NOT sufficient; the marker prevents fluke exit 0 and mocked PoCs. Example: 'VULN_CONFIRMED_<case-id>'. Never print it unconditionally or before the exploit check.",
-    }),
-    disconfirmation_path: Type.String({
-      description:
-        "REQUIRED for EVERY promotion: absolute path to a disconfirmation script that tries to disprove the finding; it must complete and exit non-zero (finding survived disproof).",
-    }),
     control_path: Type.String({
       description:
-        "REQUIRED for EVERY promotion: absolute path to the SAME script as poc_path (sha256-enforced). The harness runs it in control mode against control_target and blocks if verification_marker appears.",
+        "REQUIRED: absolute path to the SAME script as poc_path (sha256-equality is ENFORCED). The harness runs it with PI_POC_MODE=control and PI_POC_TARGET=control_target.",
     }),
     control_target: Type.String({
       minLength: 1,
       description:
-        "REQUIRED for EVERY promotion: target passed to the same PoC in control mode. Must be distinct from the case target and lack the vulnerability (patched replica, second account, baseline endpoint).",
-    }),
-    control_liveness_marker: Type.String({
-      minLength: 1,
-      description:
-        "REQUIRED for EVERY promotion: a unique string the control script must print AFTER successfully reaching/exercising the control target (e.g. 'CONTROL_REACHED_<case-id>'). The harness blocks promotion if the control output lacks it — a control that never reached its target (unreachable host, wrong port, early exit) is not a clean verdict. Must differ from verification_marker.",
+        "REQUIRED: a distinct baseline target that lacks the vulnerability (patched replica, second account, baseline endpoint).",
     }),
     local: Type.Optional(
       Type.Boolean({
         description:
           "Run with network access (Docker sandbox with --network host — still read-only FS, dropped capabilities, unprivileged user) instead of the isolated --network none sandbox. True host execution is NOT agent-selectable: it requires the operator to set PI_POC_ALLOW_LOCAL=1, and is used only as a fallback when Docker is unavailable.",
       }),
+    ),
+  },
+  { additionalProperties: false },
+);
+
+const ConfirmSchema = Type.Object(
+  {
+    id: Type.String({ description: "Case ID with a pending confirmation" }),
+    verdict: Type.Object(
+      {
+        verdict: Type.String({ enum: [...CONFIRM_VERDICT_VALUES] }),
+        reasoning: Type.String({
+          description: "Why the evidence does or does not demonstrate the claim",
+        }),
+        evidence_reviewed: Type.Array(Type.String(), {
+          description: "Files/evidence the confirmer actually reviewed",
+        }),
+        re_executed: Type.Boolean({
+          description:
+            "True iff the confirmer re-sent the verify request itself. Mandatory for CONFIRMED.",
+        }),
+        re_execution_note: Type.Optional(
+          Type.String({ description: "What the confirmer observed when re-executing" }),
+        ),
+        differential: Type.String({
+          enum: [...CONFIRM_DIFFERENTIAL_VALUES],
+          description: "Target vs control evidence comparison. CONFIRMED requires target_only.",
+        }),
+        severity_match: Type.Optional(
+          Type.String({
+            enum: [...SEVERITY_MATCH_VALUES],
+            description: "Claimed severity vs what the evidence shows",
+          }),
+        ),
+        disconfirmation_attempt: Type.Optional(
+          Type.String({
+            description:
+              "The confirmer's own failed attempt to disprove — becomes the case's disconfirmation",
+          }),
+        ),
+        model: Type.Optional(
+          Type.String({ description: "Which model judged (recorded for the accuracy ledger)" }),
+        ),
+      },
+      { additionalProperties: false },
     ),
   },
   { additionalProperties: false },
@@ -605,13 +657,27 @@ function buildCaseListContext(records: CaseRecord[]): string {
 }
 
 /**
+ * Detect the extension host. OMP is a fork of Pi: both load the same
+ * `pi`-manifest extensions, but subagent dispatch differs (pi-subagents'
+ * `subagent({workflowScript})` vs OMP's native `task`). The entry script path
+ * carries the host package: `@oh-my-pi/pi-coding-agent/dist/cli.js` under OMP,
+ * `@earendil-works/pi-coding-agent` under Pi.
+ */
+export function detectHost(): "omp" | "pi" {
+  const argv = process.argv.join(" ");
+  if (argv.includes("@oh-my-pi")) return "omp";
+  return "pi";
+}
+
+/**
  * Builds the per-prompt injection. The cyber workflow is session-scope data —
  * it never changes — so the caller passes includeWorkflow=true exactly once
  * per session; re-injecting it on every prompt is pure token cost. The active
  * case list DOES change as cases are added, so it is refreshed every prompt.
  *
  * mode selects the workflow text: "lite" injects the single-agent workflow
- * (no subagent dispatch), anything else gets the full subagent pipeline.
+ * (no subagent dispatch), anything else gets the full subagent pipeline,
+ * rendered for the host's dispatch convention (pi-subagents vs OMP task).
  */
 function buildAgentInjection(
   active: CaseRecord[],
@@ -620,7 +686,12 @@ function buildAgentInjection(
 ): string {
   const caseList = buildCaseListContext(active);
   if (!includeWorkflow) return caseList;
-  const workflow = mode === "lite" ? STATIC_CYBER_WORKFLOW_LITE : STATIC_CYBER_WORKFLOW;
+  const workflow =
+    mode === "lite"
+      ? STATIC_CYBER_WORKFLOW_LITE
+      : detectHost() === "omp"
+        ? STATIC_CYBER_WORKFLOW_OMP
+        : STATIC_CYBER_WORKFLOW;
   // Workflow FIRST for prominence, then case list as reference data.
   return caseList ? `${workflow}\n\n${caseList}` : workflow;
 }
@@ -681,6 +752,15 @@ export function parseXpModeArg(args: string, current: XpMode): XpMode {
 // ── Main extension ────────────────────────────────────────────────────
 
 export default function casefileExtension(pi: ExtensionAPI) {
+  // Pin the workspace root ONCE at extension load. Every scratchpad / pipeline
+  // / PoC-path lookup otherwise re-walks the ambient cwd on each call — a
+  // mid-session `cd` would split state across two .scratchpad roots and
+  // misroot the hunt file-existence filter. The PoC runner reads PI_POC_ROOT
+  // (set only when the operator hasn't pinned it explicitly).
+  const workspaceRoot = detectWorkspaceRoot();
+  setScratchpadRoot(workspaceRoot);
+  process.env.PI_POC_ROOT ??= workspaceRoot;
+
   // ── Diagnostic Error Handler Middleware ──
   const originalRegisterTool = pi.registerTool.bind(pi);
   pi.registerTool = (spec: any) => {
@@ -887,13 +967,15 @@ export default function casefileExtension(pi: ExtensionAPI) {
         description:
           "The attack class tested (e.g. sql-injection, xss, idor, ssti, ssrf, auth-bypass, ...).",
       }),
-      scope: Type.Union(
-        COVERAGE_SCOPE_VALUES.map((s) => Type.Literal(s)),
-        {
-          description:
-            "'wide' if the verdict applies to the whole deployment/account/host (recorded ONCE, applies to every asset of the deployment — do NOT re-test it per asset); 'local' if specific to this one asset.",
-        },
-      ),
+      // Provider-safe string enum (per the header rule): Type.Union(Type.Literal)
+      // serializes to anyOf/const, which some providers drop — scope would
+      // arrive undefined and every explicit 'wide' verdict would silently
+      // persist as 'local', under-reporting tested classes.
+      scope: Type.String({
+        enum: [...COVERAGE_SCOPE_VALUES],
+        description:
+          "'wide' if the verdict applies to the whole deployment/account/host (recorded ONCE, applies to every asset of the deployment — do NOT re-test it per asset); 'local' if specific to this one asset.",
+      }),
       note: Type.String({
         description:
           "Short note of the tests ACTUALLY RUN and the verdict: techniques tried · result · key gap. A verdict guessed without testing can hide a real issue.",
@@ -1022,70 +1104,47 @@ export default function casefileExtension(pi: ExtensionAPI) {
   });
 
   // ── Tool: PromoteFinding ──
+  // ── Tool: PromoteFinding (phase 1) ──
 
   pi.registerTool({
     name: "PromoteFinding",
-    label: "Promote Finding",
+    label: "Run PoC Evidence",
     description:
-      "Run an on-disk PoC script (Docker sandbox or host-network sandbox) and, on exit 0 + verification marker present in output, promote an investigating case to confirmed. The verification_marker proves the exploit worked — exit code 0 alone is NOT sufficient. EVERY promotion REQUIRES disconfirmation_path, same-script control_path, distinct control_target, and control_liveness_marker. The harness blocks promotion if output capture is incomplete, if the control prints the vuln marker, if liveness is absent, or if control/disconfirmation crash. Host execution is never agent-selectable — local:true uses a host-network Docker sandbox; true host runs need PI_POC_ALLOW_LOCAL=1.",
-    promptSnippet: "Run a PoC and promote an investigating case to confirmed",
+      "Phase 1 of confirmation: run the PoC twice against the case target plus once against control_target (same script, sha256-enforced), then validate the nonce-bound evidence.json each run writes to $PI_POC_EVIDENCE_DIR. Records a pending confirmation bundle (expires in 1h) and returns the confirmer dispatch instruction. Exit codes and markers are DIAGNOSTICS — the gate is evidence + confirmer verdict. After PromoteFinding: dispatch the confirmer subagent, then commit its verdict with ConfirmFinding. Host execution is never agent-selectable — local:true uses a host-network Docker sandbox; true host runs need PI_POC_ALLOW_LOCAL=1.",
+    promptSnippet: "Phase 1: run PoC evidence (target x2 + control) and record the pending bundle",
     promptGuidelines: [
       "Use PromoteFinding when an investigating case has a concrete PoC script on disk and you are ready to prove it.",
-      "Prerequisites: status='investigating' and non-empty poc, evidence, impact, severity, target, disconfirmation, plus an artifact-backed EvidenceAdd 'observation' item on the case (the initial signal, with artifact_path) — the PoC gate auto-records the reproduction item.",
+      "Prerequisites: status='investigating' and non-empty poc, evidence, impact, severity, target, plus an artifact-backed EvidenceAdd 'observation' item on the case (the initial signal, with artifact_path). The disconfirmation comes from the confirmer at confirm time.",
+      "The PoC MUST write evidence.json to $PI_POC_EVIDENCE_DIR: { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status/body_contains/body_regex } }, observations }. The harness validates it and binds it to the run — missing/invalid/misnonced evidence blocks promotion.",
+      "control_path (REQUIRED): the SAME script as poc_path (sha256-equality is ENFORCED). The harness runs it with PI_POC_MODE=control and PI_POC_TARGET=control_target. The control's evidence must DIFFER from the target's (not target-dependent → blocked).",
       "Default sandbox: docker run --rm --network none. Use local:true for network-dependent bugs (host-network sandbox; host execution needs operator PI_POC_ALLOW_LOCAL=1).",
-      "Gate: exit 0 AND verification_marker in the PoC output. The marker (e.g. 'VULN_CONFIRMED_<case-id>') must be printed only AFTER the exploit is verified (data extracted, callback received, payload reflected) — never unconditionally or before the exploit check. The marker check prevents fluke exit 0 (script crashed early) and mocked PoCs (target faked) from passing.",
-      "control_path (REQUIRED): the SAME script as poc_path (sha256-equality is ENFORCED). The harness runs it with PI_POC_MODE=control and PI_POC_TARGET=control_target. The control must not print the verification marker and must print the liveness marker.",
-      "control_target + control_liveness_marker (REQUIRED): control_target is the distinct baseline target. The liveness marker is printed only AFTER reaching/exercising it; absent liveness blocks promotion.",
-      "disconfirmation_path: a script that tries to disprove the finding; if it exits 0, promotion is blocked. REQUIRED for EVERY promotion — the prose disconfirmation field is not enough at any severity (a case filed low/medium must not skip the run and be re-raised afterwards).",
-      "Never CaseUpdate status='confirmed' directly — it is rejected. Always use PromoteFinding.",
+      "After the bundle is recorded, dispatch the confirmer subagent (agents/confirmer.md, fresh context, different model) and commit its verdict with ConfirmFinding. Never CaseUpdate status='confirmed' directly.",
     ],
     parameters: PromoteSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      // Validate promotability BEFORE running the PoC — a sandboxed run can take
-      // 30s (plus first-time image pull), so fail cheap when the case can't
-      // advance anyway (missing, wrong status, missing required fields, missing
-      // artifact-backed observation evidence).
+      // Validate promotability BEFORE running the PoC — each sandboxed run can
+      // take 30s (plus first-time image pull), so fail cheap when the case
+      // can't advance anyway (missing, wrong status, missing required fields,
+      // missing artifact-backed observation evidence).
       const caseId = params.id as string;
       const current = assertPromotable(caseId);
 
-      // Shared blocked-promotion shape: the case stays investigating and the
-      // caller gets the record back for context.
       const fail = (text: string, _extra?: Record<string, unknown>): never => {
         throw new Error(text);
       };
 
-      // Reject empty/whitespace markers BEFORE any PoC run — it's a param
-      // error, so fail cheap instead of burning a (up to 30s) sandboxed run.
-      const marker = (params.verification_marker as string | undefined)?.trim();
-      if (!marker) {
-        return fail(
-          "verification_marker is empty or whitespace. " +
-            "A non-empty marker printed only AFTER the PoC confirms exploitation is required — " +
-            "exit code 0 alone is not sufficient. Case remains investigating.",
-        );
-      }
-
-      // Control-target anti-cheat is mandatory for EVERY promotion — sandboxed
-      // and live alike. It is the only deterministic check that the marker is
-      // target-dependent; skipping it for the default sandboxed mode would let
-      // an unconditional-marker PoC pass untouched. Check BEFORE paying for the
-      // PoC run.
-      const controlPath = (params.control_path as string | undefined)?.trim();
+      const controlPath = (params.control_path as string | undefined)?.trim() ?? "";
+      const controlTarget = (params.control_target as string | undefined)?.trim() ?? "";
       if (!controlPath) {
         return fail(
-          "control_path is REQUIRED for every promotion (sandboxed and live alike): a script that runs " +
-            "the SAME PoC against a control lacking the vuln (patched replica, second account, baseline endpoint). " +
-            "The harness verifies the verification_marker is absent from the control run's output — that is what " +
-            "proves the marker is target-dependent. Write the control script and retry.",
+          "control_path is REQUIRED: the SAME script as poc_path (sha256-equality is ENFORCED), run by the harness with PI_POC_MODE=control and PI_POC_TARGET=control_target.",
           { missingControl: true },
         );
       }
-
-      const controlTarget = (params.control_target as string | undefined)?.trim();
       if (!controlTarget) {
         return fail(
-          "control_target is REQUIRED for every promotion: a distinct baseline target that lacks the vulnerability.",
+          "control_target is REQUIRED: a distinct baseline target that lacks the vulnerability.",
           { missingControlTarget: true },
         );
       }
@@ -1096,48 +1155,8 @@ export default function casefileExtension(pi: ExtensionAPI) {
         );
       }
 
-      // The control must ALSO prove it reached its target: without a liveness
-      // marker, a control pointed at an unreachable host / wrong port / early
-      // exit would show "marker absent" for reasons unrelated to the vuln.
-      const livenessMarker = (params.control_liveness_marker as string | undefined)?.trim();
-      if (!livenessMarker) {
-        return fail(
-          "control_liveness_marker is REQUIRED for every promotion: a unique string the control script " +
-            "prints ONLY AFTER reaching/exercising the control target (e.g. 'CONTROL_REACHED_<case-id>'). " +
-            "The harness blocks promotion if the control output lacks it — a control that never reached its " +
-            "target proves nothing. Must differ from verification_marker.",
-          { missingLivenessMarker: true },
-        );
-      }
-      if (livenessMarker === marker) {
-        return fail(
-          "control_liveness_marker must differ from verification_marker — the liveness marker proves the " +
-            "control reached its target, the verification marker proves the vuln fired. Use distinct strings.",
-          { livenessEqualsMarker: true },
-        );
-      }
-
-      // EXECUTED disconfirmation is required for EVERY promotion — the prose
-      // `disconfirmation` field cannot carry the disprove-attempt. Making it
-      // unconditional (not severity-keyed) also kills the ordering attack:
-      // a case filed as low/medium could previously skip the run, promote,
-      // then be re-raised to high/critical with no executed disproof.
-      const disconfirmationPath = (params.disconfirmation_path as string | undefined)?.trim();
-      if (!disconfirmationPath) {
-        return fail(
-          "disconfirmation_path is REQUIRED for every promotion: a script that tries to " +
-            "disprove the finding and must exit non-zero (the finding survived the attempt). " +
-            "The prose disconfirmation field is not enough. Write the disconfirmation script and retry.",
-          { missingDisconfirmation: true },
-        );
-      }
-
-      // Same-file contract (anti-cheat): the control must be the SAME script as
-      // the PoC, differing only via the harness-set PI_POC_MODE env var. Two
-      // agent-written files (poc prints the marker unconditionally, control
-      // prints the liveness marker) pass every string check — the "same script"
-      // recommendation in the docs is now enforced: sha256(control) must equal
-      // sha256(poc). Hash BEFORE any run so a mismatch fails cheap.
+      // Same-file contract (anti-cheat): control must be the SAME bytes as the
+      // PoC, differing only via the harness-set env. Check BEFORE any run.
       const pocPath = (params.poc_path as string | undefined)?.trim() ?? "";
       let pocHash: string | undefined;
       let controlHash: string | undefined;
@@ -1152,19 +1171,11 @@ export default function casefileExtension(pi: ExtensionAPI) {
       }
       if (pocHash !== controlHash) {
         return fail(
-          "CONTROL CHECK FAILED: control_path must be the SAME script as poc_path " +
-            "(sha256 mismatch). The control run is only meaningful as the same PoC " +
-            "pointed at a distinct control_target via PI_POC_MODE=control and PI_POC_TARGET. " +
-            "A separately written control file proves nothing. Case remains investigating.",
-          { run: undefined, controlHashMismatch: true },
+          "CONTROL CHECK FAILED: control_path must be the SAME script as poc_path (sha256 mismatch). Case remains investigating.",
+          { controlHashMismatch: true },
         );
       }
 
-      // local:true now means "network access": with the operator's
-      // PI_POC_ALLOW_LOCAL=1 opt-in the run executes on the host; WITHOUT the
-      // opt-in it uses a Docker sandbox with --network host (same FS/cap/user
-      // isolation) and fails closed when Docker is unavailable too. Host
-      // execution is never agent-selectable on its own.
       const runOptions = (pocMode: string, target: string): PocRunOptions => ({
         network: params.local === true ? "host" : "none",
         local: params.local === true,
@@ -1172,114 +1183,102 @@ export default function casefileExtension(pi: ExtensionAPI) {
       });
 
       const caseTarget = current.target ?? "";
-      const run = runPoc(pocPath, runOptions("poc", caseTarget));
-
-      // Fail closed without throwing: non-zero PoC must leave the case investigating.
-      if (run.exitCode !== 0) {
-        return fail(
-          `PoC failed (exit ${run.exitCode}). Case remains investigating.\nOutput:\n${run.output}`,
-          { run },
-        );
-      }
-
-      // Defense-in-depth: exit 0 implies the run completed (sandbox wrapper /
-      // local spawn semantics), but never trust a run the runner says crashed.
-      if (!run.completed || !run.outputComplete) {
-        return fail(
-          `PoC did NOT complete or output capture was incomplete. Case remains investigating.\nOutput:\n${run.output}`,
-          { run, pocCrashed: true },
-        );
-      }
-
-      // Verification marker check: exit code 0 alone is NOT sufficient.
-      // The PoC must print the verification_marker, proving the exploit
-      // actually worked — not just that the script ran. The check runs on
-      // rawOutput (untruncated) so a script printing its marker past the
-      // 4000-char display window cannot hide it.
-      const pocOut = run.rawOutput ?? run.output;
-      if (!pocOut.includes(marker)) {
-        return fail(
-          `PoC exited 0 but the verification marker "${marker}" was NOT found in the output.\n` +
-            `This means the script ran but did not prove exploitation. The marker must be printed only AFTER the PoC verifies the exploit worked (data extracted, callback received, payload reflected, etc.).\n` +
-            `Do not print the marker unconditionally — print it only when the exploit is confirmed.\n\nOutput:\n${run.output}`,
-          { run, markerMissing: true },
-        );
-      }
-
-      // Run disconfirmation script — must exit NON-0 (finding survived the attempt to disprove).
-      let disconfirmationRun: PocRun | undefined;
-      if (disconfirmationPath) {
-        disconfirmationRun = runPoc(disconfirmationPath, runOptions("disconfirmation", caseTarget));
-        if (!disconfirmationRun.completed || !disconfirmationRun.outputComplete) {
-          return fail(
-            `Disconfirmation script did NOT complete (spawn error, killed, or timeout — no completion marker). ` +
-              `A crash is not a survived disproof: fix the disconfirmation script and retry.\n` +
-              `Output:\n${disconfirmationRun.output}`,
-            { run, disconfirmationRun, disconfirmationCrashed: true },
-          );
-        }
-        if (disconfirmationRun.exitCode === 0) {
-          return fail(
-            `Disconfirmation script exited 0 (finding was disproven). ` +
-              `Case remains investigating.\nOutput:\n${disconfirmationRun.output}`,
-            { run, disconfirmationRun },
-          );
-        }
-      }
-
-      // Control-target anti-cheat check: the same PoC pointed at a control that
-      // lacks the vuln must NOT print the marker. The control script is
-      // agent-written, but the marker-absence check is harness-side and
-      // deterministic — the model cannot pass it by asserting success. The
-      // liveness-marker check closes the "control pointed at an unreachable
-      // host / exited early" hole: the control must prove it reached its target.
+      // Determinism: TWO target runs + one control run. Exit codes are
+      // diagnostics; completion, evidence validity, determinism, and the
+      // differential are the gate.
+      const run1 = runPoc(pocPath, runOptions("poc", caseTarget));
+      const run2 = runPoc(pocPath, runOptions("poc", caseTarget));
       const controlRun = runPoc(controlPath, runOptions("control", controlTarget));
-      if (!controlRun.completed || !controlRun.outputComplete) {
-        return fail(
-          `CONTROL CHECK FAILED: the control-target script did NOT complete (spawn error, killed, or timeout). ` +
-            `A control run that never executed proves nothing about the marker — fix the control script and retry.\n` +
-            `Control output:\n${controlRun.output}`,
-          { run, controlRun, controlCrashed: true },
-        );
-      }
-      // Marker-absence + liveness checks run on the UNTRUNCATED control output.
-      const controlOut = controlRun.rawOutput ?? controlRun.output;
-      if (controlOut.includes(marker)) {
-        return fail(
-          `CONTROL CHECK FAILED: the verification marker "${marker}" appeared in the control-target run. ` +
-            `The PoC prints the marker without the vulnerable condition — a cheating PoC (unconditional marker) ` +
-            `or a broken check. Case remains investigating.\nControl output:\n${controlRun.output}`,
-          { run, controlRun, controlCheated: true },
-        );
-      }
-      if (!controlOut.includes(livenessMarker)) {
-        return fail(
-          `CONTROL CHECK FAILED: the control-target run completed but the control_liveness_marker "${livenessMarker}" ` +
-            `was NOT found in its output. The control must print the liveness marker only AFTER reaching/exercising ` +
-            `the control target — an unreachable host, wrong port, or early exit is not a valid control verdict. ` +
-            `Case remains investigating.\nControl output:\n${controlRun.output}`,
-          { run, controlRun, controlLivenessMissing: true },
-        );
+
+      const evidenceRun = (r: PocRun, mode: "poc" | "control", target: string): PocEvidenceRun => {
+        if (!r.completed || !r.outputComplete) {
+          return fail(
+            `${mode} run did not complete or output capture was incomplete` +
+              (r.infraError ? ` (infra: ${r.output.trim()})` : "") +
+              ". A crash is not evidence. Case remains investigating.",
+            { run: r, pocCrashed: true },
+          );
+        }
+        if (r.evidenceError) {
+          return fail(
+            `EVIDENCE CONTRACT FAILED (${mode} run): ${r.evidenceError}. ` +
+              "The PoC must write evidence.json to $PI_POC_EVIDENCE_DIR — { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status / body_contains / body_regex } }, observations } — " +
+              "the file is bound to this run and validated by the harness. Case remains investigating.",
+            { run: r, evidenceError: r.evidenceError },
+          );
+        }
+        if (!r.evidence || !r.evidenceSha256 || !r.nonce) {
+          return fail(`${mode} run produced no evidence. Case remains investigating.`, { run: r });
+        }
+        return {
+          mode,
+          target,
+          nonce: r.nonce,
+          ranAt: r.ranAt,
+          exitCode: r.exitCode,
+          sandbox: r.sandbox,
+          completed: r.completed,
+          outputComplete: r.outputComplete,
+          output: r.output ?? "",
+          evidence: r.evidence,
+          evidenceSha256: r.evidenceSha256,
+          evidencePath: r.evidencePath,
+        };
+      };
+
+      const targetRuns: [PocEvidenceRun, PocEvidenceRun] = [
+        evidenceRun(run1, "poc", caseTarget),
+        evidenceRun(run2, "poc", caseTarget),
+      ];
+      const control = evidenceRun(controlRun, "control", controlTarget);
+
+      const bundle: PendingConfirmation = {
+        caseId,
+        ranAt: new Date().toISOString(),
+        pocPath,
+        pocSha256: pocHash,
+        controlPath,
+        controlTarget,
+        targetRuns,
+        controlRun: control,
+      };
+
+      let record: CaseRecord;
+      try {
+        record = storePendingConfirmation(caseId, bundle);
+      } catch (e) {
+        return fail(`Pending confirmation rejected: ${(e as Error).message}`, {
+          storeRejected: true,
+        });
       }
 
-      // PocRun is structurally a PocVerification — pass the runs straight through.
-      const result = promoteFindingResult(
-        caseId,
-        run,
-        disconfirmationRun,
-        controlRun,
-        marker,
-        livenessMarker,
-      );
-      const record = result.record;
       return {
         content: [
           {
             type: "text",
-            text: `PoC verified (exit ${run.exitCode}). Case promoted to confirmed:\n${formatCaseDetail(record)}`,
+            text:
+              `Phase 1 complete — evidence bundle recorded on ${caseId} (expires in 1h).\n` +
+              `Target runs: 2, Control run: 1 — all with validated nonce-bound evidence.json.\n` +
+              `Evidence sha256: ${targetRuns[0].evidenceSha256}\n` +
+              `PoC script sha256 (at run time): ${pocHash}\n\n` +
+              (detectHost() === "omp"
+                ? `DISPATCH THE CONFIRMER now: task({ context: 'fresh', tasks: [{ name: 'confirm-${caseId}-1', agent: 'confirmer', task: 'Verify the PoC evidence for case ${caseId} (poc_path=${pocPath}, control_target=${controlTarget}, evidence_sha256=${targetRuns[0].evidenceSha256}, poc_sha256=${pocHash}). Assume fabricated, prove real. Re-send the verify request yourself. Return the verdict.' }] })\n`
+                : `DISPATCH THE CONFIRMER now: subagent({ workflowScript: "return runs.run('confirm-${caseId}-1', { agent: 'confirmer', task: 'Verify the PoC evidence for case ${caseId} (poc_path=${pocPath}, control_target=${controlTarget}, evidence_sha256=${targetRuns[0].evidenceSha256}, poc_sha256=${pocHash}). Assume fabricated, prove real. Re-send the verify request yourself. Return the verdict.' })", context: 'fresh', async: true })\n`) +
+              "Then commit the verdict with ConfirmFinding(case_id, verdict) — CONFIRMED promotes, NOT_CONFIRMED keeps investigating.",
           },
         ],
-        details: { record, run },
+        details: {
+          record,
+          bundle: {
+            caseId,
+            ranAt: bundle.ranAt,
+            pocPath,
+            controlPath,
+            controlTarget,
+            pocSha256: pocHash,
+            evidenceSha256: targetRuns[0].evidenceSha256,
+          },
+        },
       };
     },
 
@@ -1287,10 +1286,70 @@ export default function casefileExtension(pi: ExtensionAPI) {
       return callLine(theme, "PromoteFinding", (args.id as string) ?? "");
     },
 
-    renderResult(result, _options, theme) {
-      const details = result.details as { run?: { exitCode: number } } | undefined;
-      const success = details?.run?.exitCode === 0;
-      return new Text(renderCaseResult(result, theme, success ? "✓ " : "✗ ", "✗ "), 0, 0);
+    renderResult(result, _opts, theme) {
+      const details = result.details as { bundle?: { evidenceSha256?: string } } | undefined;
+      if (!details?.bundle) {
+        return new Text(theme.fg("error", "✗ PromoteFinding failed"), 0, 0);
+      }
+      return new Text(
+        theme.fg("success", "✓ ") +
+          theme.fg("dim", "evidence bundle ") +
+          theme.fg("muted", details.bundle.evidenceSha256?.slice(0, 12) ?? ""),
+        0,
+        0,
+      );
+    },
+  });
+
+  // ── Tool: ConfirmFinding (phase 2) ──
+
+  pi.registerTool({
+    name: "ConfirmFinding",
+    label: "Commit Confirmer Verdict",
+    description:
+      "Phase 2 of confirmation: commit (or refuse) a promotion on the confirmer subagent's verdict. CONFIRMED requires a target-only differential, re_executed: true (the confirmer re-sent the verify request itself), a disconfirmation_attempt (becomes the case's disconfirmation), and the pending bundle from PromoteFinding still valid (nonce-bound evidence, determinism, control differential, PoC script unchanged — checked again at the ledger). NOT_CONFIRMED records the verdict and keeps the case investigating — no tie-breaker.",
+    promptSnippet: "Commit the confirmer verdict — promote or keep investigating",
+    promptGuidelines: [
+      "Run after PromoteFinding + the confirmer dispatch. The verdict comes from the confirmer subagent output, not from the writer.",
+      "CONFIRMED requires differential: 'target_only', re_executed: true, and disconfirmation_attempt (the confirmer's own failed disproof). A verdict missing any of these is rejected.",
+      "NOT_CONFIRMED is final for that attempt — the case stays investigating with the reasoning recorded in assumptions. Re-dispatch a new confirmer if you want a second opinion; every attempt is recorded.",
+      "Never CaseUpdate status='confirmed' directly — it is rejected. Always use PromoteFinding + ConfirmFinding.",
+    ],
+    parameters: ConfirmSchema,
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const caseId = params.id as string;
+      const result = applyConfirmationResult(caseId, params.verdict as ConfirmerVerdict);
+      const record = result.record;
+      const promoted = record.status === "confirmed";
+      return {
+        content: [
+          {
+            type: "text",
+            text: promoted
+              ? `Confirmer CONFIRMED. Case promoted:
+${formatCaseDetail(record)}`
+              : `Confirmer NOT_CONFIRMED — case stays investigating (attempt recorded):
+${formatCaseDetail(record)}`,
+          },
+        ],
+        details: { record, promoted, changed: result.changed },
+      };
+    },
+
+    renderCall(args, theme) {
+      return callLine(theme, "ConfirmFinding", (args.id as string) ?? "");
+    },
+
+    renderResult(result, _opts, theme) {
+      const details = result.details as { promoted?: boolean } | undefined;
+      return new Text(
+        details?.promoted
+          ? theme.fg("success", "✓ Promoted")
+          : theme.fg("warning", "↷ Not confirmed"),
+        0,
+        0,
+      );
     },
   });
 

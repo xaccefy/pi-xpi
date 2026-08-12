@@ -3,11 +3,13 @@
  * Registers the `todo` tool and `/todos` slash command.
  */
 
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -103,6 +105,10 @@ const getSessionState = (sessionId: string): TaskState =>
   sessions.get(sessionId) ?? restoreState(sessionId) ?? freshState();
 
 function setSessionState(id: string, state: TaskState): void {
+  // delete-then-set: Map.set on an existing key does NOT move it to the tail,
+  // so eviction would otherwise be FIFO and the long-lived active session
+  // would be the first evicted under churn.
+  if (sessions.has(id)) sessions.delete(id);
   sessions.set(id, state);
   while (sessions.size > MAX_SESSIONS) {
     const oldest = sessions.keys().next().value;
@@ -116,23 +122,29 @@ function xtodoDir(): string {
   return fromEnv || join(homedir(), ".pi", "xtodo");
 }
 function persistPath(id: string): string {
-  return join(
-    xtodoDir(),
-    `${
-      id
-        .replace(/[^a-zA-Z0-9._-]+/g, "_")
-        .replace(/^\.+/, "")
-        .slice(0, 128) || "default"
-    }.json`,
-  );
+  const safe = id
+    .replace(/[^a-zA-Z0-9._-]+/g, "_")
+    .replace(/^\.+/, "")
+    .slice(0, 128);
+  // Sanitization is lossy ("a/b" and "a b" both become "a_b"); distinct
+  // session ids must not silently share one state file, so a changed name
+  // gets a hash suffix (same disambiguation the scratchpad uses).
+  if (safe === id) return join(xtodoDir(), `${safe || "default"}.json`);
+  const suffix = createHash("sha256").update(id).digest("hex").slice(0, 12);
+  return join(xtodoDir(), `${(safe || "default").slice(0, 80)}-${suffix}.json`);
 }
 function saveState(id: string, state: TaskState): void {
   try {
     const dir = xtodoDir();
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    writeFileSync(persistPath(id), JSON.stringify(state), "utf8");
+    // Atomic write (tmp + rename): a crash mid-write must not leave a torn
+    // file that restoreState rejects and the whole list is dropped as corrupt.
+    const target = persistPath(id);
+    const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync(tmp, JSON.stringify(state), "utf8");
+    renameSync(tmp, target);
   } catch {
-    /* best-effort */
+    /* best-effort persistence */
   }
 }
 function restoreState(id: string): TaskState | undefined {
@@ -227,6 +239,27 @@ function wouldCycle(tasks: Task[], startId: number, newBlockedBy: number[]): boo
 // ---------------------------------------------------------------------------
 // Reducer
 // ---------------------------------------------------------------------------
+
+/**
+ * Strip terminal control characters from task text. Task fields are rendered
+ * raw into the interactive overlay/widget/notify — an ESC sequence (SGR, clear
+ * screen, OSC title, hyperlinks) or C0 control embedded in a subject would be
+ * interpreted by the user's terminal (prompt-injected content from a hostile
+ * repo is the realistic source). \t \n \r survive; everything else in the C0
+ * range plus DEL is removed. Single-line fields (subject/activeForm/owner) also
+ * drop \n\r so they cannot split widget rows.
+ */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: intentional
+const CONTROL_CHARS_RE = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: intentional
+const NEWLINES_RE = /[\r\n]+/g;
+
+function sanitizeText(value: unknown, multiline = false): string {
+  let out = String(value ?? "").replace(CONTROL_CHARS_RE, "");
+  if (!multiline) out = out.replace(NEWLINES_RE, " ");
+  return out;
+}
+
 function applyMutation(
   state: TaskState,
   action: TaskAction,
@@ -238,7 +271,8 @@ function applyMutation(
 
   switch (action) {
     case "create": {
-      if (!params.subject?.trim()) return err("subject required for create");
+      const subject = sanitizeText(params.subject).trim();
+      if (!subject) return err("subject required for create");
       const blocked = params.blockedBy === undefined ? [] : (coerceIds(params.blockedBy) ?? null);
       if (blocked === null) return err("blockedBy must be an array of numbers");
       for (const dep of blocked) {
@@ -248,12 +282,14 @@ function applyMutation(
       }
       const task: Task = {
         id: nextId++,
-        subject: String(params.subject).trim(),
+        subject,
         status: "pending",
-        ...(params.description && { description: params.description }),
-        ...(params.activeForm && { activeForm: params.activeForm }),
+        ...(params.description && {
+          description: sanitizeText(params.description, true),
+        }),
+        ...(params.activeForm && { activeForm: sanitizeText(params.activeForm) }),
         ...(blocked.length && { blockedBy: blocked }),
-        ...(params.owner && { owner: params.owner }),
+        ...(params.owner && { owner: sanitizeText(params.owner) }),
         ...(params.metadata && { metadata: { ...params.metadata } }),
       };
       tasks.push(task);
@@ -340,15 +376,16 @@ function applyMutation(
       const updated: Task = {
         ...cur,
         status,
-        ...(params.subject !== undefined && { subject: String(params.subject).trim() }),
+        ...(params.subject !== undefined && { subject: sanitizeText(params.subject).trim() }),
         ...(params.description !== undefined && {
-          description: params.description === null ? undefined : params.description,
+          description:
+            params.description === null ? undefined : sanitizeText(params.description, true),
         }),
         ...(params.activeForm !== undefined && {
-          activeForm: params.activeForm === null ? undefined : params.activeForm,
+          activeForm: params.activeForm === null ? undefined : sanitizeText(params.activeForm),
         }),
         ...(params.owner !== undefined && {
-          owner: params.owner === null ? undefined : params.owner,
+          owner: params.owner === null ? undefined : sanitizeText(params.owner),
         }),
         blockedBy: blocked.length ? blocked : undefined,
         metadata,
@@ -510,7 +547,12 @@ let widgetRegistered = false;
 let widgetSessionId = "";
 
 function widgetTasks(): Task[] {
-  return (sessions.get(widgetSessionId)?.tasks ?? []).filter((t) => t.status !== "deleted");
+  // The in-memory map can lose the session under MAX_SESSIONS eviction; the
+  // disk file survives, so fall back to it instead of rendering an empty
+  // widget until the next event re-reads state.
+  const mem = sessions.get(widgetSessionId);
+  const state = mem ?? restoreState(widgetSessionId) ?? freshState();
+  return state.tasks.filter((t) => t.status !== "deleted");
 }
 
 // biome-ignore lint/suspicious/noExplicitAny: theme is provided by the host
@@ -711,14 +753,12 @@ export default function registerTodo(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    const sessionId = sid(ctx);
-    let state = replayFromBranch(ctx);
-    if (state.nextId === 1) {
-      const stored = restoreState(sessionId);
-      if (stored) state = stored;
-    }
-    setSessionState(sessionId, state);
-    refreshWidget(ctx, sessionId);
+    // Same guard as settleState (session_compact): the branch's last
+    // tool-result snapshot can be OLDER than disk after compaction dropped
+    // newer results, so disk must win when it has tasks — otherwise a restart
+    // resurrects stale state and the next mutation overwrites the newer disk
+    // file, silently losing tasks and reusing their IDs.
+    settleState(ctx, sid(ctx));
   });
 
   // After compaction/tree events the last surviving tool-result snapshot in
@@ -761,14 +801,23 @@ export default function registerTodo(pi: ExtensionAPI) {
 
 // Test helpers
 export function __resetState(): void {
+  const dir = xtodoDir();
+  // Destructive wipe guard: a test that forgets to point PI_XTODO_DIR at a
+  // temp dir would delete every session's real state under ~/.pi/xtodo.
+  // Refuse unless the env override is explicitly set.
+  if (!process.env.PI_XTODO_DIR?.trim()) {
+    throw new Error(
+      "__resetState refuses to run against the default todo dir — set PI_XTODO_DIR to a temp dir in tests",
+    );
+  }
   sessions.clear();
   widgetUi = undefined;
   widgetTui = undefined;
   widgetRegistered = false;
   widgetSessionId = "";
   try {
-    for (const f of readdirSync(xtodoDir())) {
-      if (f.endsWith(".json")) unlinkSync(join(xtodoDir(), f));
+    for (const f of readdirSync(dir)) {
+      if (f.endsWith(".json")) unlinkSync(join(dir, f));
     }
   } catch {
     // best-effort

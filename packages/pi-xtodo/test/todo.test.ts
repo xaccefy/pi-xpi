@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, beforeEach, describe, it } from "node:test";
@@ -198,6 +198,81 @@ describe("pi-xtodo", () => {
     );
     ok(r, "coerced string id");
     assert.ok(r.content[0].text.includes("Updated #1"));
+  });
+
+  it("strips terminal control characters from task text (no ANSI injection)", async () => {
+    const t = pi.tools[0];
+    // A hostile subject (prompt-injected from a repo being analyzed) carrying
+    // ESC sequences must not reach the terminal renderers.
+    const created = await exec(t, "1", {
+      action: "create",
+      subject: "Legit\u001b[2Jsubject\u001b]0;spoof\u0007 more",
+      description: "multi\nline\u001b[31mdesc",
+    });
+    ok(created);
+    const listed = await exec(t, "1", { action: "list" });
+    const text = listed.content[0].text;
+    assert.ok(!text.includes("\u001b"), "ESC sequences must be stripped from subjects");
+    assert.ok(!text.includes("\u0007"), "BEL must be stripped");
+    // The sequence payload survives as inert visible text (no terminal
+    // interpretation) — the words are still there, just not the control chars.
+    assert.ok(text.includes("Legit"), "visible text survives");
+    assert.ok(text.includes("subject"), "visible text survives");
+    assert.ok(text.includes("spoof"), "visible text survives");
+    // Descriptions keep newlines (multiline field) — check via get, which
+    // renders them.
+    const got = await exec(t, "1", { action: "get", id: 1 });
+    assert.ok(got.content[0].text.includes("multi\nline"), "newlines survive in descriptions");
+  });
+
+  it("create rejects a subject that is only control characters", async () => {
+    const t = pi.tools[0];
+    const created = await exec(t, "1", { action: "create", subject: "\u001b\u0000\u0007" });
+    fail(created);
+  });
+
+  it("stale branch replay does not clobber newer disk state on session_start", async () => {
+    const t = pi.tools[0];
+    // Fresh session: branch snapshot carries tasks 1-2 (nextId 3)…
+    sessionManager.branch = [
+      {
+        type: "message",
+        message: {
+          role: "toolResult",
+          toolName: "todo",
+          details: {
+            nextId: 3,
+            tasks: [
+              { id: 1, subject: "old from branch", status: "pending" },
+              { id: 2, subject: "old from branch", status: "pending" },
+            ],
+          },
+        },
+      },
+    ];
+    // …but disk holds NEWER state (tasks 1-3, nextId 4) from a prior process.
+    const newer = {
+      tasks: [
+        { id: 1, subject: "kept", status: "pending" },
+        { id: 2, subject: "kept", status: "pending" },
+        { id: 3, subject: "new on disk", status: "pending" },
+      ],
+      nextId: 4,
+    };
+    writeFileSync(join(TEST_XTODO_DIR, "test-session.json"), JSON.stringify(newer), "utf8");
+
+    const handlers = pi.events["session_start"] ?? [];
+    for (const h of handlers) await h({}, mockCtx);
+
+    const listed = await exec(t, "1", { action: "list" });
+    assert.ok(
+      listed.content[0].text.includes("new on disk"),
+      "disk state must win over stale replay",
+    );
+    assert.ok(
+      !listed.content[0].text.includes("old from branch"),
+      "stale branch must not resurrect",
+    );
   });
 
   it("rejects empty subject and mutations on deleted", async () => {

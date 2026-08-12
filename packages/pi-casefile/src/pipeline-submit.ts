@@ -18,7 +18,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { getRunDir, getScratchpadRoot, scratchpad_write } from "./scratchpad.ts";
 
@@ -120,6 +120,13 @@ export const SPECS: Record<SubmitStage, StageSpec> = {
     ],
     conditional: [
       { when: { field: "verdict", equals: "DISPROVEN" }, require: ["disproval_reason"] },
+      {
+        // A CONFIRMED verdict must carry the skeptic's own failed disproof —
+        // the workflow makes it the case's disconfirmation. "Could not
+        // disprove" alone is not an attempt.
+        when: { field: "verdict", equals: "CONFIRMED" },
+        require: ["disconfirmation_attempt"],
+      },
     ],
   },
   // schemas/stage-validation.json
@@ -189,6 +196,7 @@ type FindingRef = {
   key: string;
   file: string;
   line?: number;
+  endpoint?: string;
   vuln_class: string;
 };
 
@@ -516,6 +524,20 @@ function validateStage(stage: SubmitStage, obj: Record<string, unknown>): string
       ];
       if (!allowed.includes(obj.kill_reason)) errors.push("kill_reason: invalid value");
     }
+    if (obj.status === "confirmed" && isNonEmptyString(obj.poc_path)) {
+      // A validate submission asserting "confirmed" must point at a PoC file
+      // that actually exists in the project — same file-existence filter hunt
+      // findings get. Otherwise fabricated run logs pass the stage gate.
+      const raw = obj.poc_path as string;
+      const normalized = raw.replace(/^\.?\//, "");
+      const abs = isAbsolute(normalized) ? resolve(normalized) : resolve(projectRoot(), normalized);
+      const rel = relative(projectRoot(), abs);
+      if (rel.startsWith("..") || isAbsolute(rel)) {
+        errors.push("poc_path: must resolve inside the project root");
+      } else if (!existsSync(abs)) {
+        errors.push(`poc_path: "${raw}" does not exist under the project root`);
+      }
+    }
     if (
       obj.refinement_attempts !== undefined &&
       (!Number.isInteger(obj.refinement_attempts) ||
@@ -579,6 +601,23 @@ function prefilterHunt(obj: Record<string, unknown>): string | null {
       `Findings must reference files inside the target repository.`
     );
   }
+  // Symlink containment (same defense as the PoC runner): resolve() is
+  // lexical, and existsSync() dereferences symlinks — a workspace symlink to
+  // /etc (ln -s /etc etc-link) would otherwise pass both checks and let a
+  // "finding" point at host paths outside the project.
+  let real: string;
+  try {
+    real = realpathSync(abs);
+  } catch {
+    return `file-existence filter: "${file}" cannot be resolved under the project root (${root}).`;
+  }
+  const realRel = relative(root, real);
+  if (realRel.startsWith("..") || isAbsolute(realRel)) {
+    return (
+      `containment filter: "${file}" resolves through a symlink to outside the project root ` +
+      `(${real}). Symlinked files outside ${root} are rejected.`
+    );
+  }
   if (!existsSync(abs)) {
     return (
       `file-existence filter: "${file}" does not exist under the project root ` +
@@ -590,12 +629,19 @@ function prefilterHunt(obj: Record<string, unknown>): string | null {
 
 function dedupHunt(state: SubmitState, obj: Record<string, unknown>): { duplicateOf?: string } {
   const file = typeof obj.file === "string" ? obj.file.replace(/^\.?\//, "") : undefined;
+  const endpoint = typeof obj.endpoint === "string" ? obj.endpoint.trim() : undefined;
   const vulnClass = typeof obj.vuln_class === "string" ? obj.vuln_class : undefined;
   const line = typeof obj.line === "number" ? obj.line : undefined;
-  if (!file || !vulnClass) return {};
+  if (!vulnClass) return {};
   for (const accepted of state.accepted_findings) {
     if (accepted.vuln_class !== vulnClass) continue;
-    if (accepted.file !== file) continue;
+    // Live locator: same endpoint + class is the same finding (re-submissions
+    // after a repair must not be accepted repeatedly).
+    if (!file && endpoint !== undefined) {
+      if (accepted.endpoint === endpoint) return { duplicateOf: accepted.key };
+      continue;
+    }
+    if (!file || accepted.file !== file) continue;
     if (
       line !== undefined &&
       accepted.line !== undefined &&
@@ -672,24 +718,33 @@ export function pipeline_submit(runId: string, stage: SubmitStage, output: unkno
         duplicate_of: duplicateOf,
       };
     }
-    if (typeof obj.file === "string" && typeof obj.vuln_class === "string") {
-      state.accepted_findings.push({
-        key,
-        file: obj.file.replace(/^\.?\//, ""),
-        line: typeof obj.line === "number" ? obj.line : undefined,
-        vuln_class: obj.vuln_class,
-      });
+    if (typeof obj.vuln_class === "string") {
+      const isFileFinding = typeof obj.file === "string";
+      const isEndpointFinding = !isFileFinding && typeof obj.endpoint === "string";
+      if (isFileFinding || isEndpointFinding) {
+        state.accepted_findings.push({
+          key,
+          file: isFileFinding ? (obj.file as string).replace(/^\.?\//, "") : "",
+          line: typeof obj.line === "number" ? obj.line : undefined,
+          endpoint: isEndpointFinding ? (obj.endpoint as string).trim() : undefined,
+          vuln_class: obj.vuln_class,
+        });
+      }
       writeState(runId, state);
     }
   }
 
   // Submit stages are a subset of scratchpad phases, so the stage name IS
-  // the phase directory.
+  // the phase directory. The filename gets a content hash: distinct findings
+  // sharing one plausible id (the stable repair-bucket key) must not clobber
+  // each other's accepted artifact.
+  const json = JSON.stringify(obj, null, 2);
+  const contentHash = createHash("sha1").update(json).digest("hex").slice(0, 8);
   const artifact = scratchpad_write(
     runId,
     stage,
-    `${key.replace(/[^a-zA-Z0-9._:-]/g, "_")}.json`,
-    JSON.stringify(obj, null, 2),
+    `${key.replace(/[^a-zA-Z0-9._:-]/g, "_")}-${contentHash}.json`,
+    json,
   );
   return { verdict: "accepted", stage, errors: [], key, artifact };
 }

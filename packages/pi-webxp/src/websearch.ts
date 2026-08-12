@@ -217,44 +217,6 @@ function validateAndParseUrl(input: string): URL {
   }
 }
 
-// ── SPA / client-rendered page detection ─────────────────────────────
-// Thin SPA shells are reported as-is. Local Chromium fallback was removed so
-// WebXP never runs untrusted pages outside the daemon's guarded fetch path.
-
-const SPA_SHELL_MARKERS = [
-  /enable javascript/i,
-  /please (wait|enable)/i,
-  /your browser does not support/i,
-];
-
-/** True when static extraction looks like an empty SPA shell. */
-export function looksLikeSpaShell(
-  data: { retrievalMethod?: string; contentType?: string } | null | undefined,
-  text: string,
-): boolean {
-  if (data?.retrievalMethod === "browser-html") return false;
-  const contentType = String(data?.contentType || "").toLowerCase();
-  if (!contentType.includes("text/html")) return false;
-  const trimmed = (text || "").trim();
-  // Only force a browser pass for truly thin shells or explicit JS-required markers.
-  if (trimmed.length < 120) return true;
-  return SPA_SHELL_MARKERS.some((re) => re.test(trimmed));
-}
-
-/** Re-export the shared SSRF host checker (network-safety) so test imports stay stable. */
-export { isPublicHttpHost } from "./network-safety.ts";
-
-/** Prefer browser text only when it is meaningfully richer than the static shell. */
-export function preferRenderedText(staticText: string, renderedText: string): boolean {
-  const a = staticText.trim().length;
-  const b = renderedText.trim().length;
-  if (b <= a) return false;
-  // Thin SPA shells: any clearly longer render wins (e.g. "Loading..." → real body).
-  if (a < 120) return b >= Math.max(a + 20, 40);
-  // Longer static pages: require 2x and +80 so chrome/nav noise alone doesn't win.
-  return b > a * 2 && b >= a + 80;
-}
-
 // ── Diagnostic Error Handler ──────────────────────────────────────────
 
 function handleWebsearchError(err: unknown, toolName: string): never {
@@ -393,7 +355,6 @@ export default function websearchExtension(pi: ExtensionAPI) {
     promptSnippet: "Fetch the full text/markdown content of a URL",
     promptGuidelines: [
       "Use web_fetch to read the full text, article markdown, or README from a specific HTTP(S) URL when the user gives a link or you need page content rather than search results.",
-      "SPAs and JS-rendered pages are re-rendered headlessly, so the real content is returned; just pass the URL.",
       "Prefer web_fetch over web_search when you already have a target URL.",
     ],
     parameters: Type.Object(

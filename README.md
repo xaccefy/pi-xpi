@@ -22,10 +22,19 @@ XPI turns the Pi agent into a security researcher: a case ledger with enforced g
 
 ## Install
 
+Works on **Pi Agent** and its fork **OMP** (`@oh-my-pi/pi-coding-agent`). One manifest serves both: OMP reads the same `pi` extension field, the Agent Plugins `plugin.json` for skills, and the `task` tool spawns the specialist agents.
+
 ```bash
-./install.sh
-# or
-pi install npm:@xaccefy/pi-xpi
+./install.sh            # auto-detects pi or omp in PATH
+./install.sh --pi       # force Pi  (adds pi-subagents + optional fff search)
+./install.sh --omp      # force OMP (copies agents/*.md to ~/.omp/agent/agents)
+```
+
+Or install the npm package per host:
+
+```bash
+pi install npm:@xaccefy/pi-xpi     # Pi
+omp install npm:@xaccefy/pi-xpi    # OMP
 ```
 
 Set `PREVIEW_IS_API_KEY` for `exploit_search` (see [docs/guide.md](docs/guide.md)).
@@ -36,6 +45,8 @@ Set `PREVIEW_IS_API_KEY` for `exploit_search` (see [docs/guide.md](docs/guide.md
 /xp on     # enable the cyber workflow (subagent pipeline)
 /xp lite   # single-agent variant
 ```
+
+On Pi, `/xp on` dispatches specialist subagents via pi-subagents; on OMP it uses the native `task` tool with the same agent names (auditor, tracer, skeptic, exploit, chain, reporter, confirmer — installed by `install.sh --omp`).
 
 Full tool reference, configuration, and pipeline docs: **[docs/guide.md](docs/guide.md)**.
 

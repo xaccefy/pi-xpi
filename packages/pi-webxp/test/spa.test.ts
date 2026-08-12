@@ -1,33 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { isPublicHttpHost, looksLikeSpaShell, preferRenderedText } from "../src/websearch.ts";
-
-describe("looksLikeSpaShell", () => {
-  it("skips non-html and already browser-rendered content", () => {
-    expect(
-      looksLikeSpaShell({ contentType: "text/markdown", retrievalMethod: "request" }, "x"),
-    ).toBe(false);
-    expect(
-      looksLikeSpaShell(
-        { contentType: "text/html", retrievalMethod: "browser-html" },
-        "Loading...",
-      ),
-    ).toBe(false);
-  });
-
-  it("flags thin HTML shells and JS-required markers", () => {
-    expect(looksLikeSpaShell({ contentType: "text/html; charset=utf-8" }, "Loading...")).toBe(true);
-    expect(
-      looksLikeSpaShell(
-        { contentType: "text/html" },
-        "Please enable JavaScript to continue using this application.",
-      ),
-    ).toBe(true);
-    const medium =
-      "About us - we ship secure software for teams worldwide. Contact support@example.com for help with onboarding, billing, and enterprise plans today.";
-    expect(medium.length).toBeGreaterThan(120);
-    expect(looksLikeSpaShell({ contentType: "text/html" }, medium)).toBe(false);
-  });
-});
+import { isPublicHttpHost } from "../src/network-safety.ts";
 
 describe("isPublicHttpHost", () => {
   it("blocks loopback / private / localhost", () => {
@@ -48,18 +20,5 @@ describe("isPublicHttpHost", () => {
   it("allows public hosts", () => {
     expect(isPublicHttpHost(new URL("https://example.com/a"))).toBe(true);
     expect(isPublicHttpHost(new URL("https://docs.github.com/en"))).toBe(true);
-  });
-});
-
-describe("preferRenderedText", () => {
-  it("requires meaningfully richer rendered text", () => {
-    expect(preferRenderedText("Loading...", "Loading...")).toBe(false);
-    expect(preferRenderedText("Loading...", "Load")).toBe(false);
-    expect(
-      preferRenderedText(
-        "Loading...",
-        "Rendered Heading\n\nReal SPA content injected by JavaScript at runtime with enough body text.",
-      ),
-    ).toBe(true);
   });
 });

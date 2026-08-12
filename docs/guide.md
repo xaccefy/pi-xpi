@@ -2,6 +2,15 @@
 
 Full reference: tools, configuration, pipeline, and development. The root [README](../README.md) is the short overview.
 
+## Hosts: Pi Agent and OMP
+
+XPI runs on **Pi Agent** (`@earendil-works/pi-coding-agent`) and its fork **OMP** (`@oh-my-pi/pi-coding-agent`, binary `omp`). The same extension code, tools, ledger, and XP-mode workflow are used on both:
+
+- **Extensions** — both hosts read the `pi` field in `package.json` (OMP also accepts an `omp` field; `plugin.json` is the Agent Plugins manifest OMP uses for skills).
+- **Skills** — `skills/cyberwf`, `skills/web-pentest`, `skills/casefile` load on both hosts (OMP via the Agent Plugins provider).
+- **Subagent dispatch** — Pi uses the pi-subagents extension (`subagent({ workflowScript: ... })`); OMP uses its native `task` tool. The `/xp on` workflow and the `cyberwf` skill describe both conventions; the extension injects the host-appropriate workflow automatically.
+- **Specialist agents** — `install.sh --omp` copies `agents/*.md` (auditor, tracer, skeptic, exploit, chain, reporter, confirmer) to `~/.omp/agent/agents` so OMP's `task` tool can spawn them by name. On Pi the same files ship inside the package for pi-subagents.
+
 ## Configuration
 
 ### Environment variables
@@ -12,8 +21,7 @@ Full reference: tools, configuration, pipeline, and development. The root [READM
 | `PI_XP_MODE` | casefile | `on` / `lite` / `off` — force casefile cyber-workflow injection (lite = single-agent, no subagent dispatch) |
 | `PI_CASEFILE_PATH` | casefile | Override SQLite ledger path |
 | `PI_WEBSEARCH_PORT` | webxp | open-websearch daemon port (default `3210`) |
-| `PI_CHROMIUM_PATH` | webxp | Chromium binary for SPA re-render in `web_fetch` |
-| `PI_FFF_MODE` | fff | `override` replaces pi's built-in grep/find with fff (set in your shell profile) |
+| `PI_FFF_MODE` | fff | `override` replaces pi's built-in grep/find with fff (set in your shell profile; Pi only — OMP ships its own search) |
 
 ```bash
 export PREVIEW_IS_API_KEY="rk_yourkeyhere"
@@ -25,10 +33,10 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 |------|---------|
 | `exploit_search` | Attack techniques, primitives, bypasses (`PREVIEW_IS_API_KEY`) |
 | `web_search` | CVEs, advisories, documentation |
-| `web_fetch` | Page content; SPA pages re-rendered via Chromium when the shell is thin |
+| `web_fetch` | Page content from an HTTP(S) URL |
 | `context7` | Current library docs |
 | `deepwiki` | Q&A on a public GitHub repo |
-| `CaseAdd` / `CaseUpdate` / `PromoteFinding` | Ledger + hard PoC gate to confirm (exit 0 + verification marker; `control_path` + `control_liveness_marker` control-target check REQUIRED for every promotion — blocks unconditional-marker/mock PoCs and dead controls) |
+| `CaseAdd` / `CaseUpdate` / `PromoteFinding` / `ConfirmFinding` | Ledger + two-phase PoC gate to confirm: PromoteFinding records an evidence bundle (PoC 2× target + 1× same-script control; every run must complete with captured output and write nonce-bound `evidence.json`; machine-checks nonce binding, determinism, target/control differential), then a confirmer subagent re-executes the verify request and its CONFIRMED verdict (via ConfirmFinding) promotes. Markers/exit codes are diagnostics, not gates |
 | `EvidenceAdd` | Role-typed, hashed evidence items (observation/reproduction/impact/refutation/cleanup); refutation justifies kills; reproduction auto-recorded by the PoC gate |
 | `CaseGet` / `CaseList` / `CaseSearch` | Browse cases |
 | `CaseLink` / `CaseUnlink` | Exploit chains |
@@ -50,7 +58,7 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 /xp lite                                    # single-agent variant — no subagent dispatch
 ```
 
-CaseAdd requires `disproveIf` (falsification conditions) on every new case; a kill of an investigating/confirmed case requires refutation evidence (a keyword alone is not enough once the case advanced past hypothesis). EVERY promotion — sandboxed and live alike — requires `control_path` + `control_liveness_marker`: the control run's output must NOT contain the verification marker AND must contain the liveness marker (harness-checked), so unconditional-marker PoCs and dead controls are both blocked. `local:true` runs in a host-network Docker sandbox (read-only FS / dropped caps / unprivileged user); true host execution is operator-gated via `PI_POC_ALLOW_LOCAL=1` and is never agent-selectable. Promotion also requires an **artifact-backed** `observation` evidence item (EvidenceAdd with `artifact_path` — summary-only observations are rejected) before `confirmed`; severity high/critical additionally require an executed `disconfirmation_path` run (non-zero exit). Control/disconfirmation scripts that crash (killed/timeout/spawn error) are blocked — a crash is neither a clean control verdict nor a survived disproof.
+CaseAdd requires `disproveIf` (falsification conditions) on every new case; a kill of a case that ever reached investigating/confirmed requires artifact-backed refutation evidence (a keyword alone is not enough, and demoting the status first does not reset that). Confirmation is two-phase: **PromoteFinding** runs the PoC twice against the case target plus once against a distinct `control_target` (same script, sha256-enforced); every run must complete with fully captured output and write nonce-bound `evidence.json` to `$PI_POC_EVIDENCE_DIR`; the machine gate then checks nonce binding, determinism across the two target runs, and that the control evidence differs from the target's (not target-dependent → blocked). The coordinator dispatches the **confirmer** subagent (fresh context, different model), which re-sends the `verify` request itself and returns a verdict; **ConfirmFinding** commits it — CONFIRMED (requires `re_executed: true`, a `target_only` differential, and the confirmer's own `disconfirmation_attempt`) promotes, NOT_CONFIRMED keeps the case investigating. Exit codes and output markers are diagnostics, not gates. `local:true` runs in a host-network Docker sandbox (read-only FS / dropped caps / unprivileged user); true host execution is operator-gated via `PI_POC_ALLOW_LOCAL=1` and is never agent-selectable. Promotion also requires an **artifact-backed** `observation` evidence item (EvidenceAdd with `artifact_path` — summary-only observations are rejected)
 
 Pi injects skill descriptions (`web-pentest`, `cyberwf`) into every session; the agent reads the full skill file when the task matches (e.g. "find bugs in X", "bug bounty Y"). Run `/xp on` for the full attacker discipline with casefile tracking, or `/xp lite` for the same discipline done by the main agent alone (CTF / single-shot engagements).
 

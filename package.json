@@ -31,6 +31,7 @@
     "registry": "https://registry.npmjs.org/"
   },
   "files": [
+    "plugin.json",
     "agents/",
     "skills/",
     "schemas/",
@@ -50,8 +51,7 @@
       "./packages/pi-xtodo/index.ts"
     ],
     "skills": [
-      "./skills",
-      "./packages/pi-casefile/skills"
+      "./skills"
     ],
     "subagents": {
       "agents": [

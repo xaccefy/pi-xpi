@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -274,10 +274,14 @@ describe("pipeline_submit", () => {
       verdict: "CONFIRMED",
       reasoning: "read src/auth.ts:88 — no defense on this path",
       evidence_reviewed: ["src/auth.ts"],
+      disconfirmation_attempt:
+        "tried the same request unauthenticated and with a second account — no leak; effect is account-bound",
     });
     assert.strictEqual(res.verdict, "accepted");
-    const back = scratchpad_read("run-1", "skeptic", "skeptic_case_9.json");
-    assert.ok(back?.includes("CONFIRMED"));
+    // Artifact filenames carry a content hash (distinct findings sharing an
+    // id must not clobber each other) — read back through the returned path.
+    assert.ok(res.artifact, "accepted submission records its artifact path");
+    assert.ok(readFileSync(res.artifact, "utf8").includes("CONFIRMED"));
   });
 
   it('junk ids ("false") never merge distinct findings into one artifact or repair bucket', () => {

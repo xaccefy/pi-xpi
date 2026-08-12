@@ -102,10 +102,7 @@ function createFakePi(): FakePi {
 async function executeTool(pi: FakePi, name: string, params: Record<string, unknown>) {
   const tool = pi.tools.get(name);
   if (!tool) throw new Error(`Tool not registered: ${name}`);
-  const finalParams =
-    name === "PromoteFinding" && params.control_path && !params.control_target
-      ? { control_target: "https://control.example", ...params }
-      : params;
+  const finalParams = params;
   try {
     return await tool.execute(
       "test-call",
@@ -122,17 +119,14 @@ async function executeTool(pi: FakePi, name: string, params: Record<string, unkn
       isError: true,
       details: {
         record: typeof finalParams.id === "string" ? getCaseById(finalParams.id) : undefined,
-        missingControl: text.includes("control_path"),
+        missingControl: text.includes("control_path is REQUIRED"),
         missingControlTarget: text.includes("control_target is REQUIRED"),
-        missingLivenessMarker: text.includes("control_liveness_marker is REQUIRED"),
-        livenessEqualsMarker: text.includes("must differ from verification_marker"),
-        missingDisconfirmation: text.includes("disconfirmation_path is REQUIRED"),
-        controlCheated: text.includes("appeared in the control-target run"),
-        controlCrashed: text.includes("control-target script did NOT complete"),
-        controlLivenessMissing:
-          text.includes("control_liveness_marker") && text.includes("NOT found"),
-        disconfirmationCrashed: text.includes("Disconfirmation script did NOT complete"),
-        markerMissing: text.includes("verification marker") && text.includes("NOT found"),
+        controlTargetEqualsCase: text.includes("control_target must differ from the case target"),
+        evidenceFailed: text.includes("EVIDENCE CONTRACT FAILED"),
+        controlIdentical: text.includes("identical evidence to the target"),
+        controlBindingFailed: text.includes("CONTROL BINDING FAILED"),
+        didNotComplete: /did not complete|did NOT complete/i.test(text),
+        sameFileCheckFailed: text.includes("sha256 mismatch"),
       },
     };
   }
@@ -145,11 +139,24 @@ beforeEach(async () => {
   pocScriptPath = join(tempDir, "shared.sh");
   // Same-file contract: the control must be the SAME script as the PoC
   // (sha256-equal; the only permitted difference is PI_POC_MODE). The shared
-  // fixture branches: poc mode prints the marker, control mode prints the
-  // liveness marker only, disconfirmation is a separate exit-1 script.
+  // fixture writes nonce-bound evidence.json per run, with mode-dependent
+  // content: the target run claims the vuln, the control run claims the
+  // baseline (so the machine differential passes).
   writeFileSync(
     pocScriptPath,
-    "#!/bin/sh\nif [ \"$PI_POC_MODE\" = \"control\" ]; then\n  echo 'CONTROL_REACHED_1'\n  exit 0\nfi\nprintf 'ok'",
+    [
+      "#!/bin/sh",
+      'E="$PI_POC_EVIDENCE_DIR"',
+      'mkdir -p "$E"',
+      'if [ "$PI_POC_MODE" = "control" ]; then',
+      '  printf \'{"nonce":"%s","claim":"control baseline lacks the vuln","verify":{"method":"GET","url":"http://%s/read?file=/etc/passwd","expect":{"status":[403]}},"observations":["control returned 403"]}\' "$PI_POC_NONCE" "$PI_POC_TARGET" > "$E/evidence.json"',
+      "  exit 0",
+      "fi",
+      'printf \'{"nonce":"%s","claim":"read /etc/passwd of target","verify":{"method":"GET","url":"http://%s/read?file=/etc/passwd","expect":{"status":[200],"body_contains":["root:"]}},"observations":["root: present"]}\' "$PI_POC_NONCE" "$PI_POC_TARGET" > "$E/evidence.json"',
+      "printf 'ok'",
+      "exit 0",
+      "",
+    ].join("\n"),
     "utf8",
   );
   controlScriptPath = pocScriptPath;
@@ -194,6 +201,7 @@ describe("casefile extension", () => {
       "CaseUnlink",
       "CaseUpdate",
       "ChainSuggest",
+      "ConfirmFinding",
       "CoverageAdd",
       "CoverageReport",
       "EvidenceAdd",
@@ -258,19 +266,48 @@ describe("casefile extension", () => {
     });
     expect(updated.details.changed).toBe(true);
 
-    const promoted = await executeTool(pi, "PromoteFinding", {
+    // Phase 1: PromoteFinding records the evidence bundle (2 target runs +
+    // control); the case stays investigating until the confirmer's verdict.
+    const phase1 = await executeTool(pi, "PromoteFinding", {
       id: record.id,
       poc_path: pocScriptPath,
-      verification_marker: "ok",
+      control_target: "https://control.example",
       control_path: controlScriptPath,
-      control_liveness_marker: "CONTROL_REACHED_1",
-      disconfirmation_path: disconfirmationScriptPath,
       local: true,
     });
+    expect(phase1.details?.record?.status).toBe("investigating");
+    expect(phase1.details.record.pendingConfirmation).toBeDefined();
+    expect(phase1.details.bundle.evidenceSha256).toMatch(/^[a-f0-9]{64}$/);
+
+    // Phase 2: ConfirmFinding commits a complete confirmer verdict.
+    const promoted = await executeTool(pi, "ConfirmFinding", {
+      id: record.id,
+      verdict: {
+        verdict: "CONFIRMED",
+        reasoning: "re-sent the verify request: target returned the claimed entry, control did not",
+        evidence_reviewed: ["evidence.json (target run 1)", "evidence.json (control run)"],
+        re_executed: true,
+        re_execution_note: "GET /read?file=/etc/passwd → 200 with root: on target; 403 on control",
+        differential: "target_only",
+        severity_match: "ok",
+        disconfirmation_attempt:
+          "tried /read?file=/etc/shadow and a patched replica → no entry; the effect is target-dependent",
+        model: "test-model",
+      },
+    });
+    expect(promoted.details.promoted).toBe(true);
     expect(promoted.details.record.status).toBe("confirmed");
     expect(promoted.details.record.pocVerified?.exitCode).toBe(0);
     expect(promoted.details.record.evidence).toContain("PoC Execution Capture");
-    expect(promoted.details.record.evidence).toContain("Execution Output\n```\nok\n```");
+    expect(promoted.details.record.evidence).toContain("Target Run Output");
+    // The confirmer's attempt becomes the case's disconfirmation.
+    expect(promoted.details.record.disconfirmation).toContain("tried /read?file=/etc/shadow");
+    // The reproduction evidence item is artifact-backed by the preserved copy.
+    const repro = promoted.details.record.evidenceItems?.find(
+      (e: { role: string }) => e.role === "reproduction",
+    );
+    expect(repro).toBeDefined();
+    expect(repro.artifactPath).toMatch(/\.evidence\.json$/);
 
     const listed = await executeTool(pi, "CaseList", { status: "confirmed" });
     expect(listed.details.total).toBe(1);
@@ -297,7 +334,7 @@ describe("casefile extension", () => {
     expect(contextText).toContain("Linked Cases");
   });
 
-  test("PromoteFinding requires control_path + control_liveness_marker for EVERY promotion (sandboxed and live)", async () => {
+  test("PromoteFinding requires control_path + control_target for EVERY promotion (sandboxed and live)", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
 
@@ -310,7 +347,6 @@ describe("casefile extension", () => {
       poc: "send payload, check reflection",
       impact: "script execution",
       target: "example-app",
-      disconfirmation: "tried without payload; no reflection",
     });
     const id = added.details.record.id;
 
@@ -319,11 +355,9 @@ describe("casefile extension", () => {
     const noControl = await executeTool(pi, "PromoteFinding", {
       id,
       poc_path: pocScriptPath,
-      verification_marker: "ok",
-      control_liveness_marker: "CONTROL_REACHED_1",
+      control_target: "https://control.example",
     });
     expect(noControl.isError).toBe(true);
-    expect(noControl.content[0].text).toContain("control_path");
     expect(noControl.details.missingControl).toBe(true);
     expect(noControl.details.record.status).toBe("investigating");
 
@@ -331,44 +365,41 @@ describe("casefile extension", () => {
     const noControlLive = await executeTool(pi, "PromoteFinding", {
       id,
       poc_path: pocScriptPath,
-      verification_marker: "ok",
       local: true,
     });
     expect(noControlLive.isError).toBe(true);
-    expect(noControlLive.content[0].text).toContain("control_path");
+    expect(noControlLive.details.missingControl).toBe(true);
     expect(noControlLive.details.record.status).toBe("investigating");
 
-    // Missing control_liveness_marker — blocked before any PoC run.
-    const noLiveness = await executeTool(pi, "PromoteFinding", {
+    // control_path without control_target — blocked before any PoC run.
+    const noTarget = await executeTool(pi, "PromoteFinding", {
       id,
       poc_path: pocScriptPath,
-      verification_marker: "ok",
       control_path: controlScriptPath,
     });
-    expect(noLiveness.isError).toBe(true);
-    expect(noLiveness.content[0].text).toContain("control_liveness_marker");
-    expect(noLiveness.details.missingLivenessMarker).toBe(true);
-    expect(noLiveness.details.record.status).toBe("investigating");
+    expect(noTarget.isError).toBe(true);
+    expect(noTarget.details.missingControlTarget).toBe(true);
+    expect(noTarget.details.record.status).toBe("investigating");
 
-    // A liveness marker identical to the verification marker is rejected.
-    const sameMarker = await executeTool(pi, "PromoteFinding", {
+    // control_target equal to the case target — blocked: a control run against
+    // the vulnerable target proves nothing.
+    const sameTarget = await executeTool(pi, "PromoteFinding", {
       id,
       poc_path: pocScriptPath,
-      verification_marker: "ok",
       control_path: controlScriptPath,
-      control_liveness_marker: "ok",
+      control_target: "example-app",
     });
-    expect(sameMarker.isError).toBe(true);
-    expect(sameMarker.details.livenessEqualsMarker).toBe(true);
-    expect(sameMarker.details.record.status).toBe("investigating");
+    expect(sameTarget.isError).toBe(true);
+    expect(sameTarget.details.controlTargetEqualsCase).toBe(true);
+    expect(sameTarget.details.record.status).toBe("investigating");
   });
 
-  test("PromoteFinding requires disconfirmation_path for severity high/critical", async () => {
+  test("PromoteFinding rejects a PoC that exits 0 but writes no evidence.json", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
 
     const added = await addCase(pi, {
-      title: "High severity without disconfirmation script",
+      title: "Exit 0 without evidence",
       status: "investigating",
       evidence: "reflected input",
       confidence: "high",
@@ -376,25 +407,27 @@ describe("casefile extension", () => {
       poc: "send payload, check reflection",
       impact: "script execution",
       target: "example-app",
-      disconfirmation: "tried without payload; no reflection",
     });
     const id = added.details.record.id;
 
+    // The script "succeeds" (exit 0) but never writes evidence.json — the old
+    // exit-0 gate would have promoted it; the evidence contract blocks it.
+    const noEvidence = join(tempDir, "no-evidence.sh");
+    writeFileSync(noEvidence, "#!/bin/sh\nexit 0", "utf8");
+
     const result = await executeTool(pi, "PromoteFinding", {
       id,
-      poc_path: pocScriptPath,
-      verification_marker: "ok",
-      control_path: controlScriptPath,
-      control_liveness_marker: "CONTROL_REACHED_1",
+      poc_path: noEvidence,
+      control_target: "https://control.example",
+      control_path: noEvidence,
       local: true,
     });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("disconfirmation_path");
-    expect(result.details.missingDisconfirmation).toBe(true);
+    expect(result.details.evidenceFailed).toBe(true);
     expect(result.details.record.status).toBe("investigating");
   });
 
-  test("PromoteFinding blocks a PoC whose marker appears in the control-target run (cheat)", async () => {
+  test("PromoteFinding blocks a control run whose evidence matches the target's (cheat)", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
 
@@ -407,33 +440,39 @@ describe("casefile extension", () => {
       poc: "send payload, check reflection",
       impact: "script execution",
       target: "example-app",
-      disconfirmation: "tried without payload; no reflection",
     });
     const id = added.details.record.id;
 
     // The control script is the SAME file as the PoC (same-file contract) but
-    // its control branch echoes the marker unconditionally — the way a
-    // cheating PoC prints it without the vulnerable condition. The harness
-    // must block promotion even though the PoC run itself "succeeded".
+    // its control branch writes the SAME evidence as the target branch — the
+    // way a cheating PoC claims success regardless of target behavior. The
+    // machine differential must block the promotion.
     const cheatScript = join(tempDir, "cheat.sh");
     writeFileSync(
       cheatScript,
-      "#!/bin/sh\nif [ \"$PI_POC_MODE\" = \"control\" ]; then\n  printf 'ok'\n  echo 'CONTROL_REACHED_1'\n  exit 0\nfi\nprintf 'ok'",
+      [
+        "#!/bin/sh",
+        'E="$PI_POC_EVIDENCE_DIR"',
+        'mkdir -p "$E"',
+        // Hardcoded URL + claim in BOTH modes: the control run's evidence is
+        // byte-identical to the target's (modulo nonce), so the machine
+        // differential must block the promotion.
+        'printf \'{"nonce":"%s","claim":"read /etc/passwd","verify":{"method":"GET","url":"http://victim/read?file=/etc/passwd","expect":{"status":[200],"body_contains":["root:"]}},"observations":["root:"]}\' "$PI_POC_NONCE" > "$E/evidence.json"',
+        "exit 0",
+        "",
+      ].join("\n"),
       "utf8",
     );
 
     const result = await executeTool(pi, "PromoteFinding", {
       id,
       poc_path: cheatScript,
-      verification_marker: "ok",
+      control_target: "https://control.example",
       control_path: cheatScript,
-      control_liveness_marker: "CONTROL_REACHED_1",
-      disconfirmation_path: disconfirmationScriptPath,
       local: true,
     });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("CONTROL CHECK FAILED");
-    expect(result.details.controlCheated).toBe(true);
+    expect(result.details.controlIdentical).toBe(true);
     expect(result.details.record.status).toBe("investigating");
   });
 
@@ -450,36 +489,44 @@ describe("casefile extension", () => {
       poc: "send payload, check reflection",
       impact: "script execution",
       target: "example-app",
-      disconfirmation: "tried without payload; no reflection",
     });
     const id = added.details.record.id;
 
     // A control script that kills itself never runs to completion — the gate
-    // must NOT treat "no marker in crash output" as a clean control verdict.
-    // Same-file contract: poc and control are the SAME script.
+    // must NOT treat a crash as a clean control verdict. The poc branch still
+    // writes valid evidence (so the failure is the CONTROL completion, not the
+    // poc evidence contract). Same-file contract: poc and control are the SAME
+    // script.
     const crashControl = join(tempDir, "crash-control.sh");
     writeFileSync(
       crashControl,
-      '#!/bin/sh\nif [ "$PI_POC_MODE" = "control" ]; then\n  kill -9 $$\nfi\nprintf \'ok\'',
+      [
+        "#!/bin/sh",
+        'E="$PI_POC_EVIDENCE_DIR"',
+        'mkdir -p "$E"',
+        'if [ "$PI_POC_MODE" = "control" ]; then',
+        "  kill -9 $$",
+        "fi",
+        'printf \'{"nonce":"%s","claim":"read /etc/passwd","verify":{"method":"GET","url":"http://%s/read?file=/etc/passwd","expect":{"status":[200],"body_contains":["root:"]}},"observations":["root:"]}\' "$PI_POC_NONCE" "$PI_POC_TARGET" > "$E/evidence.json"',
+        "exit 0",
+        "",
+      ].join("\n"),
       "utf8",
     );
 
     const result = await executeTool(pi, "PromoteFinding", {
       id,
       poc_path: crashControl,
-      verification_marker: "ok",
+      control_target: "https://control.example",
       control_path: crashControl,
-      control_liveness_marker: "CONTROL_REACHED_1",
-      disconfirmation_path: disconfirmationScriptPath,
       local: true,
     });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("did NOT complete");
-    expect(result.details.controlCrashed).toBe(true);
+    expect(result.details.didNotComplete).toBe(true);
     expect(result.details.record.status).toBe("investigating");
   });
 
-  test("PromoteFinding blocks a control that completed WITHOUT the liveness marker", async () => {
+  test("PromoteFinding blocks a control that completes but writes no evidence", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
 
@@ -492,14 +539,13 @@ describe("casefile extension", () => {
       poc: "send payload, check reflection",
       impact: "script execution",
       target: "example-app",
-      disconfirmation: "tried without payload; no reflection",
     });
     const id = added.details.record.id;
 
-    // The control exits cleanly and never prints the vuln marker — but it also
-    // never reaches the control target (no liveness marker). A control pointed
-    // at an unreachable host / wrong port / early exit is NOT a clean verdict.
-    // Same-file contract: poc and control are the SAME script.
+    // The control exits cleanly — but it never writes evidence.json, so it
+    // never demonstrates anything about the control target. A "control" that
+    // completes without a verdict is not a clean verdict. Same-file contract:
+    // poc and control are the SAME script (the poc branch also writes nothing).
     const deadControl = join(tempDir, "dead-control.sh");
     writeFileSync(
       deadControl,
@@ -510,16 +556,12 @@ describe("casefile extension", () => {
     const result = await executeTool(pi, "PromoteFinding", {
       id,
       poc_path: deadControl,
-      verification_marker: "ok",
+      control_target: "https://control.example",
       control_path: deadControl,
-      control_liveness_marker: "CONTROL_REACHED_1",
-      disconfirmation_path: disconfirmationScriptPath,
       local: true,
     });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("CONTROL CHECK FAILED");
-    expect(result.content[0].text).toContain("control_liveness_marker");
-    expect(result.details.controlLivenessMissing).toBe(true);
+    expect(result.details.evidenceFailed).toBe(true);
     expect(result.details.record.status).toBe("investigating");
   });
 
@@ -564,12 +606,12 @@ describe("casefile extension", () => {
     expect(sstiLine).toContain("⚠ unbacked");
   });
 
-  test("PromoteFinding blocks a crashed disconfirmation script (crash is not survived disproof)", async () => {
+  test("ConfirmFinding requires a pending bundle and a complete verdict", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
 
     const added = await addCase(pi, {
-      title: "Crashing disconfirmation",
+      title: "Confirm without phase 1",
       status: "investigating",
       evidence: "reflected input",
       confidence: "high",
@@ -577,26 +619,57 @@ describe("casefile extension", () => {
       poc: "send payload, check reflection",
       impact: "script execution",
       target: "example-app",
-      disconfirmation: "tried without payload; no reflection",
     });
     const id = added.details.record.id;
 
-    const crashDisconf = join(tempDir, "crash-disconf.sh");
-    writeFileSync(crashDisconf, "#!/bin/sh\nkill -9 $$\n", "utf8");
+    const completeVerdict = {
+      verdict: "CONFIRMED",
+      reasoning: "re-sent the verify request: effect reproduced on target only",
+      evidence_reviewed: ["evidence.json (target run)"],
+      re_executed: true,
+      differential: "target_only",
+      disconfirmation_attempt: "tried a patched replica and a second account — no effect",
+      model: "test-model",
+    };
 
-    const result = await executeTool(pi, "PromoteFinding", {
+    // No pending bundle (PromoteFinding never ran) → the verdict cannot apply.
+    let err: Error | undefined;
+    try {
+      await executeTool(pi, "ConfirmFinding", { id, verdict: completeVerdict });
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err).toBeDefined();
+    expect(err!.message).toContain("No pending confirmation");
+
+    // A CONFIRMED verdict missing the mandatory fields is rejected.
+    const phase1 = await executeTool(pi, "PromoteFinding", {
       id,
       poc_path: pocScriptPath,
-      verification_marker: "ok",
-      disconfirmation_path: crashDisconf,
+      control_target: "https://control.example",
       control_path: controlScriptPath,
-      control_liveness_marker: "CONTROL_REACHED_1",
       local: true,
     });
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("did NOT complete");
-    expect(result.details.disconfirmationCrashed).toBe(true);
-    expect(result.details.record.status).toBe("investigating");
+    expect(phase1.details?.record?.status).toBe("investigating");
+    let badVerdictErr: Error | undefined;
+    try {
+      await executeTool(pi, "ConfirmFinding", {
+        id,
+        verdict: { ...completeVerdict, re_executed: false },
+      });
+    } catch (e) {
+      badVerdictErr = e as Error;
+    }
+    expect(badVerdictErr).toBeDefined();
+    expect(badVerdictErr!.message).toContain("re_executed");
+
+    // A complete verdict commits.
+    const confirmed = await executeTool(pi, "ConfirmFinding", {
+      id,
+      verdict: completeVerdict,
+    });
+    expect(confirmed.details.promoted).toBe(true);
+    expect(confirmed.details.record.status).toBe("confirmed");
   });
 
   test("CoverageAdd records cells and CoverageReport renders the matrix", async () => {
@@ -644,12 +717,12 @@ describe("casefile extension", () => {
     expect(suggestions.details.suggestions.length).toBeGreaterThan(0);
   });
 
-  test("PromoteFinding rejects a PoC that exits 0 but lacks the verification marker", async () => {
+  test("PromoteFinding rejects evidence not bound to this run (nonce mismatch)", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
 
     const added = await addCase(pi, {
-      title: "Missing marker PoC",
+      title: "Copy-pasted evidence",
       target: "example-app",
       bugClass: "xss",
       evidence: "reflected input",
@@ -663,21 +736,33 @@ describe("casefile extension", () => {
       poc: "send payload, check reflection",
       impact: "script execution",
       target: "example-app",
-      disconfirmation: "tried without payload; no reflection",
     });
 
-    // PoC prints 'ok' but we require a marker that is NOT in the output.
+    // The PoC writes a well-formed evidence.json but with a HARDCODED nonce —
+    // copy-pasted evidence from an earlier run must not bind to this one.
+    const staleNonce = join(tempDir, "stale-nonce.sh");
+    writeFileSync(
+      staleNonce,
+      [
+        "#!/bin/sh",
+        'E="$PI_POC_EVIDENCE_DIR"',
+        'mkdir -p "$E"',
+        'printf \'{"nonce":"stale-nonce","claim":"read /etc/passwd","verify":{"method":"GET","url":"http://%s/read?file=/etc/passwd","expect":{"status":[200],"body_contains":["root:"]}},"observations":["root:"]}\' "$PI_POC_TARGET" > "$E/evidence.json"',
+        "exit 0",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
     const result = await executeTool(pi, "PromoteFinding", {
       id,
-      poc_path: pocScriptPath,
-      verification_marker: "VULN_CONFIRMED_not_present",
-      control_path: controlScriptPath,
-      control_liveness_marker: "CONTROL_REACHED_1",
-      disconfirmation_path: disconfirmationScriptPath,
+      poc_path: staleNonce,
+      control_target: "https://control.example",
+      control_path: staleNonce,
       local: true,
     });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("verification marker");
+    expect(result.content[0].text).toContain("nonce");
     expect(result.details.record.status).toBe("investigating");
   });
 
@@ -975,11 +1060,21 @@ describe("casefile extension", () => {
       await executeTool(pi, "PromoteFinding", {
         id: reported.details.record.id,
         poc_path: pocScriptPath,
-        verification_marker: "ok",
+        control_target: "https://control.example",
         control_path: controlScriptPath,
-        control_liveness_marker: "CONTROL_REACHED_1",
-        disconfirmation_path: disconfirmationScriptPath,
         local: true,
+      });
+      await executeTool(pi, "ConfirmFinding", {
+        id: reported.details.record.id,
+        verdict: {
+          verdict: "CONFIRMED",
+          reasoning: "re-sent the verify request: effect reproduced on target only",
+          evidence_reviewed: ["evidence.json (target run)"],
+          re_executed: true,
+          differential: "target_only",
+          disconfirmation_attempt: "tried a patched replica — no effect; target-dependent",
+          model: "test-model",
+        },
       });
       const ctxResult = await executeTool(pi, "CaseContext", { id: reported.details.record.id });
       // The reporter agent writes the report file (passing the content gate:
@@ -1184,11 +1279,21 @@ describe("casefile extension", () => {
     await executeTool(pi, "PromoteFinding", {
       id: storedXss.details.record.id,
       poc_path: pocScriptPath,
-      verification_marker: "ok",
+      control_target: "https://control.example",
       control_path: controlScriptPath,
-      control_liveness_marker: "CONTROL_REACHED_1",
-      disconfirmation_path: disconfirmationScriptPath,
       local: true,
+    });
+    await executeTool(pi, "ConfirmFinding", {
+      id: storedXss.details.record.id,
+      verdict: {
+        verdict: "CONFIRMED",
+        reasoning: "re-sent the verify request: payload rendered on target only",
+        evidence_reviewed: ["evidence.json (target run)"],
+        re_executed: true,
+        differential: "target_only",
+        disconfirmation_attempt: "rendered a control note without script — no execution",
+        model: "test-model",
+      },
     });
 
     const notifications: string[] = [];

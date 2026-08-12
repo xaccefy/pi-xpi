@@ -24,11 +24,9 @@ Fetch a URL as clean text/markdown (GitHub READMEs use a dedicated path).
 
 - `url` (required, http/https)
 
-**JS pages:** if the static extract is a bare HTML shell, `web_fetch` re-renders with system Chromium (`--headless --dump-dom`) when present.
 
 | Variable | Purpose |
 |----------|---------|
-| `PI_CHROMIUM_PATH` | Absolute path to chromium/chrome binary |
 | `PI_WEBSEARCH_PORT` | Daemon port (default `3210`) |
 
 ### `context7`

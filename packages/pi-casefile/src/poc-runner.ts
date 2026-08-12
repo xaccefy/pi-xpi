@@ -1,7 +1,9 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
@@ -11,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 
+import { evidenceNonceMatches, type PoCEvidence, parsePoCEvidence } from "./evidence.ts";
 import { findWorkspaceRoot } from "./scratchpad.ts";
 
 export type PocRun = {
@@ -40,12 +43,22 @@ export type PocRun = {
   mode?: string;
   /** Harness target used for this run. */
   target?: string;
-  /**
-   * True when the run never started because of harness infrastructure
+  /** True when the run never started because of harness infrastructure
    * failure (e.g. sandbox image pull failed) — set only by the runner,
-   * never derived from PoC-controlled output text.
-   */
+   * never derived from PoC-controlled output text. */
   infraError?: boolean;
+  /** Validated evidence.json written by the PoC to $PI_POC_EVIDENCE_DIR. */
+  evidence?: PoCEvidence;
+  /** SHA-256 of the evidence.json file (reproduction artifact). */
+  evidenceSha256?: string;
+  /** Absolute path of the PRESERVED copy of evidence.json (moved into the
+   * durable .pi/poc-evidence/ dir before the temp workspace is cleaned up) —
+   * lets the ledger's reproduction item stay artifact-backed and re-verifiable. */
+  evidencePath?: string;
+  /** Evidence contract failure (missing/invalid/nonce mismatch) — blocks the gate. */
+  evidenceError?: string;
+  /** The per-run nonce the evidence must be bound to (harness-generated). */
+  nonce?: string;
 };
 
 /**
@@ -116,6 +129,10 @@ const TIMEOUT_MS = 30_000;
 /** Completion sentinel echoed after the PoC command inside the sandbox shell. */
 function makeSentinel(): string {
   return `__PI_POC_DONE_${Math.random().toString(36).slice(2, 12)}__`;
+}
+/** Per-run random nonce the PoC must echo in evidence.json (binds evidence to its run). */
+function makeNonce(): string {
+  return `poc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
 }
 /** First-use image downloads are slow — pull outside the run timeout. */
 const PULL_TIMEOUT_MS = 300_000;
@@ -286,8 +303,65 @@ function splitOutput(raw: string): { rawOutput: string; output: string; truncate
   return { rawOutput: raw, output: raw.slice(0, OUTPUT_MAX_CHARS), truncated };
 }
 
+/**
+ * Read + validate the PoC's evidence.json from the harness-owned evidence
+ * dir. Missing, malformed, or nonce-mismatched evidence is a contract
+ * failure, not a verdict — surfaced as evidenceError on the run.
+ */
+function readEvidence(
+  evidenceDir: string,
+  nonce: string,
+): { evidence?: PoCEvidence; evidenceSha256?: string; evidenceError?: string } {
+  const p = join(evidenceDir, "evidence.json");
+  if (!existsSync(p)) {
+    return {
+      evidenceError: `evidence.json missing in ${evidenceDir} — the PoC must write it to $PI_POC_EVIDENCE_DIR ({"nonce", "claim", "verify", "observations"})`,
+    };
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(p, "utf8"));
+  } catch (e) {
+    return { evidenceError: `evidence.json unparseable: ${(e as Error).message}` };
+  }
+  const parsed = parsePoCEvidence(raw);
+  if (!parsed.ok) return { evidenceError: parsed.error };
+  if (!evidenceNonceMatches(parsed.evidence, nonce)) {
+    return {
+      evidenceError:
+        "evidence.json nonce mismatch — the file was not written by this run (copy-pasted evidence fails here)",
+    };
+  }
+  return {
+    evidence: parsed.evidence,
+    evidenceSha256: createHash("sha256").update(readFileSync(p)).digest("hex"),
+  };
+}
+
 function runProvenance(env?: Record<string, string>): Pick<PocRun, "mode" | "target"> {
   return { mode: env?.PI_POC_MODE, target: env?.PI_POC_TARGET };
+}
+
+/**
+ * Copy the run's evidence.json into a durable harness-owned dir BEFORE the
+ * temp workspace is deleted. The ledger's reproduction item stores the SHA-256
+ * of this exact file, so the file must survive the run — otherwise the
+ * "artifact-backed" evidence item hashes a file that no longer exists.
+ * Returns the preserved path, or undefined when the file is missing.
+ */
+function preserveEvidence(evidenceDir: string, nonce: string): string | undefined {
+  const source = join(evidenceDir, "evidence.json");
+  if (!existsSync(source)) return undefined;
+  try {
+    const durableDir = join(getProjectRoot(), ".pi", "poc-evidence");
+    mkdirSync(durableDir, { recursive: true });
+    const dest = join(durableDir, `${nonce}.evidence.json`);
+    copyFileSync(source, dest);
+    return dest;
+  } catch {
+    // Best-effort: a preserved copy is an audit-trail improvement, not a gate.
+    return undefined;
+  }
 }
 
 function outputWasComplete(result: { error?: Error; signal: string | null }): boolean {
@@ -423,6 +497,17 @@ function runSandboxed(
   // Named container so a timed-out / killed client can still be cleaned up —
   // `--rm` alone leaks the container when the CLI dies before the child exits.
   const containerName = `poc-runner-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+  // Evidence contract: harness-owned dir + per-run nonce. The PoC writes
+  // evidence.json into $PI_POC_EVIDENCE_DIR (/workspace/evidence inside the
+  // container); the nonce binds the file to this run.
+  const nonce = makeNonce();
+  const evidenceDir = join(workspaceDir, "evidence");
+  mkdirSync(evidenceDir, { recursive: true });
+  const runEnv = {
+    ...env,
+    PI_POC_EVIDENCE_DIR: "/workspace/evidence",
+    PI_POC_NONCE: nonce,
+  };
 
   try {
     // Fail closed as a non-zero run (not a throw) when docker/images are
@@ -447,15 +532,17 @@ function runSandboxed(
     const command = renderCommand(language.run, pocPath, true);
 
     // Completion sentinel: wrap the command so the shell echoes a unique token
-    // AFTER the PoC exits, preserving its exit code. If the container is
-    // killed, times out, or the run never starts, the sentinel is absent —
-    // callers can then tell "script ran and failed" from "script crashed".
+    // ONLY when the PoC exited normally (rc < 128). A child killed by a signal
+    // (segfault, OOM under the sandbox limits) yields rc = 128+N — the sentinel
+    // is suppressed, so `completed` means "the script actually ran to
+    // completion", not merely "the container exited". Callers treat a missing
+    // sentinel as "not a verdict".
     const sentinel = makeSentinel();
-    const wrapped = `${command}; rc=$?; echo '${sentinel}'; exit $rc`;
+    const wrapped = `${command}; rc=$?; if [ "$rc" -lt 128 ]; then echo '${sentinel}'; fi; exit $rc`;
 
     const result = spawnSync(
       "docker",
-      buildDockerArgs(language.image, wrapped, workspaceDir, containerName, network, env),
+      buildDockerArgs(language.image, wrapped, workspaceDir, containerName, network, runEnv),
       {
         encoding: "utf8",
         timeout: TIMEOUT_MS,
@@ -467,6 +554,8 @@ function runSandboxed(
     const raw = (result.stdout ?? "") + (result.stderr ?? "") + spawnErr;
     const completed = raw.includes(sentinel);
     const { rawOutput, output, truncated } = splitOutput(sanitizeOutput(raw.replace(sentinel, "")));
+    const preserved = preserveEvidence(evidenceDir, nonce);
+    const evidence = readEvidence(evidenceDir, nonce);
     return {
       path: pocPath,
       exitCode: spawnExitCode(result),
@@ -477,6 +566,9 @@ function runSandboxed(
       sandbox: true,
       completed,
       outputComplete: outputWasComplete(result),
+      nonce,
+      ...evidence,
+      evidencePath: evidence.evidence ? preserved : undefined,
       ...runProvenance(env),
     };
   } finally {
@@ -496,49 +588,70 @@ function runSandboxed(
 
 function runLocal(pocPath: string, language: PocLanguage, env?: Record<string, string>): PocRun {
   const ranAt = new Date().toISOString();
-
-  // The run template is `<interpreter> [flags...] {{file}}`. Split the static
-  // template on whitespace FIRST (builtins only, not user input), then render
-  // placeholders within each token. Passing the tokens to spawnSync with NO
-  // shell keeps a space-containing PoC path as one arg and keeps extra flags
-  // (e.g. `node --experimental-vm-modules {{file}}`) as separate args.
-  // Splitting after rendering would re-split a space-containing path.
-  const tokens = language.run.trim().split(/\s+/).filter(Boolean);
-  const interpreter = tokens.shift() ?? language.run.trim();
-  const args = tokens.map((tok) => renderCommand(tok, pocPath, false));
-
-  const result = spawnSync(interpreter, args, {
-    encoding: "utf8",
-    timeout: TIMEOUT_MS,
-    maxBuffer: MAX_BUFFER,
-    // Host runs get the harness env contract merged over the operator env;
-    // the spawn env is explicitly provided so PI_POC_MODE / PI_POC_TARGET
-    // reach the script without leaking through a shell. Same control-char
-    // rejection as the sandboxed path.
-    env: env ? { ...process.env, ...sanitizePocEnv(env) } : undefined,
-  });
-
-  // Local runs stay shell-free (space-containing paths stay single args), so
-  // there is no sentinel echo: "completed" is derived from the spawn result.
-  // A spawn error (interpreter missing) or a signal kill (timeout, SIGKILL)
-  // means the script never ran to completion — fail closed on those.
-  const spawnErr = result.error ? `\n[spawn error] ${result.error.message}` : "";
-  const completed = !result.error && result.signal === null;
-  const { rawOutput, output, truncated } = splitOutput(
-    sanitizeOutput((result.stdout ?? "") + (result.stderr ?? "") + spawnErr),
-  );
-  return {
-    path: pocPath,
-    exitCode: spawnExitCode(result),
-    output,
-    rawOutput,
-    truncated,
-    ranAt,
-    sandbox: false,
-    completed,
-    outputComplete: outputWasComplete(result),
-    ...runProvenance(env),
+  // Evidence contract: harness-owned temp dir + per-run nonce, same as sandboxed.
+  const nonce = makeNonce();
+  const evidenceDir = mkdtempSync(join(tmpdir(), "poc-evidence-"));
+  const runEnv = {
+    ...env,
+    PI_POC_EVIDENCE_DIR: evidenceDir,
+    PI_POC_NONCE: nonce,
   };
+
+  try {
+    // The run template is `<interpreter> [flags...] {{file}}`. Split the static
+    // template on whitespace FIRST (builtins only, not user input), then render
+    // placeholders within each token. Passing the tokens to spawnSync with NO
+    // shell keeps a space-containing PoC path as one arg and keeps extra flags
+    // (e.g. `node --experimental-vm-modules {{file}}`) as separate args.
+    // Splitting after rendering would re-split a space-containing path.
+    const tokens = language.run.trim().split(/\s+/).filter(Boolean);
+    const interpreter = tokens.shift() ?? language.run.trim();
+    const args = tokens.map((tok) => renderCommand(tok, pocPath, false));
+
+    const result = spawnSync(interpreter, args, {
+      encoding: "utf8",
+      timeout: TIMEOUT_MS,
+      maxBuffer: MAX_BUFFER,
+      // Host runs get the harness env contract merged over the operator env;
+      // the spawn env is explicitly provided so PI_POC_MODE / PI_POC_TARGET
+      // reach the script without leaking through a shell. Same control-char
+      // rejection as the sandboxed path.
+      env: { ...process.env, ...sanitizePocEnv(runEnv) },
+    });
+
+    // Local runs stay shell-free (space-containing paths stay single args), so
+    // there is no sentinel echo: "completed" is derived from the spawn result.
+    // A spawn error (interpreter missing) or a signal kill (timeout, SIGKILL)
+    // means the script never ran to completion — fail closed on those.
+    const spawnErr = result.error ? `\n[spawn error] ${result.error.message}` : "";
+    const completed = !result.error && result.signal === null;
+    const { rawOutput, output, truncated } = splitOutput(
+      sanitizeOutput((result.stdout ?? "") + (result.stderr ?? "") + spawnErr),
+    );
+    const preserved = preserveEvidence(evidenceDir, nonce);
+    const evidence = readEvidence(evidenceDir, nonce);
+    return {
+      path: pocPath,
+      exitCode: spawnExitCode(result),
+      output,
+      rawOutput,
+      truncated,
+      ranAt,
+      sandbox: false,
+      completed,
+      outputComplete: outputWasComplete(result),
+      nonce,
+      ...evidence,
+      evidencePath: evidence.evidence ? preserved : undefined,
+      ...runProvenance(env),
+    };
+  } finally {
+    try {
+      rmSync(evidenceDir, { recursive: true, force: true });
+    } catch {
+      // Best-effort cleanup.
+    }
+  }
 }
 
 /**
@@ -547,8 +660,7 @@ function runLocal(pocPath: string, language: PocLanguage, env?: Record<string, s
  * Language detection (in order):
  * 1. Shebang line in the PoC file.
  * 2. File extension (a .py PoC in a Node repo still runs under python).
- * 3. Project type markers in the workspace root (e.g., package.json, requirements.txt).
- * 4. PI_POC_DEFAULT_LANGUAGE environment variable (a built-in language key).
+ * 3. PI_POC_DEFAULT_LANGUAGE environment variable (a built-in language key).
  *
  * Security:
  * - PoC paths must be absolute and under the project workspace by default.
@@ -561,20 +673,12 @@ function runLocal(pocPath: string, language: PocLanguage, env?: Record<string, s
  *   `PI_POC_ALLOW_LOCAL=1` and is used only when Docker is unavailable
  *   (or when `PI_POC_FORCE_LOCAL=1` is also set). Without ALLOW the run
  *   fails closed if Docker cannot start.
- *
- * Back-compat: `runPoc(path, true)` == sandboxed, `runPoc(path, false)` ==
- * `{ local: true }` (host-network sandbox; host if operator-gated).
  */
-export function runPoc(pocPath: string, options?: PocRunOptions | boolean): PocRun {
+export function runPoc(pocPath: string, options?: PocRunOptions): PocRun {
   const normalized = validatePocPath(pocPath);
   const { language } = resolveLanguage(normalized);
 
-  const opts: PocRunOptions =
-    typeof options === "boolean"
-      ? options
-        ? { network: "none" }
-        : { local: true }
-      : (options ?? {});
+  const opts: PocRunOptions = options ?? {};
 
   // Host execution is gated by the OPERATOR, never by an agent-supplied flag.
   // `local: true` means "network access needed":

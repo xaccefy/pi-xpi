@@ -127,7 +127,7 @@ export function findWorkspaceRoot(envNames: string[], markers: string[]): string
 }
 
 /** Detect the scratchpad workspace root (override, env, then walk up). */
-function detectWorkspaceRoot(): string {
+export function detectWorkspaceRoot(): string {
   if (scratchpadRootOverride) return scratchpadRootOverride;
   return findWorkspaceRoot(
     ["XPI_SCRATCHPAD_ROOT", "PI_WORKSPACE_ROOT", "GITHUB_WORKSPACE"],
@@ -167,6 +167,23 @@ function runDirName(runId: string): string {
   const suffix = createHash("sha256").update(runId).digest("hex").slice(0, 12);
   return `${safe.slice(0, 80)}-${suffix}`;
 }
+
+/**
+ * Artifact names get the same disambiguation as run dirs: sanitization is
+ * lossy ("a/b" and "a_b" both become "a_b"), so a changed name gets a content
+ * hash suffix — distinct inputs can no longer silently overwrite each other's
+ * file. Reads use the same mapping, so round-trips stay consistent.
+ */
+function artifactFileName(name: string): string {
+  const safe = sanitizeName(name, "artifact name");
+  if (safe === name) return safe;
+  const suffix = createHash("sha256").update(name).digest("hex").slice(0, 12);
+  return `${safe.slice(0, 80)}-${suffix}`;
+}
+
+/** Cap on a single scratchpad artifact (2 MiB) — a hallucinating or hostile
+ * subagent must not be able to fill the disk with unbounded writes. */
+const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024;
 
 /** Pre-hash-suffix naming used by older scratchpad versions (sanitize only). */
 function legacyRunDirName(runId: string): string {
@@ -281,8 +298,15 @@ export function scratchpad_write(
   const runDir = getRunDir(runId, root);
   ensureRunDirs(runDir);
 
-  // Sanitize artifact name: no path traversal, no dot-only escape.
-  const safeName = sanitizeName(artifactName, "artifact name");
+  if (Buffer.byteLength(content, "utf8") > MAX_ARTIFACT_BYTES) {
+    throw new Error(
+      `Artifact too large (${Buffer.byteLength(content, "utf8")} bytes; max ${MAX_ARTIFACT_BYTES}): ${artifactName}`,
+    );
+  }
+
+  // Sanitize + disambiguate artifact name: no path traversal, no dot-only
+  // escape, and lossy sanitization cannot collide two distinct names.
+  const safeName = artifactFileName(artifactName);
   const dir = join(runDir, PHASE_DIRS[phase]);
   const filePath = join(dir, safeName);
   writeFileSync(filePath, content, "utf8");
@@ -299,7 +323,7 @@ export function scratchpad_read(
   projectRoot?: string,
 ): string | null {
   const root = projectRoot ?? detectWorkspaceRoot();
-  const safeName = sanitizeName(artifactName, "artifact name");
+  const safeName = artifactFileName(artifactName);
   const filePath = join(getRunDir(runId, root), PHASE_DIRS[phase], safeName);
   if (!existsSync(filePath)) return null;
   return readFileSync(filePath, "utf8");

@@ -7,9 +7,15 @@ description: Vulnerability discovery pipeline — the REQUIRED workflow whenever
 
 ## Your Role: Coordinator
 
-**You are the pipeline coordinator.** You do NOT hunt, trace, or write PoCs yourself. You dispatch specialist subagents via the `subagent` tool and orchestrate their outputs.
+**You are the pipeline coordinator.** You do NOT hunt, trace, or write PoCs yourself. You dispatch specialist subagents and orchestrate their outputs.
 
-- Every HUNT, TRACE, SKEPTIC, VALIDATE, CHAIN, and PATCH stage launches through `subagent({ workflowScript: "return runs.run('stable-key', { agent: '...', task: '...' })", context: "fresh", async: true })` — never inline.
+**Dispatch tool — use the one YOUR host provides:**
+- **Pi (pi-subagents extension):** `subagent({ workflowScript: "return runs.run('stable-key', { agent: '...', task: '...' })", context: "fresh", async: true })`; parallel stages launch ONE script whose `runs.all([...])` carries one entry per agent.
+- **OMP (fork, @oh-my-pi):** `task({ context: "fresh", tasks: [{ name: "stable-key", agent: "...", task: "..." }] })`; parallel stages put one entry per agent in the `tasks` array of a single call.
+
+The examples below show the Pi form first; the OMP `task` call carries the same `agent` name and `task` text as `{ name, agent, task }` entries. Never dispatch inline — every stage launches through the tool.
+
+- Every HUNT, TRACE, SKEPTIC, VALIDATE, CHAIN, and PATCH stage launches through the dispatch tool — never inline.
 - You own: casefile state, scratchpad checkpoints, schema validation at stage boundaries, coverage aggregation, advance/kill/retry decisions.
 - Reading source or probing endpoints yourself = **stop** — that's the subagent's job. Dispatch, validate against the schema, record.
 - You do yourself only: RECON (below) and REPORT (aggregate subagent outputs into the pipeline summary). The per-case report file is written by the **reporter** subagent (CaseContext → dispatch reporter → verify its output).
@@ -103,7 +109,7 @@ Every stage output must pass the `PipelineSubmit` gate before the next stage. It
 - A TRACER that errors or fails validation = **UNREACHABLE** — the finding does not advance.
 - Agent prompts state their schema contract. If you have the schema object, pass it as the child `outputSchema`; PipelineSubmit still validates every returned value.
 
-**Subagent crash handling (mandatory):** a crash (SIGABRT, OOM, timeout, process error) is a RETRY, not a verdict. Launch one new workflowScript with the same specialist task, a new stable attempt key, and a stronger model. If it crashes again, record `blocked: <agent> crashed` in the pipeline-run case and continue — never silently drop the stage.
+**Subagent crash handling (mandatory):** a crash (SIGABRT, OOM, timeout, process error) is a RETRY, not a verdict. Launch one new dispatch (pi: new workflowScript; OMP: new `task` call) with the same specialist task, a new stable attempt key/name, and a stronger model. If it crashes again, record `blocked: <agent> crashed` in the pipeline-run case and continue — never silently drop the stage.
 
 ## Agent Dispatch Patterns
 
@@ -120,9 +126,11 @@ RECON owns the coverage floor: hunts can only cover what recon found. Shallow re
 
 HUNT tasks reference this inventory; all coverage judgements are measured against it.
 
-**HARD GATE — RECON → HUNT:** inventory recorded → STOP all inline reading/probing. Your next tool call MUST launch one async workflowScript whose `runs.all([...])` dispatches one auditor per attack class. When completion is delivered, submit each output through PipelineSubmit. Mapping a sink, reading a handler, or probing beyond the inventory is HUNT work.
+**HARD GATE — RECON → HUNT:** inventory recorded → STOP all inline reading/probing. Your next tool call MUST launch one async dispatch — pi: one workflowScript whose `runs.all([...])` carries one auditor per attack class; OMP: one `task` call whose `tasks` array carries one `{ name, agent: "auditor", task }` entry per attack class. When completion is delivered, submit each output through PipelineSubmit. Mapping a sink, reading a handler, or probing beyond the inventory is HUNT work.
 
 ### HUNT: One agent per attack class (parallel)
+
+Pi form:
 
 ```js
 subagent({
@@ -132,6 +140,18 @@ subagent({
   ])`,
   context: "fresh",
   async: true
+})
+```
+
+OMP form (same tasks, one entry per class):
+
+```js
+task({
+  context: "fresh",
+  tasks: [
+    { name: "<run>-hunt-<class>-1", agent: "auditor", task: "Hunt for <class> vulnerabilities in <target/subsystem>. Output the Stage Finding contract." },
+    { name: "<run>-hunt-<class2>-1", agent: "auditor", task: "Hunt for <class2> vulnerabilities. Output the Stage Finding contract." }
+  ]
 })
 ```
 
@@ -148,12 +168,20 @@ Any unchecked entry point = `INCOMPLETE`, never `NOT_FOUND`.
 
 ### TRACE: One agent per finding
 
+Pi form:
+
 ```js
 subagent({
   workflowScript: `return runs.run("<run>-trace-<case>-1", { agent: "tracer", task: "Trace whether attacker input reaches the sink at <file:line>. Output the Stage Trace contract." })`,
   context: "fresh",
   async: true
 })
+```
+
+OMP form:
+
+```js
+task({ context: "fresh", tasks: [{ name: "<run>-trace-<case>-1", agent: "tracer", task: "Trace whether attacker input reaches the sink at <file:line>. Output the Stage Trace contract." }] })
 ```
 
 Only `TRACE RESULT: REACHABLE` advances.
@@ -175,13 +203,15 @@ subagent({
 })
 ```
 
+OMP form: same `task` text in a `task({ context: "fresh", tasks: [{ name: "<run>-skeptic-<case>-1", agent: "skeptic", task: "<same task text>" }] })` call.
+
 Validate: finding_id, verdict (CONFIRMED|DISPROVEN), reasoning, evidence_reviewed; DISPROVEN must have disproval_reason.
 
 **Verdict handling:**
-- **CONFIRMED** — write the skeptic's `disconfirmation_attempt` into the case's `disconfirmation` via `CaseUpdate(id, { disconfirmation: <attempt> })`; finding advances to VALIDATE.
+- **CONFIRMED** — record the skeptic's `disconfirmation_attempt` on the case via `CaseUpdate(id, { disconfirmation: <attempt> })` AND as `EvidenceAdd(role: "observation", artifact_path: <saved skeptic artifact>)` — the field will be replaced by the confirmer's attempt at confirm time, but the artifact keeps the skeptic's independent disproof in the audit trail; finding advances to VALIDATE.
 - **DISPROVEN** — first add the skeptic output as `EvidenceAdd(role: "refutation", artifact_path: <saved skeptic artifact>)`, then `CaseUpdate(id, { status: "killed", nextStep: "killed: skeptic-disproven — <disproval_reason>" })`. No tie-breaker.
 
-The skeptic's `disconfirmation_attempt` IS the case's disconfirmation record — satisfies the pre-CONFIRMED gate; stronger than self-disconfirmation (independent agent).
+The skeptic's `disconfirmation_attempt` is the pre-promotion disconfirmation record — stronger than self-disconfirmation (independent agent). The confirmer's independent attempt replaces the field at confirm time; both live in the evidence trail.
 
 ### VALIDATE: One agent per traced finding
 
@@ -193,11 +223,19 @@ subagent({
 })
 ```
 
-The exploit agent runs the PoC through `PromoteFinding` (you do not). The case must be `investigating` with poc/evidence/impact/severity/target/disconfirmation before the gate accepts a run — the exploit agent does that CaseUpdate (keeping the skeptic's `disconfirmation` if present) before its first PromoteFinding call. Non-skeptic findings: the exploit agent writes its own disconfirmation.
+OMP form: `task({ context: "fresh", tasks: [{ name: "<run>-validate-<case>-1", agent: "exploit", task: "Phase 1: EXPLOIT. Finding <case-id>. Output the Stage Validation contract." }] })`
+
+The exploit agent runs the PoC through `PromoteFinding` (you do not). The case must be `investigating` with poc/evidence/impact/severity/target before the gate accepts a run — the exploit agent does that CaseUpdate before its first PromoteFinding call.
 
 **Evidence chain closure (before PromoteFinding):** promotion now REQUIRES an **artifact-backed** `observation` evidence item (EvidenceAdd role=observation with `artifact_path` — the initial signal, stored with its SHA-256) in addition to the reproduction item the gate auto-writes. A summary-only observation is agent prose and is rejected. If the case lacks one, the ledger rejects promotion with "Evidence chain incomplete". Record the observation (probe response, source snippet, log file) when the case is first created or when it reaches investigating — not at the last minute.
 
-**Differential control gate (PromoteFinding, REQUIRED for EVERY promotion):** `control_path`, a distinct `control_target`, `control_liveness_marker`, and `disconfirmation_path` are mandatory. `control_path` must contain the same bytes as the PoC. The harness runs that script with `PI_POC_MODE=poc` and the case target, then `PI_POC_MODE=control` and `control_target`. The control must complete, print the liveness marker after reaching the baseline, and omit the verification marker. The PoC and control outputs must be fully captured. `local: true` uses a host-network Docker sandbox; true host execution remains operator-gated by `PI_POC_ALLOW_LOCAL=1`. A crashed or truncated run proves nothing and blocks promotion. Every severity requires the executed disconfirmation run.
+**Two-phase promotion (REQUIRED for EVERY promotion — markers/exit codes are diagnostics, not gates):**
+
+*Phase 1 — PromoteFinding.* Pass `poc_path`, `control_path` (the SAME bytes as the PoC — sha256-equality is enforced), a distinct `control_target`, and `local: true` when the bug needs network (host-network sandbox; true host execution remains operator-gated by `PI_POC_ALLOW_LOCAL=1`). The harness runs the script with `PI_POC_MODE=poc` against the case target twice, then `PI_POC_MODE=control` against `control_target`. Every run must complete with fully captured output and write nonce-bound `evidence.json` to `$PI_POC_EVIDENCE_DIR` (`{ nonce (echo $PI_POC_NONCE), claim, verify: { method, url, headers?, body?, expect: { status/body_contains/body_regex } }, observations }`). The machine gate checks completion + output capture, nonce binding, determinism across the two target runs, and that the control evidence differs from the target's (not target-dependent → blocked). A crashed, truncated, or evidence-less run proves nothing and blocks promotion.
+
+*Dispatch the confirmer.* After the bundle is recorded, dispatch `agent: "confirmer"` (fresh context, different model) to verify the evidence: it re-sends the `verify` request itself, judges the differential, and writes its own disproof attempt.
+
+*Phase 2 — ConfirmFinding.* Commit the confirmer's verdict with `ConfirmFinding(case_id, verdict)`. CONFIRMED requires `re_executed: true`, `differential: "target_only"`, and a `disconfirmation_attempt` (becomes the case's `disconfirmation`). NOT_CONFIRMED keeps the case investigating — no tie-breaker. Never `CaseUpdate(status: "confirmed")` directly.
 
 **Design & runtime check (VALIDATE, before promoting):** the case must carry the non-intentionality evidence — the skeptic's disconfirmation includes the docs/git-history/runtime search. For non-skeptic findings, the exploit agent searches docs, git history, and runtime/framework docs before promoting: documented intent → kill `intended_behavior`; runtime mitigates → kill `framework_protection`; neither → keep the notes in `disconfirmation` as non-intentionality proof.
 
@@ -213,13 +251,15 @@ subagent({
 })
 ```
 
+OMP form: `task({ context: "fresh", tasks: [{ name: "<run>-gapfill-<class>-<attempt>", agent: "auditor", task: "Hunt for <class> in <target>. Already checked: <checked>. Examine each unchecked entry: <unchecked>. Use exploit_search." }] })`
+
 Loop terminates when zero `INCOMPLETE` remain, or after 3 iterations (safety cap). Never freeze a class as `NOT_FOUND` while entry points are unchecked — report `INCOMPLETE` if the cap hits.
 
 **Coverage is machine-checked (not prose):** as each class finishes on an asset, record it with `CoverageAdd(case_id, asset, class, scope: wide|local, note)` — for BOTH outcomes (a clean result is a coverage cell too). `scope: wide` when the verdict is deployment-wide: recorded once, applies to every asset of the deployment, do NOT re-test per asset. Before claiming the plateau ("every class COVERED/SKIPPED/NOT_FOUND"), run `CoverageReport(case_id)` and make the claim match the matrix. A class with no cell recorded is untested — GAPFIL must still cover it.
 
 ### FEEDBACK: Convert traces into new hunt tasks
 
-Each TRACE that reveals untested surface gets a new stable-key workflowScript dispatch to an auditor scoped to that subsystem.
+Each TRACE that reveals untested surface gets a new stable-key dispatch (pi: workflowScript; OMP: task call) to an auditor scoped to that subsystem.
 
 ## Coverage Tracking
 
@@ -252,6 +292,8 @@ subagent({
 })
 ```
 
+OMP form: `task({ context: "fresh", tasks: [{ name: "<run>-chain-1", agent: "chain", task: "Analyze all confirmed findings for pipeline run <pipeline-case-id>. Tag: <pipeline-tag>. Target: <target>. Output the Stage Chain contract." }] })`
+
 Validate: chains[] with title, severity, steps, narrative; ≥2 steps each. Record chains via CaseLink. Chain failure → don't block; emit report without chains.
 
 ## Report
@@ -281,6 +323,6 @@ Target budgets (cumulative in+out): HUNT ~50K/class, TRACE ~20K/finding, SKEPTIC
 - No finding advances without passing its stage schema. Malformed → send it back.
 - No finding is validated without a reachability trace showing REACHABLE.
 - A `confidence: high` finding is not validated until the skeptic runs — confirm or killed on DISPROVEN. **The skeptic independently verifies scope**: target mismatch → DISPROVEN `out_of_scope`, citing the instruction verbatim.
-- `confirmed` requires evidence + poc + impact + severity + a PoC that exited 0 **with the verification_marker in the output**, hitting the real target (or faithful replica) — no mocks. **Severity derives from what the PoC output demonstrates, not theory.** The auditor sets `confidence` only; the exploit agent sets severity after the PoC exits 0. The skeptic checks for inflation.
+- `confirmed` requires evidence + poc + impact + severity + target + disconfirmation, reached only through **PromoteFinding (evidence bundle) → confirmer dispatch → ConfirmFinding (CONFIRMED verdict)** — the PoC runs 2× against the real target (or faithful replica) + 1× against a distinct control with nonce-bound `evidence.json`; no mocks, no markers-as-gates. **Severity derives from what the PoC evidence demonstrates, not theory.** The auditor sets `confidence` only; the exploit agent sets severity after the evidence bundle is recorded. The skeptic and confirmer check for inflation.
 - A patch isn't safe until a fresh tracer confirms the sink is unreachable.
 - Coverage is tracked per class with entry-point lists. Only `INCOMPLETE` re-queues in gapfill; `NOT_FOUND` requires an empty UNCHECKED list.

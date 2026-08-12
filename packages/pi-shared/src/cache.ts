@@ -5,14 +5,24 @@
  * (no typebox, no host types) so any extension can import it.
  */
 import { setTimeout as nodeDelay } from "node:timers/promises";
+
+type CacheEntry<T> = { expires: number; value: T; gen: number };
+
 export class TtlLruCache<T> {
-  private readonly map = new Map<string, { expires: number; value: T }>();
+  private readonly map = new Map<string, CacheEntry<T>>();
   private readonly inflight = new Map<string, Promise<T>>();
 
   constructor(
     private readonly ttlMs: number,
     private readonly maxSize: number,
-  ) {}
+  ) {
+    if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
+      throw new Error("TtlLruCache: ttlMs must be a positive number");
+    }
+    if (!Number.isInteger(maxSize) || maxSize <= 0) {
+      throw new Error("TtlLruCache: maxSize must be a positive integer");
+    }
+  }
 
   get(key: string): T | undefined {
     const hit = this.map.get(key);
@@ -22,14 +32,19 @@ export class TtlLruCache<T> {
       return undefined;
     }
     // LRU touch: re-insert at the tail so eviction order reflects recency.
+    // The entry object (and its gen counter) is preserved.
     this.map.delete(key);
     this.map.set(key, hit);
     return hit.value;
   }
 
   set(key: string, value: T): void {
+    const prev = this.map.get(key);
+    // Direct set bumps the generation so an in-flight getOrLoad loader cannot
+    // clobber this newer value when it resolves (stale-write race).
+    const gen = (prev?.gen ?? 0) + 1;
     if (this.map.has(key)) this.map.delete(key);
-    this.map.set(key, { expires: Date.now() + this.ttlMs, value });
+    this.map.set(key, { expires: Date.now() + this.ttlMs, value, gen });
     this.evict();
   }
 
@@ -38,10 +53,21 @@ export class TtlLruCache<T> {
     if (cached !== undefined) return cached;
     const pending = this.inflight.get(key);
     if (pending) return pending;
+    const hadEntry = this.map.has(key);
+    const genAtStart = this.map.get(key)?.gen ?? 0;
     const promise = (async () => {
       try {
         const value = await loader();
-        this.set(key, value);
+        // Publish the loaded value only if the entry has not been directly
+        // replaced since the load started (stale-write guard). An LRU touch
+        // preserves the gen, so a plain get() does not suppress the publish.
+        const current = this.map.get(key);
+        const staleWrite = hadEntry ? current?.gen !== genAtStart : current !== undefined;
+        if (!staleWrite && value !== undefined) {
+          // undefined results are not cached (get treats a miss as
+          // undefined); caching them would just reload on every call.
+          this.set(key, value);
+        }
         return value;
       } finally {
         this.inflight.delete(key);
