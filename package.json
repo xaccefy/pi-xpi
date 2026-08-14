@@ -103,7 +103,7 @@
     "version:patch": "node scripts/bump-version.js patch && bun install --lockfile-only",
     "version:minor": "node scripts/bump-version.js minor && bun install --lockfile-only",
     "version:major": "node scripts/bump-version.js major && bun install --lockfile-only",
-    "publish:all": "npm publish -w @xaccefy/pi-shared --access public && npm publish -w @xaccefy/pi-casefile --access public && npm publish -w @xaccefy/pi-webxp --access public && npm publish -w @xaccefy/pi-xtodo --access public && npm publish --access public",
+    "publish:all": "node scripts/publish-all.js",
     "publish:dry": "npm publish -ws --access public --dry-run"
   }
 }

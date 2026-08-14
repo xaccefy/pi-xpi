@@ -47,7 +47,12 @@ const workspacePaths = readdirSync(packagesDir, { withFileTypes: true })
   .map((entry) => join(packagesDir, entry.name, "package.json"));
 const missing = workspacePaths.filter((path) => !existsSync(path));
 if (missing.length) throw new Error(`Missing workspace manifest(s): ${missing.join(", ")}`);
-const manifestPaths = [rootPath, ...workspacePaths];
+const manifestPaths = [rootPath, join(rootDir, "plugin.json"), ...workspacePaths];
+
+// plugin.json (Agent Plugins manifest) carries name + version but no dependency
+// sections — the shared update loop below is a no-op for it. It must ride the
+// same bump or the manifest drifts from the published packages (it did: 0.8.2
+// vs 0.9.0 — the release workflow now rejects such trees).
 
 const manifests = manifestPaths.map((path) => {
   let data;

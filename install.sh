@@ -8,7 +8,7 @@
 # Pi:  pi install <dir>  + pi-subagents (full XP mode dispatch) + optional @ff-labs/pi-fff
 # OMP: omp install <dir>  (extensions + skills via the Agent Plugins manifest);
 #      specialist agents are copied to ~/.omp/agent/agents so the `task` tool can
-#      spawn auditor/tracer/skeptic/exploit/chain/reporter/confirmer by name.
+#      spawn auditor/tracer/skeptic/exploit/chain/reporter by name.
 set -euo pipefail
 
 if [[ -n "${PI_XPI_INSTALLING:-}" ]]; then exit 0; fi
@@ -16,10 +16,12 @@ export PI_XPI_INSTALLING=1
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST=""
+FORCE=""
 for arg in "$@"; do
   case "$arg" in
     --pi) HOST="pi" ;;
     --omp) HOST="omp" ;;
+    --force) FORCE=1 ;;
   esac
 done
 
@@ -43,9 +45,17 @@ if [[ "$HOST" == "omp" ]]; then
   # files that already exist so a customized agent is never clobbered.
   AGENTS_DIR="${OMP_AGENTS_DIR:-$HOME/.omp/agent/agents}"
   mkdir -p "$AGENTS_DIR"
+  # Exact retired-agent allowlist: upgrades remove only files XPI previously
+  # installed and has deliberately dropped. Never prune arbitrary user agents.
+  for retired in confirmer.md; do
+    if [[ -f "$AGENTS_DIR/$retired" ]]; then
+      rm -f -- "$AGENTS_DIR/$retired"
+      echo "  retired agent $retired removed"
+    fi
+  done
   for agent in "$ROOT_DIR"/agents/*.md; do
     name="$(basename "$agent")"
-    if [[ -f "$AGENTS_DIR/$name" ]]; then
+    if [[ -f "$AGENTS_DIR/$name" && -z "$FORCE" ]]; then
       echo "  agent $name already exists — skipped (use --force to overwrite)"
     else
       cp "$agent" "$AGENTS_DIR/$name"

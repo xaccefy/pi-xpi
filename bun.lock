@@ -5,7 +5,7 @@
     "": {
       "name": "pi-xpi",
       "dependencies": {
-        "@xaccefy/pi-shared": "0.8.3",
+        "@xaccefy/pi-shared": "0.9.0",
         "open-websearch": "^2.1.11",
         "tough-cookie": "^6.0.2",
         "undici": "^8.9.0",
@@ -33,7 +33,11 @@
     },
     "packages/pi-casefile": {
       "name": "@xaccefy/pi-casefile",
-      "version": "0.8.3",
+      "version": "0.9.0",
+      "dependencies": {
+        "@xaccefy/pi-shared": "0.9.0",
+        "undici": "^8.9.0",
+      },
       "devDependencies": {
         "@types/bun": "^1.3.14",
         "typescript": "^6.0.3",
@@ -47,7 +51,7 @@
     },
     "packages/pi-shared": {
       "name": "@xaccefy/pi-shared",
-      "version": "0.8.3",
+      "version": "0.9.0",
       "devDependencies": {
         "@types/bun": "^1.3.14",
         "typescript": "^6.0.3",
@@ -55,7 +59,7 @@
     },
     "packages/pi-webxp": {
       "name": "@xaccefy/pi-webxp",
-      "version": "0.8.3",
+      "version": "0.9.0",
       "dependencies": {
         "@xaccefy/pi-shared": "0.8.3",
         "open-websearch": "^2.1.11",
@@ -75,7 +79,7 @@
     },
     "packages/pi-xtodo": {
       "name": "@xaccefy/pi-xtodo",
-      "version": "0.8.3",
+      "version": "0.9.0",
       "devDependencies": {
         "@types/bun": "^1.3.14",
         "typescript": "^6.0.3",
