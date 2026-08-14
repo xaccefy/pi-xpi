@@ -71,7 +71,7 @@ Stateful HTTP request with a persistent cookie jar, full method/header/body cont
 
 **Cookie jar:** `Set-Cookie` headers are stored per-host and automatically injected into subsequent requests to the same host — enabling login → probe workflows without manual cookie threading.
 
-**SSRF guard:** private/internal hosts (127.0.0.1, 10.x, 192.168.x, fc00::/7, link-local) are blocked by default. Set `allowPrivateHosts: true` for internal red-team targets. DNS rebinding is unmitigated — see the `web-pentest` skill §8.
+**SSRF guard:** private/internal hosts (127.0.0.1, 10.x, 192.168.x, fc00::/7, link-local) are blocked by default. Set `allowPrivateHosts: true` for internal red-team targets. `http_request` pins DNS at connect time on Node and for plain HTTP on Bun; Bun HTTPS and daemon-backed `web_fetch` retain a pre-flight-to-connect rebinding window.
 
 **Lifecycle:** cookie jar is cleared on `session_shutdown`.
 

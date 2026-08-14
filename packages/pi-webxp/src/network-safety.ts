@@ -1,7 +1,10 @@
 import { lookup as dnsLookup } from "node:dns";
 import { lookup as dnsLookupAsync } from "node:dns/promises";
 import { isIP } from "node:net";
+import { isPublicIpAddress } from "@xaccefy/pi-shared";
 import { Agent } from "undici";
+
+export { isPublicIpAddress } from "@xaccefy/pi-shared";
 
 export function normalizeHostname(hostname: string): string {
   let host = hostname.toLowerCase();
@@ -9,69 +12,10 @@ export function normalizeHostname(hostname: string): string {
   return host;
 }
 
-function ipv4ToLong(ip: string): number | undefined {
-  const parts = ip.split(".").map((p) => Number(p));
-  if (parts.length !== 4 || parts.some((p) => !Number.isInteger(p) || p < 0 || p > 255)) return;
-  return (((parts[0] << 24) >>> 0) + (parts[1] << 16) + (parts[2] << 8) + parts[3]) >>> 0;
-}
-
-function inRange(value: number, base: string, bits: number): boolean {
-  const baseLong = ipv4ToLong(base);
-  if (baseLong === undefined) return false;
-  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
-  return (value & mask) === (baseLong & mask);
-}
-
-function mappedIpv4(ip: string): string | undefined {
-  const host = normalizeHostname(ip);
-  const dotted = host.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
-  if (dotted) return dotted[1];
-  const hex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
-  if (!hex) return;
-  const g1 = parseInt(hex[1], 16);
-  const g2 = parseInt(hex[2], 16);
-  return `${(g1 >> 8) & 0xff}.${g1 & 0xff}.${(g2 >> 8) & 0xff}.${g2 & 0xff}`;
-}
-
-export function isPublicIpAddress(address: string): boolean {
-  const mapped = mappedIpv4(address);
-  const ip = mapped ?? normalizeHostname(address);
-  const family = isIP(ip);
-  if (family === 4) {
-    const n = ipv4ToLong(ip);
-    if (n === undefined) return false;
-    return ![
-      ["0.0.0.0", 8],
-      ["10.0.0.0", 8],
-      ["100.64.0.0", 10],
-      ["127.0.0.0", 8],
-      ["169.254.0.0", 16],
-      ["172.16.0.0", 12],
-      ["192.0.0.0", 24],
-      ["192.0.2.0", 24],
-      ["192.168.0.0", 16],
-      ["198.18.0.0", 15],
-      ["198.51.100.0", 24],
-      ["203.0.113.0", 24],
-      ["224.0.0.0", 4],
-      ["240.0.0.0", 4],
-    ].some(([base, bits]) => inRange(n, base as string, bits as number));
-  }
-  if (family === 6) {
-    if (ip === "::" || ip === "::1") return false;
-    if (/^f[cd][0-9a-f]{0,2}:/i.test(ip)) return false;
-    if (/^fe[89ab][0-9a-f]?:/i.test(ip)) return false;
-    if (/^ff/i.test(ip)) return false;
-    if (/^2001:db8:/i.test(ip)) return false;
-    return /^2|^3/i.test(ip);
-  }
-  return false;
-}
-
 export function isPublicHttpHost(parsed: URL): boolean {
   const host = normalizeHostname(parsed.hostname);
   if (host === "localhost" || host.endsWith(".localhost")) return false;
-  const family = isIP(host) || (mappedIpv4(host) ? 4 : 0);
+  const family = isIP(host);
   return family === 0 ? true : isPublicIpAddress(host);
 }
 
@@ -105,11 +49,10 @@ function guardedLookup(hostname: string, options: any, callback: any): void {
 /**
  * Pre-flight DNS guard. Bun's fetch ignores undici's `dispatcher` (verified:
  * 0 lookup calls), so the guardedLookup agent only protects Node runtimes.
- * This check makes the DNS rebinding block effective under Bun too: a
- * hostname that resolves to a private address is rejected before the fetch.
+ * This check rejects a hostname that resolves to a private address before the
+ * fetch under Bun too.
  * On resolution ERRORS we proceed — the fetch itself will fail with its own
- * connection error, so there is no SSRF window (our resolver is the same one
- * the fetch uses).
+ * connection error.
  *
  * Residual (accepted): under Bun there is a TOCTOU window between this
  * pre-flight and the actual connect (the connect-time guardedLookup is
@@ -143,4 +86,44 @@ export function createSafeDispatcher(options: {
   const connect: Record<string, unknown> = { rejectUnauthorized: options.verifyTls !== false };
   if (!options.allowPrivateHosts) connect.lookup = guardedLookup;
   return new Agent({ connect } as never);
+}
+
+/**
+ * Bun-only TOCTOU close for plain-HTTP requests: Bun's fetch ignores the
+ * guardedLookup dispatcher, so the connect-time DNS check never runs there
+ * (assertPublicDns pre-flight is the only guard). For http:// HOSTNAMES,
+ * re-resolve here and rewrite the URL to the validated IP — the connection
+ * then goes to the address this check approved, so a rebinding answer
+ * cannot reach a later connect. The caller must carry the original host as
+ * the Host header.
+ *
+ * - Throws (fail closed) when any answer is private — the rebinding attempt.
+ * - Returns null when the host no longer resolves (fetch fails on its own).
+ * - Returns null for https:// and IP literals: rewriting an https URL host
+ *   breaks TLS SNI/cert verification on Bun (documented residual), and IP
+ *   literals are already gated by assertPublicHttpUrl.
+ */
+export async function pinPublicHostForPlainHttp(
+  url: URL,
+  resolveFn: (host: string) => Promise<{ address: string }[]> = (host) =>
+    dnsLookupAsync(host, { all: true }),
+): Promise<URL | null> {
+  if (url.protocol !== "http:") return null;
+  const host = normalizeHostname(url.hostname);
+  if (isIP(host)) return null;
+  let addresses: { address: string }[];
+  try {
+    addresses = await resolveFn(host);
+  } catch {
+    return null;
+  }
+  const blocked = addresses.find((entry) => !isPublicIpAddress(entry.address));
+  if (blocked) {
+    throw new Error(`Blocked: ${host} resolved to private/internal address ${blocked.address}`);
+  }
+  const picked = addresses.find((entry) => isIP(entry.address) === 4) ?? addresses[0];
+  if (!picked) return null;
+  const pinned = new URL(url.toString());
+  pinned.hostname = isIP(picked.address) === 6 ? `[${picked.address}]` : picked.address;
+  return pinned;
 }

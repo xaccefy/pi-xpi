@@ -12,7 +12,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { abortableSleep } from "@xaccefy/pi-shared";
 import { Type } from "typebox";
-import { isPublicHttpHost } from "./network-safety.ts";
+import { assertPublicDns, isPublicHttpHost } from "./network-safety.ts";
 
 /** Retriable HTTP statuses for daemon calls (408/429/5xx). */
 function isTransientHttpStatus(status: number): boolean {
@@ -384,6 +384,11 @@ export default function websearchExtension(pi: ExtensionAPI) {
             `Blocked: ${parsedUrl.hostname} is a private/internal host. Use http_request with allowPrivateHosts=true for internal targets.`,
           );
         }
+        // Hostname-level validation alone accepts DNS names. Reject addresses
+        // that are private at submission time. The daemon resolves again when
+        // it fetches, so this is a pre-flight guard rather than connect-time
+        // pinning; use http_request for the stronger direct-fetch boundary.
+        await assertPublicDns(parsedUrl.hostname);
         const targetUrl = parsedUrl.toString();
 
         // Match on hostname only — never substring-match the full URL, which would

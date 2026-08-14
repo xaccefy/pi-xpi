@@ -2,14 +2,20 @@
  * Stateful raw HTTP request tool for offensive security testing.
  *
  * SSRF guard: private/internal hosts are blocked by default. The guard checks
- * IP literals, DNS answers at socket-lookup time, and every redirect hop.
+ * IP literals and every redirect hop. Node pins policy in socket lookup; Bun
+ * pins plain HTTP to the approved address and pre-flights HTTPS DNS.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { CookieJar } from "tough-cookie";
 import { Type } from "typebox";
-import { assertPublicDns, assertPublicHttpUrl, createSafeDispatcher } from "./network-safety.ts";
+import {
+  assertPublicDns,
+  assertPublicHttpUrl,
+  createSafeDispatcher,
+  pinPublicHostForPlainHttp,
+} from "./network-safety.ts";
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MAX_BODY = 262144;
@@ -253,6 +259,20 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
           await assertPublicDns(current.hostname, allowPrivateHosts);
           const cookie = hop === 0 ? explicitCookie : undefined;
           requestHeaders = withCookies(jar, current, headers, cookie);
+          // Bun + plain HTTP: pin the connection to the validated IP (the
+          // dispatcher's connect-time lookup never runs under Bun). Cookies
+          // and result URLs keep the ORIGINAL host — only the dial target
+          // changes, with the original host carried in the Host header.
+          let connectTarget = current;
+          if (isBun) {
+            const pinned = await pinPublicHostForPlainHttp(current);
+            if (pinned) {
+              if (!hasHeader(requestHeaders, "host")) {
+                setHeader(requestHeaders, "Host", current.host);
+              }
+              connectTarget = pinned;
+            }
+          }
           const init: RequestInit & { dispatcher?: unknown } = {
             method,
             headers: requestHeaders,
@@ -268,7 +288,7 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
             (init as RequestInit & { tls?: unknown }).tls = { rejectUnauthorized: false };
           }
 
-          res = await fetch(current, init as never);
+          res = await fetch(connectTarget, init as never);
           cookiesInResponse = storeCookies(jar, current.toString(), res);
 
           const next =

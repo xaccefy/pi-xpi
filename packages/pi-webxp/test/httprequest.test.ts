@@ -360,6 +360,61 @@ describe("pi-webxp: http_request", () => {
     );
   });
 
+  it("follows a public redirect and applies safe cross-origin method/header rules", async () => {
+    const tool = api.tools.find((t) => t.name === "http_request")!;
+    const calls: {
+      url: string;
+      method?: string;
+      body?: BodyInit | null;
+      headers: Record<string, string>;
+    }[] = [];
+    const prevFetch = globalThis.fetch;
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({
+        url: url.toString(),
+        method: init?.method,
+        body: init?.body,
+        headers: { ...((init?.headers as Record<string, string> | undefined) ?? {}) },
+      });
+      return prevFetch(url, init);
+    }) as typeof fetch;
+
+    const result = await tool.execute(
+      "call-follow",
+      {
+        url: "https://example.com/redirect",
+        method: "POST",
+        body: "sensitive=request-body",
+        headers: {
+          Authorization: "Bearer must-not-cross-origin",
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        redirect: "follow",
+      },
+      null,
+      () => {},
+      {},
+    );
+    globalThis.fetch = prevFetch;
+
+    const details = (result as any).details;
+    assert.equal(details.status, 200);
+    assert.equal(details.finalUrl, "https://target.example/land");
+    assert.equal(details.redirected, true);
+    assert.equal(details.redirectChain.length, 1);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].method, "GET", "POST + 302 becomes GET");
+    assert.equal(calls[1].body, undefined, "redirected GET does not retain the request body");
+    assert.ok(
+      !Object.keys(calls[1].headers).some((name) => name.toLowerCase() === "authorization"),
+      "cross-origin redirect strips Authorization",
+    );
+    assert.ok(
+      !Object.keys(calls[1].headers).some((name) => name.toLowerCase() === "content-type"),
+      "GET redirect strips the stale entity content type",
+    );
+  });
+
   // ── SSRF block ──────────────────────────────────────────
 
   it("blocks private/internal hosts by default", async () => {
