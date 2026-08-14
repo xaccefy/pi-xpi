@@ -1,6 +1,6 @@
 {
   "name": "@xaccefy/pi-webxp",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "description": "Web search, page fetch, library docs, repo Q&A, and exploit technique search for Pi Agent",
   "keywords": [
     "pi-package",
@@ -46,7 +46,7 @@
     ]
   },
   "dependencies": {
-    "@xaccefy/pi-shared": "0.9.1",
+    "@xaccefy/pi-shared": "0.9.2",
     "open-websearch": "^2.1.11",
     "tough-cookie": "^6.0.2",
     "undici": "^8.9.0"
