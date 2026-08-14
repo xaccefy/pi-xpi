@@ -17,12 +17,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/x4cc3/pi-xpi.git",
+    "url": "git+https://github.com/xaccefy/pi-xpi.git",
     "directory": "packages/pi-webxp"
   },
-  "homepage": "https://github.com/x4cc3/pi-xpi/tree/main/packages/pi-webxp#readme",
+  "homepage": "https://github.com/xaccefy/pi-xpi/tree/main/packages/pi-webxp#readme",
   "bugs": {
-    "url": "https://github.com/x4cc3/pi-xpi/issues"
+    "url": "https://github.com/xaccefy/pi-xpi/issues"
   },
   "publishConfig": {
     "access": "public",

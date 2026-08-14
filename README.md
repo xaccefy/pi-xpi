@@ -6,7 +6,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@xaccefy/pi-xpi?style=flat-square&label=npm&color=cb3837)](https://www.npmjs.com/package/@xaccefy/pi-xpi)
 [![npm downloads](https://img.shields.io/npm/dm/@xaccefy/pi-xpi?style=flat-square&label=downloads&color=4c9aff)](https://www.npmjs.com/package/@xaccefy/pi-xpi)
-[![License: MIT](https://img.shields.io/github/license/x4cc3/pi-xpi?style=flat-square&color=blueviolet)](LICENSE)
+[![License: MIT](https://img.shields.io/github/license/xaccefy/pi-xpi?style=flat-square&color=blueviolet)](LICENSE)
 
 </div>
 
