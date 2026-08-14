@@ -119,7 +119,7 @@ Every stage output must pass the `PipelineSubmit` gate before the next stage. It
 
 RECON owns the coverage floor: hunts can only cover what recon found. Shallow recon makes every later `NOT_FOUND` a lie. Code target → map routes/handlers/parsers/sinks with `grep`/`find` yourself. **Live target** → loop:
 
-1. Enumerate: subdomains (`subfinder`), live hosts (`httpx`), URLs (`katana`/`ffuf`), mine JS for routes/params.
+1. Enumerate: subdomains (`subfinder`), live hosts (`httpx`), URLs (`katana`/`ffuf`); mine every JS bundle for routes/params and pull its **source map** (`.js.map` → original tree: endpoints, internal hosts, secrets); harvest zero-traffic intel (`robots.txt`, `sitemap.xml`, OpenAPI/GraphQL introspection, passive archives via `gau`).
 2. Fingerprint: stack + versions → `exploit_search` for CVEs and class techniques.
 3. Expand: every 4xx page, redirect, JS route, API schema response is new surface — feed back until recon plateau.
 4. Record **every entry point** (URL, method, params, auth state) + tech notes: `ScratchpadWrite(run_id, "recon", "entry-points.md", ...)`.

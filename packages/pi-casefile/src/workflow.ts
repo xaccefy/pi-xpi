@@ -92,6 +92,16 @@ ${d.reference}
 
 RECON (you, inline) → **HUNT** (auditor subagents, one per attack class, parallel) → TRACE (tracer) → SKEPTIC (high-confidence only) → VALIDATE (exploit) → CHAIN (chain) → REPORT (reporter)
 
+### Blackbox doctrine — gather everything first (no source access)
+
+Live web target, CTF, or bounty box: the target is opaque and **every later stage's yield is capped by what RECON learned** — shallow recon makes every later NOT_FOUND a guess. The primary goal of RECON in blackbox mode is not to find one bug; it is to gather the MAXIMUM intel about the target/challenge and turn the black box into a map you keep referring back to. Before any exploitation, harvest all observable intel:
+- **Client-side code is a gift** — pull every JS bundle and, when present, its **source map** (\`.js.map\`): it reconstructs the original tree — routes, API/WS endpoints, feature flags, internal hostnames, and hardcoded secrets/keys. One recovered source map beats a week of blind fuzzing.
+- **Zero-traffic intel first** — \`robots.txt\`, \`sitemap.xml\`, \`/.well-known/\`, OpenAPI/Swagger, GraphQL introspection, \`/.git\` · \`/.env\` · backups, and passive archives (Wayback/\`gau\`).
+- **Fingerprint precisely** — stack + exact versions → \`exploit_search\` for CVEs; every header, cookie name, and error page is a signal.
+- **Bank it** — write the map to the scratchpad and file high-value leaks (source map, origin IP, exposed schema, leaked creds) as \`EvidenceAdd role=observation\`; they are leads to pivot to directly, not trivia. Tactical commands: web-pentest skill §2.
+
+**Observe behavior, then analyze — static intel is only half.** Interrogate the target empirically and infer its internals from how it *reacts*; the differential (vary one input, watch what changes) is the signal. **Web/API:** status vs length vs timing vs body vs error across crafted inputs; how auth actually gates (401 vs 302 vs 200-with-error); reflected vs stored; timing oracles for blind bugs; state changes across a request sequence. **Binary/local target:** map the I/O contract, trace syscalls + library calls (\`strace\`/\`ltrace\`), feed malformed/boundary input and watch crashes, signals, and return codes, and diff behavior across inputs to expose the parse/branch logic. **Protocol/service:** walk the handshake + state machine, then replay and mutate one field and observe the divergence and side effects. Loop: stimulus → observe → infer the internal model → craft a discriminating probe → repeat. Every observed anomaly (crash, error leak, timing gap, unexpected 200, state change) is a HYPOTHESIS — \`CaseAdd\` it with its \`disproveIf\`, don't just note it.
+
 **HARD GATE — after RECON:** record the entry-point inventory, then STOP all inline reading/probing. ${d.hardGate} When its completion is delivered, submit each output through PipelineSubmit. If you catch yourself mapping a sink, reading a handler, or probing an endpoint beyond the recon inventory, stop and add it to a HUNT task.
 
 ${d.crash}
@@ -315,10 +325,10 @@ ${LIFECYCLE_DIAGRAM}
 
 ## Stage discipline (all done by you, inline)
 
-1. **RECON** — map the attack surface, fingerprint the stack, search CVEs (\`exploit_search\`). Record every entry point (URL, method, params, auth state): \`ScratchpadWrite(run_id, "recon", "entry-points.md", ...)\`.
+1. **RECON — gather everything first.** Blackbox/CTF: the target is opaque and your whole yield is capped by recon depth, so the goal of this stage is MAXIMUM intel, not a first bug. Map the attack surface, fingerprint the stack + exact versions, and search CVEs (\`exploit_search\`). Harvest all observable intel — pull every JS bundle and its **source map** (\`.js.map\` reconstructs routes, API/WS endpoints, internal hosts, and hardcoded secrets), plus \`robots.txt\` · \`sitemap.xml\` · OpenAPI/Swagger · GraphQL introspection · \`/.git\`/\`.env\` · passive archives (Wayback/\`gau\`). Record every entry point (URL, method, params, auth state) and file high-value leaks as \`EvidenceAdd role=observation\`: \`ScratchpadWrite(run_id, "recon", "entry-points.md", ...)\`.
 2. **HUNT** — for each attack class, examine every entry point. \`CaseAdd\` each lead as a hypothesis. Track coverage per class.
-3. **TRACE** — prove reachability yourself: read the source (grep/find) or probe the live endpoint (\`http_request\`). Only reachable findings advance.
-4. **VALIDATE** — write a PoC that emits nonce-bound \`evidence.json\`, run it via \`PromoteFinding\` (2 target runs + same-script control), re-send the verify request yourself, and commit via \`ConfirmFinding\` (see the gates below). Derive severity from the proven impact.
+3. **TRACE / observe** — prove reachability and understand the mechanism by observing how the target behaves, then analyzing the reaction. Read the source (grep/find); probe the live endpoint (\`http_request\`) and diff responses (status vs length vs timing vs error) as you vary one input; or for a binary/local target trace syscalls + library calls (\`strace\`/\`ltrace\`) and watch crashes, signals, and return codes under malformed/boundary input. Infer the internal model from the differential, feed anomalies back as hypotheses, and only advance reachable findings.
+4. **VALIDATE** — write a PoC that emits nonce-bound \`evidence.json\`, run it via \`PromoteFinding\` (2 target runs + same-script control), review and disconfirm it yourself, and commit via \`ConfirmFinding\`, which performs the fresh phase-2 replay (see the gates below). Derive severity from the proven impact.
 5. **CHAIN** — link confirmed findings via \`CaseLink\` to find exploit chains.
 6. **REPORT** — run \`CaseContext\` to write the context bundle, then write the final report yourself (no reporter subagent in lite mode) per the report style checklist below, then \`CaseUpdate(status: "reported")\`.
 
