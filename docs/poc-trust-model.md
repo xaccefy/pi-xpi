@@ -84,7 +84,7 @@ A confirmation is machine-judged to the degree that the harness owns:
 2. **The secret** — the thing whose appearance proves the effect (interaction token, canary value, planted file content). If the secret is chosen by the model, the model can print it unconditionally.
 3. **Predicate execution** — the code that decides pass/fail (matcher on harness-fetched response, log query, file comparison). If the "predicate" is `output.includes(marker)` where the model chose the marker, the model chose the bar.
 
-Current XPI direct-response tier: the harness owns evidence acquisition and predicate execution for both target and control, including connect-time DNS pinning. The worker-authored PoC owns predicate definition; the main agent reviews its semantic strength. For reflection, the harness also owns a post-PoC random secret and checks target-only appearance. XPI does not yet own a source-separated OOB channel or a general file/account/state oracle.
+Current XPI direct-response tier: the harness owns evidence acquisition and predicate execution for both target and control, including connect-time DNS pinning. The main-agent-authored PoC owns predicate definition, and the main agent reviews its semantic strength before commit. For reflection, the harness also owns a post-PoC random secret and checks target-only appearance. XPI does not yet own a source-separated OOB channel or a general file/account/state oracle.
 
 ## 6. Remaining design — per bug class
 
@@ -117,7 +117,7 @@ Reflection canaries are implemented for Tier 2 HTTP replay: declare one fixed `{
 ### Tier 4 — Structured evidence record (all classes)
 
 - Every PoC emits `evidence.json` (schema-validated): what it claims, what it observed, request/response pairs, timestamps.
-- Even when the harness cannot independently verify (see §7), the structured record (a) makes the self-report auditable by the skeptic/reporter, (b) is the input carrier for Tiers 1–3, (c) is far harder to fake *consistently* across the control run than a one-line marker.
+- Even when the harness cannot independently verify (see §7), the structured record (a) makes the self-report auditable by the skeptic and main-agent report review, (b) is the input carrier for Tiers 1–3, (c) is far harder to fake *consistently* across the control run than a one-line marker.
 - Control-run consistency: the same record shape is required in control mode; a record that "succeeds" against a target it never reached is detectable by cross-checking fields (URL, status, body length) against harness-side observation where available.
 
 ### Tier 5 — Meta-level statistical trust

@@ -16,13 +16,17 @@ The attack-mode text stays **quiet by default** so your normal coding isn't buri
 
 | Control | Effect |
 |---------|--------|
-| `/xp` | Toggle ON/OFF |
-| `/xp on` / `/xp off` / `/xp lite` | Set explicitly |
-| `PI_XP_MODE=on` | Force ON for this process (overrides file) |
+| `/xp` | Toggle SWARM/OFF |
+| `/xp on` | Default enabled mode: SWARM |
+| `/xp swarm` | Bounded multi-agent workflow: auditor/tracer/skeptic/chain only |
+| `/xp lite` | Focused workflow: single-agent, no subagent dispatch |
+| `/xp off` | Quiet mode explicitly |
+| `PI_XP_MODE=on` | Force SWARM for this process (same as `swarm`) |
+| `PI_XP_MODE=swarm` | Force SWARM for this process (overrides file) |
 | `PI_XP_MODE=lite` | Force LITE (single-agent, no subagent dispatch) |
 | `PI_XP_MODE=off` | Force OFF |
 
-When **ON**, every prompt gets the attacker-minded workflow plus any open cases. **LITE** is the same discipline done by the main agent alone — no `subagent` dispatch (CTF / single-shot engagements). When **OFF**, nothing is added; tools still work.
+When **LITE**, every prompt gets the attacker-minded workflow plus any open cases, done by the main agent alone — no `subagent` dispatch (CTF / single-shot engagements). When **SWARM**, the bounded pipeline is injected and only auditor/tracer/skeptic/chain are delegated; validation, patching, reporting, and ConfirmFinding stay with the main agent. When **OFF**, nothing is added; tools still work.
 
 State is persisted next to the ledger as `xp-mode` (e.g. `.pi/xp-mode`).
 
@@ -48,10 +52,10 @@ hypothesis → investigating → confirmed → reported
 
 - **investigating** needs `evidence` + `confidence`
 - **confirmed** only through the two-phase gate — `PromoteFinding` runs the PoC 2× target + 1× control, requires complete zero-exit runs and nonce-bound discriminating response-body evidence, then the harness performs a DNS-pinned identical replay and requires two conclusive responses with `target_only`. Reflection-capable requests may add a post-PoC harness-generated canary that must appear only on target. Status-only/trivial matchers and incomplete response capture are rejected. Exit zero is necessary but never proof. The main agent performs semantic review and calls `ConfirmFinding`, which captures a second fresh harness replay and binds it to the verdict; worker processes are rejected. Blind/OOB claims fail closed without a source-separated oracle.
-- **Every promotion requires `control_path`** (the same bytes as the PoC — sha256 enforced) and a distinct `control_target` pre-approved by the operator in `PI_POC_CONTROL_TARGETS`; an agent cannot invent its own easy control. The control run is stored as `controlVerified`. Crashes, transport-inconclusive controls, status-only evidence, and missing evidence all block promotion.
+- **Every promotion requires a distinct `control_target`** pre-approved by the operator in `PI_POC_CONTROL_TARGETS`; an agent cannot invent its own easy control. `control_path` defaults to `poc_path` and exists only as an override — if supplied, it must contain the same bytes as the PoC (sha256 enforced). The control run is stored as `controlVerified`. Crashes, transport-inconclusive controls, status-only evidence, and missing evidence all block promotion.
 - **New cases require `disproveIf`** — falsification conditions (what would disprove this hypothesis). A hypothesis that can't say what kills it isn't one yet.
 - **A kill must be justified**: either an EvidenceAdd `refutation` item, or a canonical kill-reason token (intended_behavior, duplicate, framework_protection, out_of_scope, insufficient_impact, no_attack_path, ...) in assumptions/nextStep. Bare `status: "killed"` is rejected.
-- **reported** needs `CaseContext` first (records the report path; the report writer produces the final file)
+- **reported** needs `CaseContext` first (records the report path; the main agent produces the final file)
 - **killed** / **reported** are final (no more edits)
 
 ## Evidence items
@@ -65,8 +69,8 @@ hypothesis → investigating → confirmed → reported
 | `CaseAdd` | Open a case (`title` + `disproveIf` required; start as `hypothesis` or `investigating`) |
 | `CaseUpdate` | Evidence, impact, severity, status (not direct confirm) |
 | `EvidenceAdd` | Role-typed, hashed evidence item on a case (refutation justifies kills; cleanup tracks cleanup) |
-| `PromoteFinding` | Phase 1: PoC 2× target + 1× operator-approved control, then DNS-pinned harness-owned replay requiring conclusive `target_only`; optional reflection canary upgrades the recorded proof strength when observed only on target. `local:true` and private replay are operator-gated; blind/OOB proof fails closed without source separation |
-| `ConfirmFinding` | Phase 2: main-agent-only semantic decision plus a fresh harness-owned target/control replay (CONFIRMED promotes; NOT_CONFIRMED keeps investigating; worker calls are rejected) |
+| `PromoteFinding` | Phase 1: main-agent-only PoC 2× target + 1× operator-approved control, then DNS-pinned harness-owned replay requiring conclusive `target_only`; optional reflection canary upgrades the recorded proof strength when observed only on target. `local:true` and private replay are operator-gated; blind/OOB proof fails closed without source separation |
+| `ConfirmFinding` | Phase 2: main-agent-only semantic decision plus a fresh harness-owned target/control replay (CONFIRMED promotes; NOT_CONFIRMED keeps investigating; worker/subagent gate calls are rejected) |
 | `CaseGet` / `CaseList` / `CaseSearch` | Read / filter / search |
 | `CaseLink` / `CaseUnlink` | Bidirectional exploit chains |
 | `ChainSuggest` | Scan cases for exploitable chain combinations (credential+endpoint→ATO, redirect+OAuth→token theft, XSS+state-change→CSRF, IDOR+user-data, SSTI→RCE, race+payment, info-disclosure+SSRF), ranked by confidence |

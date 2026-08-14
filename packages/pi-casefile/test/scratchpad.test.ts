@@ -223,6 +223,25 @@ describe("scratchpad", () => {
     assert.deepStrictEqual(resume.artifacts.recon, ["fingerprint.json"]);
   });
 
+  it("does not schedule legacy gapfil as a new next phase", () => {
+    scratchpad_init("run-1");
+    scratchpad_checkpoint("run-1", "recon", { summary: "recon done" });
+    scratchpad_checkpoint("run-1", "hunt", { summary: "hunt done" });
+
+    const resume = scratchpad_resume("run-1")!;
+    assert.strictEqual(resume.next_phase, "trace");
+  });
+
+  it("does not schedule legacy patch as a new next phase", () => {
+    scratchpad_init("run-1");
+    for (const phase of ["recon", "hunt", "trace", "skeptic", "validate", "chain"] as const) {
+      scratchpad_checkpoint("run-1", phase, { summary: `${phase} done` });
+    }
+
+    const resume = scratchpad_resume("run-1")!;
+    assert.strictEqual(resume.next_phase, "report");
+  });
+
   it("resume returns null next_phase when all phases complete", () => {
     scratchpad_init("run-1");
     for (const phase of [

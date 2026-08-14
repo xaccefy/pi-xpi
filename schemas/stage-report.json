@@ -75,11 +75,9 @@
     "coverage": {
       "type": "object",
       "description": "Per-class coverage summary, required so caller knows which classes were genuinely clean vs skipped",
-      "patternProperties": {
-        "^[a-z-]+$": {
-          "type": "string",
-          "enum": ["COVERED", "SKIPPED", "NOT_FOUND", "INCOMPLETE"]
-        }
+      "additionalProperties": {
+        "type": "string",
+        "enum": ["COVERED", "SKIPPED", "NOT_FOUND", "INCOMPLETE"]
       }
     },
     "summary": {

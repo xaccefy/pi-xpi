@@ -69,27 +69,6 @@ type StageSpec = {
 
 // ── Stage specs (mirror of schemas/*.json semantics) ─────────────────
 
-const VULN_CLASSES = [
-  "injection",
-  "xss",
-  "idor",
-  "bola",
-  "path-traversal",
-  "ssrf",
-  "command-injection",
-  "deserialization",
-  "auth-bypass",
-  "privilege-escalation",
-  "business-logic",
-  "race-condition",
-  "xxe",
-  "ssti",
-  "open-redirect",
-  "information-disclosure",
-  "crypto-weakness",
-  "other",
-] as const;
-
 // Exported for test/pipeline-submit-schema-parity.test.ts (drift guard
 // against schemas/*.json — the two are kept as mirrors of each other).
 export const SPECS: Record<SubmitStage, StageSpec> = {
@@ -108,7 +87,7 @@ export const SPECS: Record<SubmitStage, StageSpec> = {
       "subsystem",
     ],
     required: [
-      { name: "vuln_class", type: "string", enum: VULN_CLASSES },
+      { name: "vuln_class", type: "string" },
       { name: "sink", type: "string" },
       { name: "entry_point", type: "string" },
       { name: "confidence", type: "string", enum: ["low", "medium", "high"] },
@@ -127,9 +106,10 @@ export const SPECS: Record<SubmitStage, StageSpec> = {
       "attacker_model",
       "impact_if_reachable",
       "unreachable_reason",
+      "uncertainty_reason",
     ],
     required: [
-      { name: "trace_result", type: "string", enum: ["REACHABLE", "UNREACHABLE"] },
+      { name: "trace_result", type: "string", enum: ["REACHABLE", "UNREACHABLE", "UNDETERMINED"] },
       { name: "entry_point", type: "string" },
       { name: "call_chain", type: "array", minItems: 1 },
       { name: "defenses_checked", type: "array" },
@@ -138,6 +118,7 @@ export const SPECS: Record<SubmitStage, StageSpec> = {
     conditional: [
       { when: { field: "trace_result", equals: "REACHABLE" }, require: ["impact_if_reachable"] },
       { when: { field: "trace_result", equals: "UNREACHABLE" }, require: ["unreachable_reason"] },
+      { when: { field: "trace_result", equals: "UNDETERMINED" }, require: ["uncertainty_reason"] },
     ],
   },
   // schemas/stage-skeptic.json
@@ -149,10 +130,11 @@ export const SPECS: Record<SubmitStage, StageSpec> = {
       "evidence_reviewed",
       "disconfirmation_attempt",
       "disproval_reason",
+      "uncertainty_reason",
     ],
     required: [
       { name: "finding_id", type: "string" },
-      { name: "verdict", type: "string", enum: ["CONFIRMED", "DISPROVEN"] },
+      { name: "verdict", type: "string", enum: ["CONFIRMED", "DISPROVEN", "UNDETERMINED"] },
       { name: "reasoning", type: "string" },
       { name: "evidence_reviewed", type: "array", minItems: 1 },
     ],
@@ -165,6 +147,7 @@ export const SPECS: Record<SubmitStage, StageSpec> = {
         when: { field: "verdict", equals: "CONFIRMED" },
         require: ["disconfirmation_attempt"],
       },
+      { when: { field: "verdict", equals: "UNDETERMINED" }, require: ["uncertainty_reason"] },
     ],
   },
   // schemas/stage-validation.json
@@ -247,7 +230,7 @@ const CHAIN_SEVERITIES = ["low", "medium", "high", "critical"] as const;
 /**
  * Test/mock/example paths carry no real findings (mirrors VVAH S5). Exception
  * from VVAH deliberately not copied: hardcoded-creds-in-test-files — the
- * auditor can submit those under vuln_class "other"+bugClass documentation;
+ * auditor can submit those under the precise class it decides fits the issue;
  * the gate errs on filtering noise.
  */
 
@@ -419,7 +402,7 @@ function validateReport(errors: string[], obj: Record<string, unknown>): void {
   if (coverage) {
     const allowed = ["COVERED", "SKIPPED", "NOT_FOUND", "INCOMPLETE"];
     for (const [key, value] of Object.entries(coverage)) {
-      if (!/^[a-z-]+$/.test(key)) errors.push(`coverage.${key}: invalid class key`);
+      if (!key.trim() || /[\r\n]/.test(key)) errors.push(`coverage.${key}: invalid class key`);
       if (typeof value !== "string" || !allowed.includes(value)) {
         errors.push(`coverage.${key}: must be one of { ${allowed.join(" | ")} }`);
       }
@@ -472,6 +455,14 @@ function validateReport(errors: string[], obj: Record<string, unknown>): void {
       });
     }
   }
+}
+
+function resolveProjectPath(input: string): { abs: string; rel: string } {
+  const root = projectRoot();
+  const trimmed = input.trim();
+  const relativeInput = trimmed.replace(/^\.\//, "");
+  const abs = isAbsolute(trimmed) ? resolve(trimmed) : resolve(root, relativeInput);
+  return { abs, rel: relative(root, abs) };
 }
 
 function validateStage(stage: SubmitStage, obj: Record<string, unknown>): string[] {
@@ -584,9 +575,7 @@ function validateStage(stage: SubmitStage, obj: Record<string, unknown>): string
       // that actually exists in the project — same file-existence filter hunt
       // findings get. Otherwise fabricated run logs pass the stage gate.
       const raw = obj.poc_path as string;
-      const normalized = raw.replace(/^\.?\//, "");
-      const abs = isAbsolute(normalized) ? resolve(normalized) : resolve(projectRoot(), normalized);
-      const rel = relative(projectRoot(), abs);
+      const { abs, rel } = resolveProjectPath(raw);
       if (rel.startsWith("..") || isAbsolute(rel)) {
         errors.push("poc_path: must resolve inside the project root");
       } else if (!existsSync(abs)) {
@@ -636,24 +625,22 @@ function validateStage(stage: SubmitStage, obj: Record<string, unknown>): string
 function prefilterHunt(obj: Record<string, unknown>): string | null {
   const file = typeof obj.file === "string" ? obj.file : undefined;
   if (!file) return null; // live target: endpoint locator, nothing to filter
-  const normalized = file.replace(/^\.?\//, "");
-  const segments = normalized.split("/");
-  if (segments.some((s) => TEST_SEGMENT_RE.test(s)) || TEST_FILE_RE.test(normalized)) {
-    return (
-      `test-path filter: "${file}" matches test/fixture/mock paths — findings in ` +
-      `test code are noise. If this is a deliberately-shipped test credential, ` +
-      `re-submit documenting why it ships to production.`
-    );
-  }
   const root = projectRoot();
-  const abs = isAbsolute(normalized) ? resolve(normalized) : resolve(root, normalized);
+  const { abs, rel } = resolveProjectPath(file);
   // Containment: resolved path must stay inside the project, otherwise a
   // "finding" can point at ../ or absolute files outside the target repo.
-  const rel = relative(root, abs);
   if (rel.startsWith("..") || isAbsolute(rel)) {
     return (
       `containment filter: "${file}" resolves outside the project root (${root}). ` +
       `Findings must reference files inside the target repository.`
+    );
+  }
+  const segments = rel.split("/");
+  if (segments.some((s) => TEST_SEGMENT_RE.test(s)) || TEST_FILE_RE.test(rel)) {
+    return (
+      `test-path filter: "${file}" matches test/fixture/mock paths — findings in ` +
+      `test code are noise. If this is a deliberately-shipped test credential, ` +
+      `re-submit documenting why it ships to production.`
     );
   }
   // Symlink containment (same defense as the PoC runner): resolve() is
@@ -683,7 +670,10 @@ function prefilterHunt(obj: Record<string, unknown>): string | null {
 }
 
 function dedupHunt(state: SubmitState, obj: Record<string, unknown>): { duplicateOf?: string } {
-  const file = typeof obj.file === "string" ? obj.file.replace(/^\.?\//, "") : undefined;
+  const file =
+    typeof obj.file === "string"
+      ? resolveProjectPath(obj.file).rel.replace(/^\.\//, "")
+      : undefined;
   const endpoint = typeof obj.endpoint === "string" ? obj.endpoint.trim() : undefined;
   const vulnClass = typeof obj.vuln_class === "string" ? obj.vuln_class : undefined;
   const line = typeof obj.line === "number" ? obj.line : undefined;
@@ -779,7 +769,9 @@ export function pipeline_submit(runId: string, stage: SubmitStage, output: unkno
       if (isFileFinding || isEndpointFinding) {
         state.accepted_findings.push({
           key,
-          file: isFileFinding ? (obj.file as string).replace(/^\.?\//, "") : "",
+          file: isFileFinding
+            ? resolveProjectPath(obj.file as string).rel.replace(/^\.\//, "")
+            : "",
           line: typeof obj.line === "number" ? obj.line : undefined,
           endpoint: isEndpointFinding ? (obj.endpoint as string).trim() : undefined,
           vuln_class: obj.vuln_class,

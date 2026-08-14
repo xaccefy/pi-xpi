@@ -32,10 +32,11 @@ describe("readXpMode / writeXpMode", () => {
   it("env overrides file", () => {
     const path = tempStatePath();
     writeFileSync(path, "off", "utf8");
-    expect(readXpMode("on", path)).toBe("on");
-    expect(readXpMode("1", path)).toBe("on");
-    expect(readXpMode("true", path)).toBe("on");
-    writeFileSync(path, "on", "utf8");
+    expect(readXpMode("swarm", path)).toBe("swarm");
+    expect(readXpMode("on", path)).toBe("swarm");
+    expect(readXpMode("1", path)).toBe("swarm");
+    expect(readXpMode("true", path)).toBe("swarm");
+    writeFileSync(path, "swarm", "utf8");
     expect(readXpMode("off", path)).toBe("off");
     expect(readXpMode("0", path)).toBe("off");
     expect(readXpMode("false", path)).toBe("off");
@@ -51,15 +52,17 @@ describe("readXpMode / writeXpMode", () => {
     writeXpMode("lite", path);
     expect(readFileSync(path, "utf8")).toBe("lite");
     expect(readXpMode("", path)).toBe("lite");
-    // env on overrides a lite file
-    expect(readXpMode("on", path)).toBe("on");
+    // env on is the default enabled mode: swarm
+    expect(readXpMode("on", path)).toBe("swarm");
   });
 
   it("reads persisted file when env unset", () => {
     const path = tempStatePath();
-    writeXpMode("on", path);
-    expect(readFileSync(path, "utf8")).toBe("on");
-    expect(readXpMode("", path)).toBe("on");
+    writeXpMode("swarm", path);
+    expect(readFileSync(path, "utf8")).toBe("swarm");
+    expect(readXpMode("", path)).toBe("swarm");
+    writeFileSync(path, "on", "utf8");
+    expect(readXpMode("", path)).toBe("swarm");
     writeXpMode("off", path);
     expect(readXpMode("", path)).toBe("off");
   });
@@ -72,20 +75,20 @@ describe("readXpMode / writeXpMode", () => {
 });
 
 describe("parseXpModeArg", () => {
-  it("sets on/off explicitly and toggles otherwise", () => {
-    expect(parseXpModeArg("on", "off")).toBe("on");
-    expect(parseXpModeArg("off", "on")).toBe("off");
-    expect(parseXpModeArg("", "off")).toBe("on");
-    expect(parseXpModeArg("  ", "on")).toBe("off");
-    expect(parseXpModeArg("nope", "off")).toBe("on");
+  it("sets swarm/off explicitly and bare /xp toggles swarm", () => {
+    expect(parseXpModeArg("swarm", "off")).toBe("swarm");
+    expect(parseXpModeArg("on", "off")).toBe("swarm");
+    expect(parseXpModeArg("off", "swarm")).toBe("off");
+    expect(parseXpModeArg("", "off")).toBe("swarm");
+    expect(parseXpModeArg("  ", "lite")).toBe("off");
+    expect(parseXpModeArg("nope", "off")).toBe("swarm");
   });
 
-  it("accepts lite explicitly but never toggles into it", () => {
+  it("accepts lite explicitly and bare /xp toggles any enabled mode off", () => {
     expect(parseXpModeArg("lite", "off")).toBe("lite");
-    expect(parseXpModeArg("LITE", "on")).toBe("lite");
+    expect(parseXpModeArg("LITE", "swarm")).toBe("lite");
     expect(parseXpModeArg("lite", "lite")).toBe("lite");
-    // bare /xp from lite toggles to on (off is skipped: lite -> on -> off)
-    expect(parseXpModeArg("", "lite")).toBe("on");
-    expect(parseXpModeArg("", "on")).toBe("off");
+    expect(parseXpModeArg("", "lite")).toBe("off");
+    expect(parseXpModeArg("", "swarm")).toBe("off");
   });
 });

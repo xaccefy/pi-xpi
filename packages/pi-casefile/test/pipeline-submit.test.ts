@@ -41,9 +41,28 @@ function withRealFile(obj: Record<string, unknown>): Record<string, unknown> {
 describe("pipeline_submit", () => {
   it("accepts a valid hunt finding and writes an artifact", () => {
     withRealFile({});
-    const res = pipeline_submit("run-1", "hunt", { ...VALID_HUNT, vuln_class: "injection" });
+    const res = pipeline_submit("run-1", "hunt", VALID_HUNT);
     assert.strictEqual(res.verdict, "accepted");
     assert.ok(res.artifact && existsSync(res.artifact));
+  });
+
+  it("accepts an agent-chosen vuln_class outside the old fixed taxonomy", () => {
+    withRealFile({});
+    const res = pipeline_submit("run-1", "hunt", {
+      ...VALID_HUNT,
+      vuln_class: "oauth-callback-open-redirect",
+    });
+    assert.strictEqual(res.verdict, "accepted");
+  });
+
+  it("accepts an absolute in-project hunt file path", () => {
+    withRealFile({});
+    const res = pipeline_submit("run-1", "hunt", {
+      ...VALID_HUNT,
+      file: join(tempDir, "src/api/users.ts"),
+      vuln_class: "graphql-bola",
+    });
+    assert.strictEqual(res.verdict, "accepted");
   });
 
   it("tolerates JSON-string output with code fences", () => {
@@ -67,7 +86,7 @@ describe("pipeline_submit", () => {
     assert.strictEqual(res.repair_attempt, 1);
   });
 
-  it("returns repair for a bad enum value", () => {
+  it("returns repair for a bad confidence enum value", () => {
     const res = pipeline_submit("run-1", "hunt", { ...VALID_HUNT, confidence: "certain" });
     assert.strictEqual(res.verdict, "repair");
     assert.ok(res.errors.some((e) => e.includes("confidence")));
@@ -129,6 +148,26 @@ describe("pipeline_submit", () => {
     assert.ok(res.errors.some((e) => e.includes("disproval_reason")));
   });
 
+  it("skeptic UNDETERMINED requires uncertainty_reason", () => {
+    const missing = pipeline_submit("run-1", "skeptic", {
+      finding_id: "case_1",
+      verdict: "UNDETERMINED",
+      reasoning: "the endpoint requires credentials the reviewer does not have",
+      evidence_reviewed: ["GET /admin/export"],
+    });
+    assert.strictEqual(missing.verdict, "repair");
+    assert.ok(missing.errors.some((e) => e.includes("uncertainty_reason")));
+
+    const accepted = pipeline_submit("run-1", "skeptic", {
+      finding_id: "case_1",
+      verdict: "UNDETERMINED",
+      reasoning: "the endpoint requires credentials the reviewer does not have",
+      evidence_reviewed: ["GET /admin/export"],
+      uncertainty_reason: "missing low-privileged account needed to verify reachability",
+    });
+    assert.strictEqual(accepted.verdict, "accepted");
+  });
+
   it("trace UNREACHABLE without unreachable_reason is repair", () => {
     const res = pipeline_submit("run-1", "trace", {
       trace_result: "UNREACHABLE",
@@ -139,6 +178,29 @@ describe("pipeline_submit", () => {
     });
     assert.strictEqual(res.verdict, "repair");
     assert.ok(res.errors.some((e) => e.includes("unreachable_reason")));
+  });
+
+  it("trace UNDETERMINED requires uncertainty_reason", () => {
+    const missing = pipeline_submit("run-1", "trace", {
+      trace_result: "UNDETERMINED",
+      entry_point: "GET /admin/export",
+      call_chain: ["GET /admin/export → blocked before sink visibility"],
+      defenses_checked: [{ defense: "auth gateway", location: "live probe", verdict: "blocked" }],
+      attacker_model: "low-privilege user",
+    });
+    assert.strictEqual(missing.verdict, "repair");
+    assert.ok(missing.errors.some((e) => e.includes("uncertainty_reason")));
+
+    const accepted = pipeline_submit("run-1", "trace", {
+      trace_result: "UNDETERMINED",
+      entry_point: "GET /admin/export",
+      call_chain: ["GET /admin/export → blocked before sink visibility"],
+      defenses_checked: [{ defense: "auth gateway", location: "live probe", verdict: "blocked" }],
+      attacker_model: "low-privilege user",
+      uncertainty_reason:
+        "probe requires a low-privileged test account to distinguish auth block from WAF block",
+    });
+    assert.strictEqual(accepted.verdict, "accepted");
   });
 
   it("validate pending_confirmation requires poc_path + run_log + evidence_extracted", () => {
@@ -152,6 +214,23 @@ describe("pipeline_submit", () => {
     assert.ok(res.errors.some((e) => e.includes("poc_path")));
     assert.ok(res.errors.some((e) => e.includes("run_log")));
     assert.ok(res.errors.some((e) => e.includes("evidence_extracted")));
+  });
+
+  it("accepts an absolute in-project validation poc_path", () => {
+    const pocPath = join(tempDir, "pocs/prove.sh");
+    mkdirSync(join(tempDir, "pocs"), { recursive: true });
+    writeFileSync(pocPath, "#!/bin/sh\nexit 0\n", "utf8");
+
+    const res = pipeline_submit("run-1", "validate", {
+      finding_id: "case_1",
+      status: "pending_confirmation",
+      technique_used: "differential request",
+      detection_method: "response diff",
+      poc_path: pocPath,
+      run_log: "PromoteFinding bundle recorded",
+      evidence_extracted: "target-only body predicate matched",
+    });
+    assert.strictEqual(res.verdict, "accepted");
   });
 
   it("prefilter rejects test-path findings (not repairable)", () => {
@@ -265,7 +344,7 @@ describe("pipeline_submit", () => {
       target: "t",
       pipeline_status: "complete",
       findings: [],
-      coverage: { sqli: "NOT_FOUND" },
+      coverage: { "OAuth callback open redirect": "NOT_FOUND" },
       summary: "s",
     });
     assert.strictEqual(asObject.verdict, "accepted");

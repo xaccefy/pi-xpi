@@ -45,7 +45,9 @@ jobs:
         timeout-minutes: 5
 
       - name: Version bump (${{ inputs.bump }})
-        run: bun run version:${{ inputs.bump }}
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: bun run "version:${BUMP}"
 
       - name: Validate release tree
         run: |

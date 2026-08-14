@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Stage Finding",
-  "description": "A vulnerability finding produced by the auditor/hunter stage. Must pass validation before advancing to exploit.",
+  "description": "A vulnerability finding produced by the auditor/hunter stage. Must pass validation before proof work.",
   "type": "object",
   "required": ["vuln_class", "sink", "entry_point", "confidence", "evidence"],
   "oneOf": [
@@ -11,27 +11,7 @@
   "properties": {
     "vuln_class": {
       "type": "string",
-      "description": "Vulnerability class/type",
-      "enum": [
-        "injection",
-        "xss",
-        "idor",
-        "bola",
-        "path-traversal",
-        "ssrf",
-        "command-injection",
-        "deserialization",
-        "auth-bypass",
-        "privilege-escalation",
-        "business-logic",
-        "race-condition",
-        "xxe",
-        "ssti",
-        "open-redirect",
-        "information-disclosure",
-        "crypto-weakness",
-        "other"
-      ]
+      "description": "Agent-chosen vulnerability class/type. Use the most precise useful label for this target, for example: sqli, graphql-bola, oauth-callback-open-redirect, template-injection."
     },
     "file": {
       "type": "string",

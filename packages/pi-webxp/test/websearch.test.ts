@@ -228,17 +228,16 @@ describe("pi-webxp: web_search/web_fetch", () => {
     assert.strictEqual(result.details.renderedBy, undefined);
   });
 
-  it("session_start does not block on daemon startup", async () => {
+  it("session_start does not start or probe the daemon", async () => {
     const pi = new MockExtensionAPI();
     piWebxp(pi as any);
 
-    // Make the daemon health check hang forever; any `await ensureDaemonRunning()`
-    // would block. The handler uses `void ensureDaemonRunning()`, so session_start
-    // must resolve quickly regardless.
+    let healthChecks = 0;
     globalThis.fetch = (async (url: string | URL | Request) => {
       const urlStr = url.toString();
       if (urlStr.endsWith("/health")) {
-        return new Promise<Response>(() => {}); // never resolves
+        healthChecks++;
+        throw new Error("session_start should not touch daemon health");
       }
       return { ok: true, json: async () => ({ status: "ok", data: {} }) } as Response;
     }) as any;
@@ -251,5 +250,6 @@ describe("pi-webxp: web_search/web_fetch", () => {
       ),
     ]);
     assert.ok(Date.now() - start < 1000, "session_start should not await daemon startup");
+    assert.strictEqual(healthChecks, 0);
   });
 });

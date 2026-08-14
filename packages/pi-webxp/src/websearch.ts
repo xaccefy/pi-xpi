@@ -39,6 +39,33 @@ let daemonProcess: ChildProcess | null = null;
 let daemonSpawnError: Error | null = null;
 let startupPromise: Promise<boolean> | null = null;
 
+type DaemonResponse<T> = {
+  status?: string;
+  data?: T;
+  error?: { message?: string };
+};
+
+type SearchResult = {
+  title?: string;
+  url?: string;
+  content?: string;
+  description?: string;
+};
+
+type SearchData = {
+  results?: SearchResult[];
+};
+
+type FetchData =
+  | string
+  | {
+      markdown?: string;
+      content?: string;
+      text?: string;
+      renderedBy?: string;
+      [key: string]: unknown;
+    };
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 function getDaemonScriptPath(): string {
@@ -54,7 +81,7 @@ async function checkDaemonRunning(): Promise<boolean> {
   try {
     const res = await fetch(`${DAEMON_URL}/health`, { signal: AbortSignal.timeout(500) });
     if (res.ok) {
-      const body = (await res.json()) as any;
+      const body = (await res.json()) as DaemonResponse<{ daemon?: string }>;
       return body?.status === "ok" || body?.data?.daemon === "running";
     }
   } catch {}
@@ -293,7 +320,7 @@ export default function websearchExtension(pi: ExtensionAPI) {
           signal,
         );
 
-        const body = (await res.json()) as any;
+        const body = (await res.json()) as DaemonResponse<SearchData>;
         if (body?.status !== "ok" || !body?.data) {
           throw new Error(body?.error?.message || "Invalid response format from daemon");
         }
@@ -309,7 +336,7 @@ export default function websearchExtension(pi: ExtensionAPI) {
         }
 
         let markdown = `Web Search Results for: "${params.query}"\n\n`;
-        results.forEach((item: any, idx: number) => {
+        results.forEach((item, idx) => {
           markdown += `${idx + 1}. **${item.title || "Untitled"}**\n`;
           markdown += `   URL: ${item.url}\n`;
           if (item.content || item.description) {
@@ -328,7 +355,7 @@ export default function websearchExtension(pi: ExtensionAPI) {
     },
 
     renderResult(result, { expanded }, theme, context) {
-      const details = result.details as any;
+      const details = result.details as { results?: SearchResult[]; query?: string } | undefined;
       if (context.isError) {
         return new Text(theme.fg("error", "✗ Web Search failed"), 0, 0);
       }
@@ -339,7 +366,7 @@ export default function websearchExtension(pi: ExtensionAPI) {
         theme.fg("toolTitle", " Web Search: ") +
         theme.fg("dim", `${results.length} results found for "${query}"`);
       if (expanded) {
-        const text = (result.content[0] as any)?.text || "";
+        const text = (result.content[0] as { text?: string } | undefined)?.text || "";
         return new Text(`${baseText}\n${text}`, 0, 0);
       }
       return new Text(baseText, 0, 0);
@@ -409,7 +436,7 @@ export default function websearchExtension(pi: ExtensionAPI) {
           signal,
         );
 
-        const body = (await res.json()) as any;
+        const body = (await res.json()) as DaemonResponse<FetchData>;
         if (body?.status !== "ok" || !body?.data) {
           throw new Error(body?.error?.message || "Invalid response from daemon");
         }
@@ -430,12 +457,12 @@ export default function websearchExtension(pi: ExtensionAPI) {
     },
 
     renderResult(result, { expanded }, theme, context) {
-      const details = result.details as any;
+      const details = result.details as { url?: string; renderedBy?: string } | undefined;
       if (context.isError) {
         return new Text(theme.fg("error", "✗ Web Fetch failed"), 0, 0);
       }
       const url = details?.url || "";
-      const text = (result.content[0] as any)?.text || "";
+      const text = (result.content[0] as { text?: string } | undefined)?.text || "";
       const textLength = text.length;
       const renderedNote = details?.renderedBy ? " (browser-rendered)" : "";
       const baseText =
@@ -453,11 +480,10 @@ export default function websearchExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async () => {
     // Fresh session can spawn again even if a prior shutdown ran in-process.
+    // Daemon startup is intentionally lazy: web_search/web_fetch start it only
+    // when called, so installing webxp does not create a local listener during
+    // ordinary sessions.
     shuttingDown = false;
-    // Don't block session start on daemon startup; the tools await it when they need it.
-    void ensureDaemonRunning().catch(() => {
-      // Best-effort warm-up; tools will surface a clear error on demand.
-    });
   });
 
   pi.on("session_shutdown", async () => {

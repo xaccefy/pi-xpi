@@ -1,4 +1,4 @@
-import { lookup as dnsLookup } from "node:dns";
+import { lookup as dnsLookup, type LookupAddress } from "node:dns";
 import { lookup as dnsLookupAsync } from "node:dns/promises";
 import { isIP } from "node:net";
 import { isPublicIpAddress } from "@xaccefy/pi-shared";
@@ -30,18 +30,33 @@ export function assertPublicHttpUrl(parsed: URL, allowPrivateHosts = false): voi
   }
 }
 
-function guardedLookup(hostname: string, options: any, callback: any): void {
-  dnsLookup(hostname, { ...options, all: true }, (err, addresses) => {
+type GuardedLookupOptions = {
+  family?: number;
+  hints?: number;
+  all?: boolean;
+  verbatim?: boolean;
+  order?: "ipv4first" | "ipv6first" | "verbatim";
+};
+
+type GuardedLookupCallback = (err: Error | null, address?: string, family?: number) => void;
+
+function guardedLookup(
+  hostname: string,
+  options: GuardedLookupOptions,
+  callback: GuardedLookupCallback,
+): void {
+  const lookupOptions = { ...options, all: true as const };
+  dnsLookup(hostname, lookupOptions, (err, addresses: LookupAddress[]) => {
     if (err) return callback(err);
-    const list = Array.isArray(addresses) ? addresses : [addresses];
-    const blocked = list.find((entry) => !isPublicIpAddress(entry.address));
+    const blocked = addresses.find((entry) => !isPublicIpAddress(entry.address));
     if (blocked) {
       return callback(
         new Error(`Blocked: ${hostname} resolved to private/internal address ${blocked.address}`),
       );
     }
     const picked =
-      list.find((entry) => !options?.family || entry.family === options.family) ?? list[0];
+      addresses.find((entry) => !options.family || entry.family === options.family) ?? addresses[0];
+    if (!picked) return callback(new Error(`Blocked: ${hostname} did not resolve to an address`));
     return callback(null, picked.address, picked.family);
   });
 }

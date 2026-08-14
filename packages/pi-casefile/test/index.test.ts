@@ -124,7 +124,7 @@ async function executeTool(pi: FakePi, name: string, params: Record<string, unkn
       isError: true,
       details: {
         record: typeof finalParams.id === "string" ? getCaseById(finalParams.id) : undefined,
-        missingControl: text.includes("control_path is REQUIRED"),
+        missingPocPath: text.includes("poc_path is REQUIRED"),
         missingControlTarget: text.includes("control_target is REQUIRED"),
         controlTargetEqualsCase: text.includes("control_target must differ from the case target"),
         controlNotAuthorized: text.includes("CONTROL AUTHORIZATION FAILED"),
@@ -255,14 +255,14 @@ describe("casefile extension", () => {
     expect(values).toContain("poc");
   });
 
-  test("does not register ConfirmFinding when a worker unsets its role after startup", () => {
+  test("does not register validation gates when a worker unsets its role after startup", () => {
     process.env.PI_SUBAGENT_CHILD = "1";
     try {
       const pi = createFakePi();
       casefileExtension(pi as any);
       delete process.env.PI_SUBAGENT_CHILD;
       expect(pi.tools.has("ConfirmFinding")).toBe(false);
-      expect(pi.tools.has("PromoteFinding")).toBe(true);
+      expect(pi.tools.has("PromoteFinding")).toBe(false);
     } finally {
       delete process.env.PI_SUBAGENT_CHILD;
     }
@@ -370,7 +370,7 @@ describe("casefile extension", () => {
     expect(report.details.contextPath).toMatch(/\.context\.md$/);
 
     // Rich content (verification logs, links, complete record) lives in the
-    // context bundle; the report path is reserved for the reporter agent.
+    // context bundle; the report path is reserved for the main agent's final report.
     const contextText = readFileSync(report.details.contextPath, "utf8");
     expect(contextText).toContain("PoC Verification Log");
     expect(contextText).toContain("Output\n```\nok\n```");
@@ -492,7 +492,7 @@ describe("casefile extension", () => {
     expect(phase1.details.record.pendingConfirmation).toBeUndefined();
   });
 
-  test("PromoteFinding requires control_path + control_target for EVERY promotion (sandboxed and live)", async () => {
+  test("PromoteFinding defaults control_path to poc_path but still requires an approved control target", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
 
@@ -508,26 +508,27 @@ describe("casefile extension", () => {
     });
     const id = added.details.record.id;
 
-    // Missing control_path — blocked even WITHOUT local:true (the default
-    // sandboxed mode used to skip the control entirely; now it is mandatory).
-    const noControl = await executeTool(pi, "PromoteFinding", {
+    // Missing control_path is no longer ceremony: the harness defaults it to
+    // poc_path, then still runs the same-byte control branch.
+    const defaultControlPath = await executeTool(pi, "PromoteFinding", {
       id,
       poc_path: pocScriptPath,
       control_target: "https://control.example",
+      local: true,
     });
-    expect(noControl.isError).toBe(true);
-    expect(noControl.details.missingControl).toBe(true);
-    expect(noControl.details.record.status).toBe("investigating");
+    expect(defaultControlPath.isError).toBeUndefined();
+    expect(defaultControlPath.details.record.status).toBe("investigating");
+    expect(defaultControlPath.details.record.pendingConfirmation.controlPath).toBe(pocScriptPath);
 
-    // Same for live findings.
-    const noControlLive = await executeTool(pi, "PromoteFinding", {
+    // control_target is still mandatory and cannot be inferred by the agent.
+    const noTargetFromDefault = await executeTool(pi, "PromoteFinding", {
       id,
       poc_path: pocScriptPath,
       local: true,
     });
-    expect(noControlLive.isError).toBe(true);
-    expect(noControlLive.details.missingControl).toBe(true);
-    expect(noControlLive.details.record.status).toBe("investigating");
+    expect(noTargetFromDefault.isError).toBe(true);
+    expect(noTargetFromDefault.details.missingControlTarget).toBe(true);
+    expect(noTargetFromDefault.details.record.status).toBe("investigating");
 
     // control_path without control_target — blocked before any PoC run.
     const noTarget = await executeTool(pi, "PromoteFinding", {
@@ -823,8 +824,18 @@ describe("casefile extension", () => {
     });
     expect(phase1.details?.record?.status).toBe("investigating");
 
-    // Workers may produce evidence, but the phase-2 decision is main-agent-only.
+    // Workers may gather evidence, but validation and confirmation are main-agent-only.
     process.env.PI_SUBAGENT_CHILD = "1";
+    const workerPromote = await executeTool(pi, "PromoteFinding", {
+      id,
+      poc_path: pocScriptPath,
+      control_target: "https://control.example",
+      control_path: controlScriptPath,
+      local: true,
+    });
+    expect(workerPromote.isError).toBe(true);
+    expect(workerPromote.content?.[0]?.text).toContain("reserved for the main/coordinator agent");
+
     let workerErr: Error | undefined;
     try {
       await executeTool(pi, "ConfirmFinding", { id, verdict: completeVerdict });
@@ -1106,9 +1117,9 @@ describe("casefile extension", () => {
     }
   });
 
-  test("XP mode on: injects cyber workflow even with an empty ledger", async () => {
+  test("XP mode swarm: injects cyber workflow even with an empty ledger", async () => {
     const previous = process.env.PI_XP_MODE;
-    process.env.PI_XP_MODE = "on";
+    process.env.PI_XP_MODE = "swarm";
     try {
       const pi = createFakePi();
       casefileExtension(pi as any);
@@ -1128,10 +1139,10 @@ describe("casefile extension", () => {
     }
   });
 
-  test("XP mode on + subagent child process: before_agent_start injects nothing", async () => {
+  test("XP mode swarm + subagent child process: before_agent_start injects nothing", async () => {
     const previousXp = process.env.PI_XP_MODE;
     const previousChild = process.env.PI_SUBAGENT_CHILD;
-    process.env.PI_XP_MODE = "on";
+    process.env.PI_XP_MODE = "swarm";
     process.env.PI_SUBAGENT_CHILD = "1";
     try {
       const pi = createFakePi();
@@ -1149,7 +1160,7 @@ describe("casefile extension", () => {
     }
   });
 
-  test("XP toggle off→on mid-session re-injects the workflow", async () => {
+  test("XP swarm toggle mid-session re-injects the workflow", async () => {
     const previous = process.env.PI_XP_MODE;
     delete process.env.PI_XP_MODE;
     try {
@@ -1163,8 +1174,8 @@ describe("casefile extension", () => {
       // Default off: nothing injected.
       expect(await handler({ systemPrompt: "p" })).toBeUndefined();
 
-      // /xp on → workflow injected.
-      await xpCmd.handler("on", { ui: { notify } });
+      // /xp swarm → workflow injected.
+      await xpCmd.handler("swarm", { ui: { notify } });
       const on1 = await handler({ systemPrompt: "p" });
       expect(on1.systemPrompt).toContain("# Cyber Workflow");
 
@@ -1172,10 +1183,10 @@ describe("casefile extension", () => {
       await xpCmd.handler("off", { ui: { notify } });
       expect(await handler({ systemPrompt: "p" })).toBeUndefined();
 
-      // /xp on again → workflow must come back (regression: workflowInjected
+      // /xp swarm again → workflow must come back (regression: workflowInjected
       // stayed true from the first enable, so re-enabling silently never
       // re-injected the workflow until process restart).
-      await xpCmd.handler("on", { ui: { notify } });
+      await xpCmd.handler("swarm", { ui: { notify } });
       const on2 = await handler({ systemPrompt: "p" });
       expect(on2.systemPrompt).toContain("# Cyber Workflow");
     } finally {
@@ -1184,9 +1195,9 @@ describe("casefile extension", () => {
     }
   });
 
-  test("XP mode on: workflow injected once per session, case list refreshes per prompt", async () => {
+  test("XP mode swarm: workflow injected once per session, case list refreshes per prompt", async () => {
     const previous = process.env.PI_XP_MODE;
-    process.env.PI_XP_MODE = "on";
+    process.env.PI_XP_MODE = "swarm";
     try {
       const pi = createFakePi();
       casefileExtension(pi as any);
@@ -1217,9 +1228,9 @@ describe("casefile extension", () => {
     }
   });
 
-  test("XP mode on: injects only active cases into before_agent_start context", async () => {
+  test("XP mode swarm: injects only active cases into before_agent_start context", async () => {
     const previous = process.env.PI_XP_MODE;
-    process.env.PI_XP_MODE = "on";
+    process.env.PI_XP_MODE = "swarm";
     try {
       const pi = createFakePi();
       casefileExtension(pi as any);
@@ -1286,7 +1297,7 @@ describe("casefile extension", () => {
         },
       });
       const ctxResult = await executeTool(pi, "CaseContext", { id: reported.details.record.id });
-      // The reporter agent writes the report file (passing the content gate:
+      // The main agent creates the report file (passing the content gate:
       // non-trivial size, required sections, no internal identifiers) before
       // the case flips to reported.
       writeFileSync(
@@ -1319,9 +1330,9 @@ describe("casefile extension", () => {
     }
   });
 
-  test("XP mode on: includes hypothesis and blocked cases in prompt context", async () => {
+  test("XP mode swarm: includes hypothesis and blocked cases in prompt context", async () => {
     const previous = process.env.PI_XP_MODE;
-    process.env.PI_XP_MODE = "on";
+    process.env.PI_XP_MODE = "swarm";
     try {
       const pi = createFakePi();
       casefileExtension(pi as any);
@@ -1356,7 +1367,7 @@ describe("casefile extension", () => {
 
   test("injects at most 20 active cases, P0 first, with +N more hint", async () => {
     const previous = process.env.PI_XP_MODE;
-    process.env.PI_XP_MODE = "on";
+    process.env.PI_XP_MODE = "swarm";
     try {
       const pi = createFakePi();
       casefileExtension(pi as any);
@@ -1402,7 +1413,15 @@ describe("casefile extension", () => {
     expect(STATIC_CYBER_WORKFLOW).toContain("Design & Runtime Check");
     expect(STATIC_CYBER_WORKFLOW).toContain("CaseContext");
     expect(STATIC_CYBER_WORKFLOW).not.toContain("CaseReport");
-    expect(STATIC_CYBER_WORKFLOW).toContain("agent: 'reporter'");
+    expect(STATIC_CYBER_WORKFLOW).toContain("only auditor (HUNT rounds), tracer");
+    expect(STATIC_CYBER_WORKFLOW).toContain("VALIDATE (you, inline)");
+    expect(STATIC_CYBER_WORKFLOW).toContain("REPORT (you, inline)");
+    expect(STATIC_CYBER_WORKFLOW).toContain("maximum reachable impact");
+    expect(STATIC_CYBER_WORKFLOW).toContain("Do not stop at a benign marker");
+    expect(STATIC_CYBER_WORKFLOW).toContain("UNDETERMINED → block/re-dispatch");
+    for (const removedAgent of ["report" + "er", "explo" + "it"]) {
+      expect(STATIC_CYBER_WORKFLOW).not.toContain(`agent: '${removedAgent}'`);
+    }
     expect(STATIC_CYBER_WORKFLOW_LITE).toContain("Report style checklist");
     expect(STATIC_CYBER_WORKFLOW_LITE).toContain("CaseContext");
     expect(STATIC_CYBER_WORKFLOW_LITE).not.toContain("CaseReport");
@@ -1413,7 +1432,7 @@ describe("casefile extension", () => {
     }
   });
 
-  test("/xp command toggles mode and gates injection", async () => {
+  test("/xp command defaults to swarm and /xp lite keeps single-agent mode", async () => {
     const previous = process.env.PI_XP_MODE;
     delete process.env.PI_XP_MODE;
     try {
@@ -1431,14 +1450,29 @@ describe("casefile extension", () => {
       const handler = pi.events.get("before_agent_start")?.[0];
       expect(await handler()).toBeUndefined();
 
-      await pi.commands.get("xp").handler("on", ctx);
-      expect(notifications.some((n) => n.includes("ON"))).toBe(true);
+      await pi.commands.get("xp").handler("", ctx);
+      expect(notifications.some((n) => n.includes("SWARM"))).toBe(true);
       const event = { systemPrompt: "" };
-      const onResult = await handler(event);
-      expect(onResult.systemPrompt).toContain("# Cyber Workflow");
+      const defaultResult = await handler(event);
+      expect(defaultResult.systemPrompt).toContain("# Cyber Workflow");
+      expect(defaultResult.systemPrompt).not.toContain("# Cyber Workflow — LITE");
 
       await pi.commands.get("xp").handler("off", ctx);
       expect(await handler()).toBeUndefined();
+
+      await pi.commands.get("xp").handler("on", ctx);
+      expect(notifications.some((n) => n.includes("SWARM"))).toBe(true);
+      const onResult = await handler(event);
+      expect(onResult.systemPrompt).toContain("# Cyber Workflow");
+      expect(onResult.systemPrompt).not.toContain("# Cyber Workflow — LITE");
+
+      await pi.commands.get("xp").handler("off", ctx);
+      expect(await handler()).toBeUndefined();
+
+      await pi.commands.get("xp").handler("lite", ctx);
+      expect(notifications.some((n) => n.includes("LITE"))).toBe(true);
+      const liteResult = await handler(event);
+      expect(liteResult.systemPrompt).toContain("# Cyber Workflow — LITE (Single-Agent)");
     } finally {
       if (previous === undefined) delete process.env.PI_XP_MODE;
       else process.env.PI_XP_MODE = previous;

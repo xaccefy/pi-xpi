@@ -8,8 +8,8 @@ XPI runs on **Pi Agent** (`@earendil-works/pi-coding-agent`) and its fork **OMP*
 
 - **Extensions** — both hosts read the `pi` field in `package.json` (OMP also accepts an `omp` field; `plugin.json` is the Agent Plugins manifest OMP uses for skills).
 - **Skills** — `skills/cyberwf`, `skills/web-pentest`, `skills/casefile` load on both hosts (OMP via the Agent Plugins provider).
-- **Subagent dispatch** — Pi uses the pi-subagents extension (`subagent({ workflowScript: ... })`); OMP uses its native `task` tool. The `/xp on` workflow and the `cyberwf` skill describe both conventions; the extension injects the host-appropriate workflow automatically.
-- **Specialist agents** — `install.sh --omp` copies `agents/*.md` (auditor, tracer, skeptic, exploit, chain, reporter) to `~/.omp/agent/agents` so OMP's `task` tool can spawn them by name. PoC phase-2 confirmation stays with the main agent and is never dispatched.
+- **Subagent dispatch** — `/xp lite` needs no dispatch dependency. `/xp` and `/xp swarm` use pi-subagents on Pi (`./install.sh --pi` installs it by default; `--no-subagents` skips it) or OMP's native `task` tool. The swarm workflow and the `cyberwf` skill describe both conventions; the extension injects the host-appropriate workflow automatically.
+- **Swarm agents** — `/xp` / `/xp swarm` delegates only to auditor, tracer, skeptic, and chain. Recon, validation/PoC writing, patching, reporting, and ConfirmFinding stay with the main agent.
 
 ## Configuration
 
@@ -18,7 +18,7 @@ XPI runs on **Pi Agent** (`@earendil-works/pi-coding-agent`) and its fork **OMP*
 | Variable | Package | Purpose |
 |----------|---------|---------|
 | `PREVIEW_IS_API_KEY` | webxp | Required for `exploit_search` ([preview.is](https://preview.is)) |
-| `PI_XP_MODE` | casefile | `on` / `lite` / `off` — force casefile cyber-workflow injection (lite = single-agent, no subagent dispatch) |
+| `PI_XP_MODE` | casefile | `on` / `swarm` / `lite` / `off` — force casefile cyber-workflow injection (`on` is the default enabled mode: swarm; `lite` disables subagent dispatch) |
 | `PI_CASEFILE_PATH` | casefile | Override SQLite ledger path |
 | `PI_WEBSEARCH_PORT` | webxp | open-websearch daemon port (default `3210`) |
 | `PI_FFF_MODE` | fff | `override` replaces pi's built-in grep/find with fff (set in your shell profile; Pi only — OMP ships its own search) |
@@ -36,31 +36,32 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 | `web_fetch` | Page content from an HTTP(S) URL |
 | `context7` | Current library docs |
 | `deepwiki` | Q&A on a public GitHub repo |
-| `CaseAdd` / `CaseUpdate` / `PromoteFinding` / `ConfirmFinding` | Ledger + two-phase PoC gate: PromoteFinding runs the same PoC twice on target and once on an operator-approved control, validates nonce-bound response-body evidence, then performs a DNS-pinned identical HTTP replay and requires two conclusive responses with `target_only`. Reflection requests can opt into a post-PoC harness-generated canary that must appear only on target. Zero exit is run integrity, never proof. ConfirmFinding is main-agent-only, captures a fresh second harness replay, and binds it to the semantic verdict; workers are rejected. Private replay is operator-gated and blind/OOB claims fail closed without source separation |
+| `CaseAdd` / `CaseUpdate` / `PromoteFinding` / `ConfirmFinding` | Ledger + two-phase PoC gate: main-agent PromoteFinding runs the same PoC twice on target and once on an operator-approved control (`control_path` defaults to `poc_path`), validates nonce-bound response-body evidence, then performs a DNS-pinned identical HTTP replay and requires two conclusive responses with `target_only`. Reflection requests can opt into a post-PoC harness-generated canary that must appear only on target. Zero exit is run integrity, never proof. ConfirmFinding is also main-agent-only, captures a fresh second harness replay, and binds it to the semantic verdict; worker/subagent gate calls are rejected. Private replay is operator-gated and blind/OOB claims fail closed without source separation |
 | `EvidenceAdd` | Role-typed, hashed evidence items (observation/reproduction/impact/refutation/cleanup); refutation justifies kills; reproduction auto-recorded by the PoC gate |
 | `CaseGet` / `CaseList` / `CaseSearch` | Browse cases |
 | `CaseLink` / `CaseUnlink` | Exploit chains |
 | `ChainSuggest` | Auto-detect exploitable chain combinations across cases (credential+endpoint→ATO, XSS+state-change→CSRF, SSTI→RCE, race+payment, …), ranked — verify before linking |
 | `CoverageAdd` / `CoverageReport` | Machine-checkable test coverage: record (asset × attack-class) cells with wide/local scope, linked to artifact-backed evidence items (`evidence_item_id`); unbacked cells render as ⚠ unbacked, and the plateau claim must match the matrix |
-| `CaseContext` | Case context bundle (complete record + artifacts) for the report writer |
+| `CaseContext` | Case context bundle (complete record + artifacts) for the main agent's final report |
 | `PipelineSubmit` | Stage-output validation gate: schema check + pre-filter + repair budget — stage can't advance on invalid output |
 | `ScratchpadInit` / `Resume` / `Checkpoint` | Crash-recoverable artifact store for pipeline runs |
 | `ScratchpadWrite` / `Read` / `PhaseDone` / `Clear` | Write, read, and resume pipeline artifacts |
 | `/casefile` | Case dashboard |
-| `/xp` | Toggle casefile **XP mode** (cyber workflow injection; `on` = subagent pipeline, `lite` = single-agent, **default OFF**) |
+| `/xp` | Toggle casefile **XP mode** (bare `/xp` toggles the bounded swarm pipeline; `lite` = single-agent workflow; **default OFF**) |
 | `todo` / `/todos` | Multi-step task lists |
 | `ffgrep` / `fffind` | Frecency-ranked file + content search; in `override` mode transparently upgrades pi's built-in `grep`/`find`. Installed by `install.sh`. |
 
 ## Quick start
 
 ```
-/xp on                                      # enable casefile cyber workflow in context
-/xp lite                                    # single-agent variant — no subagent dispatch
+/xp                                         # toggle bounded swarm XP mode on/off
+/xp lite                                    # explicit single-agent security workflow
+/xp swarm                                   # bounded multi-agent pipeline for broad audits
 ```
 
-CaseAdd requires `disproveIf` (falsification conditions) on every new case; a kill of a case that ever reached investigating/confirmed requires artifact-backed refutation evidence. Confirmation is two-phase: **PromoteFinding** runs the same PoC twice against the case target and once against a distinct control pre-approved in `PI_POC_CONTROL_TARGETS`; every run must exit zero, complete with fully captured output, and write nonce-bound `evidence.json` with `body_contains` or `body_regex` (status-only is rejected). Those are integrity checks, not proof. The harness binds `verify.url`, pins DNS into each connection, locks redirects to the bound host, derives the control URL, sends the same request to both origins, and requires two conclusive responses with `target_only`. Reflection-capable evidence may place exactly one `{{PI_POC_CANARY}}` in the request and declare `verify.canary`; after the PoC exits, the harness substitutes a fresh secret and requires target-only reflection without persisting the raw token. Private replay requires `PI_POC_ALLOW_PRIVATE_REPLAY=1`, and any networked PoC requires `PI_POC_ALLOW_NETWORK=1`. Blind/OOB proof fails closed without source separation. After the machine gate, the **main agent itself** reads the exact evidence/script, attempts disconfirmation, and calls **ConfirmFinding**; that main-only call captures and stores a fresh second target/control replay before committing. A worker's role is snapshotted at extension initialization, so unsetting `PI_SUBAGENT_CHILD` cannot upgrade the running extension; this is a process-role guard, not protection against a same-UID process or direct SQLite mutation. Promotion also requires an artifact-backed, workspace-contained `observation` evidence item.
+CaseAdd requires `disproveIf` (falsification conditions) on every new case; a kill of a case that ever reached investigating/confirmed requires artifact-backed refutation evidence. Confirmation is two-phase: **PromoteFinding** runs the same PoC twice against the case target and once against a distinct control pre-approved in `PI_POC_CONTROL_TARGETS`; `control_path` defaults to `poc_path` and is sha256-checked if supplied. Every run must exit zero, complete with fully captured output, and write nonce-bound `evidence.json` with `body_contains` or `body_regex` (status-only is rejected). Those are integrity checks, not proof. The harness binds `verify.url`, pins DNS into each connection, locks redirects to the bound host, derives the control URL, sends the same request to both origins, and requires two conclusive responses with `target_only`. Reflection-capable evidence may place exactly one `{{PI_POC_CANARY}}` in the request and declare `verify.canary`; after the PoC exits, the harness substitutes a fresh secret and requires target-only reflection without persisting the raw token. Private replay requires `PI_POC_ALLOW_PRIVATE_REPLAY=1`, and any networked PoC requires `PI_POC_ALLOW_NETWORK=1`. Blind/OOB proof fails closed without source separation. After the machine gate, the **main agent itself** reads the exact evidence/script, attempts disconfirmation, and calls **ConfirmFinding**; that main-only call captures and stores a fresh second target/control replay before committing. A worker's role is snapshotted at extension initialization, so unsetting `PI_SUBAGENT_CHILD` cannot upgrade the running extension; this is a process-role guard, not protection against a same-UID process or direct SQLite mutation. Promotion also requires an artifact-backed, workspace-contained `observation` evidence item.
 
-Pi injects skill descriptions (`web-pentest`, `cyberwf`) into every session; the agent reads the full skill file when the task matches (e.g. "find bugs in X", "bug bounty Y"). Run `/xp on` for the full attacker discipline with casefile tracking, or `/xp lite` for the same discipline done by the main agent alone (CTF / single-shot engagements).
+Pi injects skill descriptions (`web-pentest`, `cyberwf`) into every session; the agent reads the full skill file when the task matches. Use `/xp` for the default bounded multi-agent pipeline, or `/xp lite` for CTFs, focused reviews, and one-target work where dispatch is unnecessary.
 
 ## Skeptic + scratchpad — how findings stay honest
 
@@ -84,7 +85,7 @@ For a target repo, the auditor and tracer agents lean on `grep`/`find`/`read` to
 
 ```
 pi-xpi/
-├── agents/                  # auditor, tracer, exploit, chain, skeptic
+├── agents/                  # auditor, tracer, skeptic, chain
 ├── packages/
 │   ├── pi-casefile          # ledger, poc-runner, workflow, scratchpad
 │   ├── pi-shared

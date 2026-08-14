@@ -9,9 +9,9 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { type TSchema, Type } from "typebox";
 import {
   CANARY_ASSESSMENT_VALUES,
   CONFIRM_DIFFERENTIAL_VALUES,
@@ -19,11 +19,7 @@ import {
   SEVERITY_MATCH_VALUES,
   validateMainAgentVerdict,
 } from "./evidence.ts";
-import {
-  controlTargetAuthorizationError,
-  type HarnessVerifyResult,
-  replayDifferential,
-} from "./harness-verify.ts";
+import { controlTargetAuthorizationError, replayDifferential } from "./harness-verify.ts";
 import {
   addCaseResult,
   addEvidenceItemResult,
@@ -73,7 +69,7 @@ import { pipeline_submit, SUBMIT_STAGES, type SubmitStage } from "./pipeline-sub
 import { type PocRun, type PocRunOptions, runPoc } from "./poc-runner.ts";
 import {
   detectWorkspaceRoot,
-  PHASE_ORDER,
+  SCRATCHPAD_PHASES,
   type ScratchpadPhase,
   type ScratchpadResume,
   scratchpad_checkpoint,
@@ -182,12 +178,13 @@ const EvidenceAddSchema = Type.Object(
 
 // ── Tool: PromoteFinding (phase 1) / ConfirmFinding (phase 2) ──────────
 //
-// Confirmation is TWO-PHASE: a worker may run PromoteFinding (the harness runs
-// the PoC 2x + control, validates nonce-bound evidence.json, and records the
-// bundle), but only the MAIN coordinator agent may review/re-execute and commit
-// a verdict via ConfirmFinding. Zero exit is necessary run integrity and
-// markers are diagnostic only; the machine records predicate/canary
-// differentials and the main agent owns the semantic vulnerability judgment.
+// Confirmation is TWO-PHASE and main-agent-owned: PromoteFinding runs the PoC
+// 2x + control, validates nonce-bound evidence.json, and records the pending
+// bundle; ConfirmFinding then performs the main coordinator's review/replay and
+// commits or refuses the verdict. Subagents may gather or challenge evidence,
+// but they cannot run validation or confirmation gates. Zero exit is necessary
+// run integrity and markers are diagnostic only; the machine records
+// predicate/canary differentials and the main agent owns the semantic judgment.
 
 const PromoteSchema = Type.Object(
   {
@@ -195,10 +192,12 @@ const PromoteSchema = Type.Object(
     poc_path: Type.String({
       description: "Absolute path to the PoC script on disk",
     }),
-    control_path: Type.String({
-      description:
-        "REQUIRED: absolute path to the SAME script as poc_path (sha256-equality is ENFORCED). The harness runs it with PI_POC_MODE=control and PI_POC_TARGET=control_target.",
-    }),
+    control_path: Type.Optional(
+      Type.String({
+        description:
+          "Optional absolute path to the SAME script as poc_path (sha256-equality is ENFORCED). Defaults to poc_path. The harness runs it with PI_POC_MODE=control and PI_POC_TARGET=control_target.",
+      }),
+    ),
     control_target: Type.String({
       minLength: 1,
       description:
@@ -358,9 +357,9 @@ const UnlinkSchema = Type.Object(
 // artifacts; it does not re-run completed phases (idempotent).
 
 const ScratchpadPhaseSchema = Type.String({
-  enum: [...PHASE_ORDER],
+  enum: [...SCRATCHPAD_PHASES],
   description:
-    "Pipeline phase: recon | hunt | gapfil | trace | skeptic | validate | chain | patch | report",
+    "Pipeline phase: recon | hunt | trace | skeptic | validate | chain | patch | report (legacy gapfil is accepted for older runs)",
 });
 
 /** run_id-only schema, shared by Scratchpad Init / Resume / Clear. */
@@ -699,13 +698,13 @@ export function detectHost(): "omp" | "pi" {
  * case list DOES change as cases are added, so it is refreshed every prompt.
  *
  * mode selects the workflow text: "lite" injects the single-agent workflow
- * (no subagent dispatch), anything else gets the full subagent pipeline,
+ * (no subagent dispatch), "swarm" gets the full subagent pipeline,
  * rendered for the host's dispatch convention (pi-subagents vs OMP task).
  */
 function buildAgentInjection(
   active: CaseRecord[],
   includeWorkflow: boolean,
-  mode: XpMode = "on",
+  mode: XpMode = "swarm",
 ): string {
   const caseList = buildCaseListContext(active);
   if (!includeWorkflow) return caseList;
@@ -722,13 +721,15 @@ function buildAgentInjection(
 // ── XP (offensive / exploit) mode toggle ─────────────────────────────
 // Casefile historically injected the cyber workflow into every prompt.
 // For normal dev work that is just noise, so XP mode defaults OFF. Enable
-// it for offensive/audit sessions to get the full attacker discipline back,
-// or lite for the single-agent variant (no subagent dispatch). Toggle with
-// /xp (or /xp on|off|lite); override per-session with PI_XP_MODE.
+// swarm for the bounded multi-agent variant, or lite for the single-agent
+// attacker discipline. Toggle with /xp (off <-> swarm), or set explicitly with
+// /xp on|lite|swarm|off. "on" means the default enabled SWARM mode; use "lite"
+// for no subagent dispatch.
+// Override per-session with PI_XP_MODE.
 // Pure helpers exported for unit tests.
 
 export const XP_MODE_ENV = "PI_XP_MODE";
-export type XpMode = "on" | "off" | "lite";
+export type XpMode = "swarm" | "off" | "lite";
 
 export function getXpModeStatePath(): string {
   return join(dirname(getCasefilePath()), "xp-mode");
@@ -739,13 +740,14 @@ export function readXpMode(
   statePath: string = getXpModeStatePath(),
 ): XpMode {
   const env = (envValue ?? "").trim().toLowerCase();
-  if (env === "on" || env === "1" || env === "true") return "on";
+  if (env === "swarm") return "swarm";
+  if (env === "on" || env === "1" || env === "true") return "swarm";
   if (env === "lite") return "lite";
   if (env === "off" || env === "0" || env === "false") return "off";
   try {
     if (existsSync(statePath)) {
       const v = readFileSync(statePath, "utf8").trim().toLowerCase();
-      if (v === "on") return "on";
+      if (v === "swarm" || v === "on") return "swarm";
       if (v === "lite") return "lite";
       if (v === "off") return "off";
     }
@@ -765,11 +767,12 @@ export function writeXpMode(state: XpMode, statePath: string = getXpModeStatePat
 
 export function parseXpModeArg(args: string, current: XpMode): XpMode {
   const arg = (args ?? "").trim().toLowerCase();
-  if (arg === "on") return "on";
+  if (arg === "swarm") return "swarm";
+  if (arg === "on") return "swarm";
   if (arg === "off") return "off";
   if (arg === "lite") return "lite";
-  // Bare /xp toggles between on and off (lite is only set explicitly).
-  return current === "on" ? "off" : "on";
+  // Bare /xp is the low-ceremony path: toggle the default XP workflow on/off.
+  return current === "off" ? "swarm" : "off";
 }
 
 // ── Main extension ────────────────────────────────────────────────────
@@ -789,34 +792,37 @@ export default function casefileExtension(pi: ExtensionAPI) {
   setScratchpadRoot(workspaceRoot);
   process.env.PI_POC_ROOT ??= workspaceRoot;
 
-  // ── Diagnostic Error Handler Middleware ──
-  const originalRegisterTool = pi.registerTool.bind(pi);
-  pi.registerTool = (spec: any) => {
+  // ── Diagnostic Error Handler ──
+  const registerCaseTool = <TParams extends TSchema, TDetails = unknown, TState = unknown>(
+    spec: ToolDefinition<TParams, TDetails, TState>,
+  ) => {
     const origExecute = spec.execute;
-    spec.execute = async (...args: any[]) => {
-      try {
-        return await origExecute(...args);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        let hint = "";
-        if (
-          message.includes("SQLITE") ||
-          message.includes("database") ||
-          message.includes("permission") ||
-          message.includes("readonly") ||
-          message.includes("lock")
-        ) {
-          hint = `\n\nHint: A database access error occurred on the casefile SQLite ledger.\nTo troubleshoot:\n  1. Check filesystem read/write permissions for the database path: ${getCasefilePath()}.\n  2. If using a locked folder, you can override the ledger location by setting:\n     export PI_CASEFILE_PATH=/your/writable/directory/casefile.db`;
+    pi.registerTool({
+      ...spec,
+      execute: async (...args: Parameters<typeof origExecute>) => {
+        try {
+          return await origExecute(...args);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          let hint = "";
+          if (
+            message.includes("SQLITE") ||
+            message.includes("database") ||
+            message.includes("permission") ||
+            message.includes("readonly") ||
+            message.includes("lock")
+          ) {
+            hint = `\n\nHint: A database access error occurred on the casefile SQLite ledger.\nTo troubleshoot:\n  1. Check filesystem read/write permissions for the database path: ${getCasefilePath()}.\n  2. If using a locked folder, you can override the ledger location by setting:\n     export PI_CASEFILE_PATH=/your/writable/directory/casefile.db`;
+          }
+          throw new Error(`${spec.name} failed: ${message}${hint}`, { cause: err });
         }
-        throw new Error(`${spec.name} failed: ${message}${hint}`, { cause: err });
-      }
-    };
-    originalRegisterTool(spec);
+      },
+    });
   };
 
   // ── Tool: CaseAdd ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "CaseAdd",
     label: "Add Case",
     description:
@@ -870,7 +876,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
 
   // ── Tool: CaseUpdate ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "CaseUpdate",
     label: "Update Case",
     description:
@@ -925,7 +931,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
 
   // ── Tool: EvidenceAdd ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "EvidenceAdd",
     label: "Add Evidence Item",
     description:
@@ -945,7 +951,8 @@ export default function casefileExtension(pi: ExtensionAPI) {
         summary: params.summary as string,
         artifactPath: params.artifact_path as string | undefined,
       });
-      const record = getCaseById(params.case_id as string)!;
+      const record = getCaseById(params.case_id as string);
+      if (!record) throw new Error(`Case not found after evidence insert: ${params.case_id}`);
       return {
         content: [
           {
@@ -1018,7 +1025,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     { additionalProperties: false },
   );
 
-  pi.registerTool({
+  registerCaseTool({
     name: "CoverageAdd",
     label: "Record Coverage",
     description:
@@ -1040,7 +1047,8 @@ export default function casefileExtension(pi: ExtensionAPI) {
         note: params.note as string,
         evidenceItemId: params.evidence_item_id as string | undefined,
       });
-      const record = getCaseById(params.case_id as string)!;
+      const record = getCaseById(params.case_id as string);
+      if (!record) throw new Error(`Case not found after coverage insert: ${params.case_id}`);
       return {
         content: [
           {
@@ -1084,11 +1092,11 @@ export default function casefileExtension(pi: ExtensionAPI) {
     { additionalProperties: false },
   );
 
-  pi.registerTool({
+  registerCaseTool({
     name: "CoverageReport",
     label: "Coverage Matrix",
     description:
-      "Render the machine-checkable coverage matrix for a case: which (asset × attack-class) cells are tested, with wide-verdict propagation. Run before deciding the hunt/gapfill is done — the plateau stop (zero new classes testable) must be visible in the matrix, not asserted in prose.",
+      "Render the machine-checkable coverage matrix for a case: which (asset × attack-class) cells are tested, with wide-verdict propagation. Run before deciding HUNT coverage is done — the plateau stop (zero new classes testable) must be visible in the matrix, not asserted in prose.",
     promptSnippet: "Show which attack classes were tested where",
     promptGuidelines: [
       "Run CoverageReport before claiming 'every class is COVERED/SKIPPED/NOT_FOUND' — the claim must match the matrix.",
@@ -1133,239 +1141,249 @@ export default function casefileExtension(pi: ExtensionAPI) {
 
   // ── Tool: PromoteFinding (phase 1) ──
 
-  pi.registerTool({
-    name: "PromoteFinding",
-    label: "Run PoC Evidence",
-    description:
-      "Phase 1 of confirmation: run the same PoC twice against the case target and once against an operator-approved control_target, validate nonce-bound evidence.json with a response-body assertion, then have the harness execute one immutable HTTP request template against both target and control. The machine records a predicate differential, or a stronger canary differential when a reflection placeholder is requested and observed only on target; neither is automatically a vulnerability verdict. Exit 0 is necessary run integrity, never proof. Networked execution, controls, and private replay are operator-gated. Blind/OOB confirmation fails closed until source separation exists. Records a pending bundle for main-agent semantic review via ConfirmFinding.",
-    promptSnippet: "Phase 1: run PoC evidence (target x2 + control) and record the pending bundle",
-    promptGuidelines: [
-      "Use PromoteFinding when an investigating case has a concrete PoC script on disk and you are ready to subject its claim to the machine gate.",
-      "Prerequisites: status='investigating' and non-empty poc, evidence, impact, severity, target, plus an artifact-backed EvidenceAdd 'observation' item on the case (the initial signal, with artifact_path). The final disconfirmation comes from the main agent at confirm time.",
-      "The PoC MUST write evidence.json to $PI_POC_EVIDENCE_DIR: { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status?, body_contains/body_regex } }, observations }. A non-empty body predicate is mandatory; status-only evidence is rejected. verify.url must belong to the case target.",
-      "For reflection-capable requests, place {{PI_POC_CANARY}} exactly once in verify.url/body/header values and declare verify.canary={mode:'reflection',placeholder:'{{PI_POC_CANARY}}'}. The harness substitutes an unpredictable value only after the PoC exits and requires target-only reflection; the raw token is not persisted.",
-      "control_path (REQUIRED): the SAME script as poc_path. control_target must be pre-approved by the operator in PI_POC_CONTROL_TARGETS. The harness derives the control request from the target request, changes only its origin, and applies the same predicates to two conclusive responses.",
-      "local:true requires PI_POC_ALLOW_NETWORK=1. Private/internal harness replay additionally requires PI_POC_ALLOW_PRIVATE_REPLAY=1. Neither silently falls back to a model verdict.",
-      "Blind/OOB classes are not promotable through the built-in loopback listener because the PoC can self-call it; obtain a direct-response or state oracle, otherwise keep the case investigating.",
-      "After the bundle is recorded, return control to the main agent. The main agent must inspect the script/evidence, attempt disconfirmation, and call ConfirmFinding itself; that call performs a fresh harness-owned target/control replay. Never delegate phase 2 and never CaseUpdate status='confirmed' directly.",
-    ],
-    parameters: PromoteSchema,
+  if (!startedAsSubagent)
+    registerCaseTool({
+      name: "PromoteFinding",
+      label: "Run PoC Evidence",
+      description:
+        "Main-agent phase 1 of confirmation: run the same PoC twice against the case target and once against an operator-approved control_target, validate nonce-bound evidence.json with a response-body assertion, then have the harness execute one immutable HTTP request template against both target and control. control_path defaults to poc_path; if supplied, sha256 equality is enforced. The machine records a predicate differential, or a stronger canary differential when a reflection placeholder is requested and observed only on target; neither is automatically a vulnerability verdict. Exit 0 is necessary run integrity, never proof. Networked execution, controls, and private replay are operator-gated. Blind/OOB confirmation fails closed until source separation exists. Records a pending bundle for main-agent semantic review via ConfirmFinding. Worker/subagent processes are rejected.",
+      promptSnippet:
+        "Phase 1: run PoC evidence (target x2 + control) and record the pending bundle",
+      promptGuidelines: [
+        "Use PromoteFinding only from the main/coordinator agent when an investigating case has a concrete PoC script on disk and you are ready to subject its claim to the machine gate.",
+        "Prerequisites: status='investigating' and non-empty poc, evidence, impact, severity, target, plus an artifact-backed EvidenceAdd 'observation' item on the case (the initial signal, with artifact_path). The final disconfirmation comes from the main agent at confirm time.",
+        "The PoC MUST write evidence.json to $PI_POC_EVIDENCE_DIR: { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status?, body_contains/body_regex } }, observations }. A non-empty body predicate is mandatory; status-only evidence is rejected. verify.url must belong to the case target.",
+        "For reflection-capable requests, place {{PI_POC_CANARY}} exactly once in verify.url/body/header values and declare verify.canary={mode:'reflection',placeholder:'{{PI_POC_CANARY}}'}. The harness substitutes an unpredictable value only after the PoC exits and requires target-only reflection; the raw token is not persisted.",
+        "control_path is optional and defaults to poc_path; if supplied, it must be the SAME script as poc_path. control_target must be pre-approved by the operator in PI_POC_CONTROL_TARGETS. The harness derives the control request from the target request, changes only its origin, and applies the same predicates to two conclusive responses.",
+        "local:true requires PI_POC_ALLOW_NETWORK=1. Private/internal harness replay additionally requires PI_POC_ALLOW_PRIVATE_REPLAY=1. Neither silently falls back to a model verdict.",
+        "Blind/OOB classes are not promotable through the built-in loopback listener because the PoC can self-call it; obtain a direct-response or state oracle, otherwise keep the case investigating.",
+        "After the bundle is recorded, stay in the main agent: inspect the script/evidence, attempt disconfirmation, and call ConfirmFinding itself; that call performs a fresh harness-owned target/control replay. Never delegate validation/confirmation and never CaseUpdate status='confirmed' directly.",
+      ],
+      parameters: PromoteSchema,
 
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
-      // Validate promotability BEFORE running the PoC — each sandboxed run can
-      // take 30s (plus first-time image pull), so fail cheap when the case
-      // can't advance anyway (missing, wrong status, missing required fields,
-      // missing artifact-backed observation evidence).
-      const caseId = params.id as string;
-      const current = assertPromotable(caseId);
-
-      const fail = (text: string, _extra?: Record<string, unknown>): never => {
-        throw new Error(text);
-      };
-
-      const controlPath = (params.control_path as string | undefined)?.trim() ?? "";
-      const controlTarget = (params.control_target as string | undefined)?.trim() ?? "";
-      if (!controlPath) {
-        return fail(
-          "control_path is REQUIRED: the SAME script as poc_path (sha256-equality is ENFORCED), run by the harness with PI_POC_MODE=control and PI_POC_TARGET=control_target.",
-          { missingControl: true },
-        );
-      }
-      if (!controlTarget) {
-        return fail(
-          "control_target is REQUIRED: a distinct baseline target that lacks the vulnerability.",
-          { missingControlTarget: true },
-        );
-      }
-      if (controlTarget === current.target) {
-        return fail(
-          "control_target must differ from the case target; a control run against the vulnerable target proves nothing.",
-          { controlTargetEqualsCaseTarget: true },
-        );
-      }
-      if (params.local === true && process.env.PI_POC_ALLOW_NETWORK !== "1") {
-        return fail(
-          "Networked PoC execution is operator-gated. Set PI_POC_ALLOW_NETWORK=1 to authorize the host-network sandbox for this session.",
-          { networkNotAuthorized: true },
-        );
-      }
-      const controlAuthorization = controlTargetAuthorizationError(controlTarget);
-      if (controlAuthorization) {
-        return fail(
-          `CONTROL AUTHORIZATION FAILED: ${controlAuthorization}. ` +
-            "The operator must set PI_POC_CONTROL_TARGETS to the exact approved control host/origin before this control can anchor confirmation.",
-          { controlNotAuthorized: true },
-        );
-      }
-
-      // Same-file contract (anti-cheat): control must be the SAME bytes as the
-      // PoC, differing only via the harness-set env. Check BEFORE any run.
-      const pocPath = (params.poc_path as string | undefined)?.trim() ?? "";
-      let pocHash: string | undefined;
-      let controlHash: string | undefined;
-      try {
-        pocHash = createHash("sha256").update(readFileSync(pocPath)).digest("hex");
-        controlHash = createHash("sha256").update(readFileSync(controlPath)).digest("hex");
-      } catch (e) {
-        return fail(
-          `Cannot read PoC/control scripts for the same-file check: ${(e as Error).message}`,
-          { sameFileCheckFailed: true },
-        );
-      }
-      if (pocHash !== controlHash) {
-        return fail(
-          "CONTROL CHECK FAILED: control_path must be the SAME script as poc_path (sha256 mismatch). Case remains investigating.",
-          { controlHashMismatch: true },
-        );
-      }
-
-      // ── OOB callback (Tier 1, opt-in for blind classes) ──
-      const oobRequested = params.oob === true;
-      if (oobRequested) {
-        return fail(
-          "OOB confirmation is fail-closed: the built-in loopback listener is reachable by the PoC and cannot prove the target caused a callback. A source-separated, operator-owned callback service is required before blind findings can be promoted.",
-          { oobSourceSeparationRequired: true },
-        );
-      }
-      const runOptions = (pocMode: string, target: string): PocRunOptions => ({
-        network: params.local === true ? "host" : "none",
-        local: params.local === true,
-        env: {
-          PI_POC_MODE: pocMode,
-          PI_POC_TARGET: target,
-        },
-      });
-
-      const caseTarget = current.target ?? "";
-      let targetRuns!: [PocEvidenceRun, PocEvidenceRun];
-      let control!: PocEvidenceRun;
-      let harnessVerified!: HarnessVerifyResult;
-      // Determinism: TWO target runs + one control run. Exit 0 is run
-      // integrity only; nonce-bound body evidence and the harness-owned
-      // target/control replay form the machine gate.
-      const run1 = runPoc(pocPath, runOptions("poc", caseTarget));
-      const run2 = runPoc(pocPath, runOptions("poc", caseTarget));
-      const controlRun = runPoc(controlPath, runOptions("control", controlTarget));
-
-      const evidenceRun = (r: PocRun, mode: "poc" | "control", target: string): PocEvidenceRun => {
-        if (!r.completed || !r.outputComplete) {
-          return fail(
-            `${mode} run did not complete or output capture was incomplete` +
-              (r.infraError ? ` (infra: ${r.output.trim()})` : "") +
-              ". A crash is not evidence. Case remains investigating.",
-            { run: r, pocCrashed: true },
+      async execute(_id, params, _signal, _onUpdate, _ctx) {
+        if (isSubagentProcess()) {
+          throw new Error(
+            "PromoteFinding is reserved for the main/coordinator agent. A worker or subagent may gather evidence but cannot run validation or create a promotion bundle.",
           );
         }
-        if (r.evidenceError) {
-          return fail(
-            `EVIDENCE CONTRACT FAILED (${mode} run): ${r.evidenceError}. ` +
-              "The PoC must write evidence.json to $PI_POC_EVIDENCE_DIR — { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status?, body_contains / body_regex } }, observations }; a response-body assertion is mandatory — " +
-              "the file is bound to this run and validated by the harness. Case remains investigating.",
-            { run: r, evidenceError: r.evidenceError },
-          );
-        }
-        if (!r.evidence || !r.evidenceSha256 || !r.nonce) {
-          return fail(`${mode} run produced no evidence. Case remains investigating.`, {
-            run: r,
+        // Validate promotability BEFORE running the PoC — each sandboxed run can
+        // take 30s (plus first-time image pull), so fail cheap when the case
+        // can't advance anyway (missing, wrong status, missing required fields,
+        // missing artifact-backed observation evidence).
+        const caseId = params.id as string;
+        const current = assertPromotable(caseId);
+
+        const fail = (text: string, _extra?: Record<string, unknown>): never => {
+          throw new Error(text);
+        };
+
+        const pocPath = (params.poc_path as string | undefined)?.trim() ?? "";
+        const controlPath = (params.control_path as string | undefined)?.trim() || pocPath;
+        const controlTarget = (params.control_target as string | undefined)?.trim() ?? "";
+        if (!pocPath) {
+          return fail("poc_path is REQUIRED: absolute path to the PoC script run by the harness.", {
+            missingPocPath: true,
           });
         }
-        return {
-          mode,
-          target,
-          nonce: r.nonce,
-          ranAt: r.ranAt,
-          exitCode: r.exitCode,
-          sandbox: r.sandbox,
-          completed: r.completed,
-          outputComplete: r.outputComplete,
-          output: r.output ?? "",
-          evidence: r.evidence,
-          evidenceSha256: r.evidenceSha256,
-          evidencePath: r.evidencePath,
-        };
-      };
+        if (!controlTarget) {
+          return fail(
+            "control_target is REQUIRED: a distinct baseline target that lacks the vulnerability.",
+            { missingControlTarget: true },
+          );
+        }
+        if (controlTarget === current.target) {
+          return fail(
+            "control_target must differ from the case target; a control run against the vulnerable target proves nothing.",
+            { controlTargetEqualsCaseTarget: true },
+          );
+        }
+        if (params.local === true && process.env.PI_POC_ALLOW_NETWORK !== "1") {
+          return fail(
+            "Networked PoC execution is operator-gated. Set PI_POC_ALLOW_NETWORK=1 to authorize the host-network sandbox for this session.",
+            { networkNotAuthorized: true },
+          );
+        }
+        const controlAuthorization = controlTargetAuthorizationError(controlTarget);
+        if (controlAuthorization) {
+          return fail(
+            `CONTROL AUTHORIZATION FAILED: ${controlAuthorization}. ` +
+              "The operator must set PI_POC_CONTROL_TARGETS to the exact approved control host/origin before this control can anchor confirmation.",
+            { controlNotAuthorized: true },
+          );
+        }
 
-      targetRuns = [evidenceRun(run1, "poc", caseTarget), evidenceRun(run2, "poc", caseTarget)];
-      control = evidenceRun(controlRun, "control", controlTarget);
+        // Same-file contract (anti-cheat): control must be the SAME bytes as the
+        // PoC, differing only via the harness-set env. Check BEFORE any run.
+        let pocHash: string | undefined;
+        let controlHash: string | undefined;
+        try {
+          pocHash = createHash("sha256").update(readFileSync(pocPath)).digest("hex");
+          controlHash = createHash("sha256").update(readFileSync(controlPath)).digest("hex");
+        } catch (e) {
+          return fail(
+            `Cannot read PoC/control scripts for the same-file check: ${(e as Error).message}`,
+            { sameFileCheckFailed: true },
+          );
+        }
+        if (pocHash !== controlHash) {
+          return fail(
+            "CONTROL CHECK FAILED: control_path must be the SAME script as poc_path (sha256 mismatch). Case remains investigating.",
+            { controlHashMismatch: true },
+          );
+        }
 
-      // Tier 2 (docs/poc-trust-model.md): the harness executes the SAME
-      // request template against target and operator-approved control, applying
-      // the target's predicates to both. DNS is pinned at connect time.
-      harnessVerified = await replayDifferential(
-        targetRuns[0].evidence,
-        caseTarget,
-        controlTarget,
-        { allowPrivate: process.env.PI_POC_ALLOW_PRIVATE_REPLAY === "1" },
-      );
-
-      const bundle: PendingConfirmation = {
-        caseId,
-        ranAt: new Date().toISOString(),
-        pocPath,
-        pocSha256: pocHash,
-        controlPath,
-        controlTarget,
-        targetRuns,
-        controlRun: control,
-        harnessVerified,
-      };
-
-      let record: CaseRecord;
-      try {
-        record = storePendingConfirmation(caseId, bundle);
-      } catch (e) {
-        return fail(`Pending confirmation rejected: ${(e as Error).message}`, {
-          storeRejected: true,
+        // ── OOB callback (Tier 1, opt-in for blind classes) ──
+        const oobRequested = params.oob === true;
+        if (oobRequested) {
+          return fail(
+            "OOB confirmation is fail-closed: the built-in loopback listener is reachable by the PoC and cannot prove the target caused a callback. A source-separated, operator-owned callback service is required before blind findings can be promoted.",
+            { oobSourceSeparationRequired: true },
+          );
+        }
+        const runOptions = (pocMode: string, target: string): PocRunOptions => ({
+          network: params.local === true ? "host" : "none",
+          local: params.local === true,
+          env: {
+            PI_POC_MODE: pocMode,
+            PI_POC_TARGET: target,
+          },
         });
-      }
 
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              `Phase 1 complete — evidence bundle recorded on ${caseId} (expires in 1h).\n` +
-              `Target runs: 2, Control run: 1 — all with validated nonce-bound evidence.json.\n` +
-              `Evidence sha256: ${targetRuns[0].evidenceSha256}\n` +
-              `PoC script sha256 (at run time): ${pocHash}\n` +
-              `Harness verify replay: ${harnessVerified.attempted ? (harnessVerified.pass ? `PASS (status ${harnessVerified.status})` : `FAILED — ${harnessVerified.note}`) : harnessVerified.note}\n` +
-              `\nMAIN-AGENT REVIEW REQUIRED (do not delegate): inspect case ${caseId}, PoC ${pocPath}, control ${controlTarget}, evidence ${targetRuns[0].evidenceSha256}, and PoC hash ${pocHash}. Hunt for a trivial predicate or fabricated differential and perform a concrete disconfirmation attempt, then call ConfirmFinding yourself. A CONFIRMED call performs and stores a fresh harness-owned target/control replay; NOT_CONFIRMED keeps the case investigating.`,
+        const caseTarget = current.target ?? "";
+        // Determinism: TWO target runs + one control run. Exit 0 is run
+        // integrity only; nonce-bound body evidence and the harness-owned
+        // target/control replay form the machine gate.
+        const run1 = runPoc(pocPath, runOptions("poc", caseTarget));
+        const run2 = runPoc(pocPath, runOptions("poc", caseTarget));
+        const controlRun = runPoc(controlPath, runOptions("control", controlTarget));
+
+        const evidenceRun = (
+          r: PocRun,
+          mode: "poc" | "control",
+          target: string,
+        ): PocEvidenceRun => {
+          if (!r.completed || !r.outputComplete) {
+            return fail(
+              `${mode} run did not complete or output capture was incomplete` +
+                (r.infraError ? ` (infra: ${r.output.trim()})` : "") +
+                ". A crash is not evidence. Case remains investigating.",
+              { run: r, pocCrashed: true },
+            );
+          }
+          if (r.evidenceError) {
+            return fail(
+              `EVIDENCE CONTRACT FAILED (${mode} run): ${r.evidenceError}. ` +
+                "The PoC must write evidence.json to $PI_POC_EVIDENCE_DIR — { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status?, body_contains / body_regex } }, observations }; a response-body assertion is mandatory — " +
+                "the file is bound to this run and validated by the harness. Case remains investigating.",
+              { run: r, evidenceError: r.evidenceError },
+            );
+          }
+          if (!r.evidence || !r.evidenceSha256 || !r.nonce) {
+            return fail(`${mode} run produced no evidence. Case remains investigating.`, {
+              run: r,
+            });
+          }
+          return {
+            mode,
+            target,
+            nonce: r.nonce,
+            ranAt: r.ranAt,
+            exitCode: r.exitCode,
+            sandbox: r.sandbox,
+            completed: r.completed,
+            outputComplete: r.outputComplete,
+            output: r.output ?? "",
+            evidence: r.evidence,
+            evidenceSha256: r.evidenceSha256,
+            evidencePath: r.evidencePath,
+          };
+        };
+
+        const targetRuns: [PocEvidenceRun, PocEvidenceRun] = [
+          evidenceRun(run1, "poc", caseTarget),
+          evidenceRun(run2, "poc", caseTarget),
+        ];
+        const control = evidenceRun(controlRun, "control", controlTarget);
+
+        // Tier 2 (docs/poc-trust-model.md): the harness executes the SAME
+        // request template against target and operator-approved control, applying
+        // the target's predicates to both. DNS is pinned at connect time.
+        const harnessVerified = await replayDifferential(
+          targetRuns[0].evidence,
+          caseTarget,
+          controlTarget,
+          { allowPrivate: process.env.PI_POC_ALLOW_PRIVATE_REPLAY === "1" },
+        );
+
+        const bundle: PendingConfirmation = {
+          caseId,
+          ranAt: new Date().toISOString(),
+          pocPath,
+          pocSha256: pocHash,
+          controlPath,
+          controlTarget,
+          targetRuns,
+          controlRun: control,
+          harnessVerified,
+        };
+
+        let record: CaseRecord;
+        try {
+          record = storePendingConfirmation(caseId, bundle);
+        } catch (e) {
+          return fail(`Pending confirmation rejected: ${(e as Error).message}`, {
+            storeRejected: true,
+          });
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Phase 1 complete — evidence bundle recorded on ${caseId} (expires in 1h).\n` +
+                `Target runs: 2, Control run: 1 — all with validated nonce-bound evidence.json.\n` +
+                `Evidence sha256: ${targetRuns[0].evidenceSha256}\n` +
+                `PoC script sha256 (at run time): ${pocHash}\n` +
+                `Harness verify replay: ${harnessVerified.attempted ? (harnessVerified.pass ? `PASS (status ${harnessVerified.status})` : `FAILED — ${harnessVerified.note}`) : harnessVerified.note}\n` +
+                `\nMAIN-AGENT REVIEW REQUIRED (do not delegate): inspect case ${caseId}, PoC ${pocPath}, control ${controlTarget}, evidence ${targetRuns[0].evidenceSha256}, and PoC hash ${pocHash}. Hunt for a trivial predicate or fabricated differential and perform a concrete disconfirmation attempt, then call ConfirmFinding yourself. A CONFIRMED call performs and stores a fresh harness-owned target/control replay; NOT_CONFIRMED keeps the case investigating.`,
+            },
+          ],
+          details: {
+            record,
+            bundle: {
+              caseId,
+              ranAt: bundle.ranAt,
+              pocPath,
+              controlPath,
+              controlTarget,
+              pocSha256: pocHash,
+              evidenceSha256: targetRuns[0].evidenceSha256,
+              harnessVerified,
+            },
           },
-        ],
-        details: {
-          record,
-          bundle: {
-            caseId,
-            ranAt: bundle.ranAt,
-            pocPath,
-            controlPath,
-            controlTarget,
-            pocSha256: pocHash,
-            evidenceSha256: targetRuns[0].evidenceSha256,
-            harnessVerified,
-          },
-        },
-      };
-    },
+        };
+      },
 
-    renderCall(args, theme) {
-      return callLine(theme, "PromoteFinding", (args.id as string) ?? "");
-    },
+      renderCall(args, theme) {
+        return callLine(theme, "PromoteFinding", (args.id as string) ?? "");
+      },
 
-    renderResult(result, _opts, theme) {
-      const details = result.details as { bundle?: { evidenceSha256?: string } } | undefined;
-      if (!details?.bundle) {
-        return new Text(theme.fg("error", "✗ PromoteFinding failed"), 0, 0);
-      }
-      return new Text(
-        theme.fg("success", "✓ ") +
-          theme.fg("dim", "evidence bundle ") +
-          theme.fg("muted", details.bundle.evidenceSha256?.slice(0, 12) ?? ""),
-        0,
-        0,
-      );
-    },
-  });
+      renderResult(result, _opts, theme) {
+        const details = result.details as { bundle?: { evidenceSha256?: string } } | undefined;
+        if (!details?.bundle) {
+          return new Text(theme.fg("error", "✗ PromoteFinding failed"), 0, 0);
+        }
+        return new Text(
+          theme.fg("success", "✓ ") +
+            theme.fg("dim", "evidence bundle ") +
+            theme.fg("muted", details.bundle.evidenceSha256?.slice(0, 12) ?? ""),
+          0,
+          0,
+        );
+      },
+    });
 
   // ── Tool: ConfirmFinding (phase 2) ──
 
@@ -1373,7 +1391,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
   // execute-time check remains as defense in depth if process state changes
   // after registration or another integration forwards a stale tool handle.
   if (!startedAsSubagent)
-    pi.registerTool({
+    registerCaseTool({
       name: "ConfirmFinding",
       label: "Main-Agent Confirmation",
       description:
@@ -1392,7 +1410,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
       async execute(_id, params, _signal, _onUpdate, _ctx) {
         if (isSubagentProcess()) {
           throw new Error(
-            "ConfirmFinding is reserved for the main/coordinator agent. A worker or subagent may produce evidence but cannot confirm a PoC.",
+            "ConfirmFinding is reserved for the main/coordinator agent. A worker or subagent may gather or challenge evidence but cannot run validation or confirm a PoC.",
           );
         }
         const caseId = params.id as string;
@@ -1461,7 +1479,7 @@ ${formatCaseDetail(record)}`,
 
   // ── Tool: CaseGet ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "CaseGet",
     label: "Get Case",
     description: "Get full details of a single case by ID.",
@@ -1490,7 +1508,7 @@ ${formatCaseDetail(record)}`,
 
   // ── Tool: CaseList ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "CaseList",
     label: "List Cases",
     description:
@@ -1520,7 +1538,7 @@ ${formatCaseDetail(record)}`,
 
   // ── Tool: CaseSearch ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "CaseSearch",
     label: "Search Cases",
     description:
@@ -1548,7 +1566,7 @@ ${formatCaseDetail(record)}`,
 
   // ── Tool: CaseLink ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "CaseLink",
     label: "Link Cases",
     description:
@@ -1620,7 +1638,7 @@ ${formatCaseDetail(record)}`,
 
   // ── Tool: CaseUnlink ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "CaseUnlink",
     label: "Unlink Cases",
     description: "Remove a bidirectional link between two cases.",
@@ -1687,7 +1705,7 @@ ${formatCaseDetail(record)}`,
     { additionalProperties: false },
   );
 
-  pi.registerTool({
+  registerCaseTool({
     name: "ChainSuggest",
     label: "Suggest Exploit Chains",
     description:
@@ -1736,15 +1754,15 @@ ${formatCaseDetail(record)}`,
 
   // ── Tool: CaseContext ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "CaseContext",
     label: "Generate Case Context",
     description:
-      "Generate the case context bundle for a confirmed or reported case under the casefile report directory (next to the casefile DB): full evidence, PoC verification log, disconfirmation attempt, links, and timeline, plus the target report path. The report writer (reporter subagent) turns this context into the final polished H1-style report. Hypothesis/investigating/blocked/killed cases are rejected — promote to confirmed first.",
-    promptSnippet: "Generate case context for the report writer",
+      "Generate the case context bundle for a confirmed or reported case under the casefile report directory (next to the casefile DB): full evidence, PoC verification log, disconfirmation attempt, links, and timeline, plus the target report path. The main agent turns this context into the final polished H1-style report. Hypothesis/investigating/blocked/killed cases are rejected — promote to confirmed first.",
+    promptSnippet: "Generate case context for the final report",
     promptGuidelines: [
       "Use CaseContext only for confirmed or already reported cases. Keep hypotheses and investigating cases in the ledger until proof is captured.",
-      "After CaseContext, dispatch the reporter subagent (agents/reporter) to write the final report to the returned report path, then CaseUpdate(status: 'reported').",
+      "After CaseContext, write the final report to the returned report path yourself, then CaseUpdate(status: 'reported').",
     ],
     parameters: IdSchema,
 
@@ -1754,7 +1772,7 @@ ${formatCaseDetail(record)}`,
         content: [
           {
             type: "text",
-            text: `Case context written: ${contextPath}\nReport path (for the reporter agent): ${path}\n${formatCase(record)}`,
+            text: `Case context written: ${contextPath}\nReport path: ${path}\n${formatCase(record)}`,
           },
         ],
         details: { path, contextPath, record },
@@ -1779,7 +1797,7 @@ ${formatCaseDetail(record)}`,
 
   pi.registerCommand("xp", {
     description:
-      "Toggle casefile XP (offensive) mode. ON injects the full cyber workflow (subagent pipeline); LITE injects the single-agent workflow (no subagent dispatch); OFF (default) keeps context quiet for normal dev work. Usage: /xp [on|off|lite]",
+      "Toggle casefile XP (offensive) mode. Bare /xp and /xp on select SWARM, the bounded multi-agent workflow. LITE keeps XP single-agent. OFF (default) keeps context quiet for normal dev work. Usage: /xp [on|lite|swarm|off]",
     handler: async (args, ctx) => {
       const next = parseXpModeArg(args ?? "", readXpMode());
       writeXpMode(next);
@@ -1790,23 +1808,25 @@ ${formatCaseDetail(record)}`,
       if (next !== "off") workflowInjected = false;
       ctx.ui.notify(
         `Casefile XP mode: ${next.toUpperCase()} (takes effect on the next prompt)`,
-        next === "on" ? "info" : "warning",
+        next === "off" ? "warning" : "info",
       );
     },
   });
 
   // ── Tool: PipelineSubmit ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "PipelineSubmit",
     label: "Submit Stage Output",
     description:
       "Submit a pipeline stage's output (hunt, trace, skeptic, validate, chain, report) through the validation gate. Validates required fields against the stage spec (mirrors schemas/*.json), applies the deterministic pre-filter (test-path and file-existence filters on hunt findings, trivial dedup by file+class+line), and counts repair attempts (max 2, then rejected). A stage cannot advance on an invalid output — submit fixed output until accepted.",
     promptSnippet: "Validate and submit a pipeline stage's output",
     promptGuidelines: [
-      "Every stage output a subagent returns must go through PipelineSubmit before the next stage is dispatched — do not eyeball schemas.",
+      "Every delegated stage output and every main-agent VALIDATE/REPORT output must go through PipelineSubmit before the next stage starts — do not eyeball schemas.",
       "verdict repair → fix the listed fields and re-submit the same output; budget is 2 attempts per finding, then rejected.",
-      "Skeptic: unparseable/schema-invalid = UNDETERMINED (never DISPROVEN). Tracer error = UNREACHABLE. Both return repair.",
+      "Skeptic: unparseable/schema-invalid = no verdict (repair/re-dispatch); only schema-valid DISPROVEN kills, and schema-valid UNDETERMINED blocks validation.",
+      "Tracer crash/invalid output = no trace verdict; repair or re-dispatch.",
+      'Only schema-valid trace_result: "UNREACHABLE" blocks advancement as a proven unreachable path; schema-valid UNDETERMINED blocks validation until resolved.',
       "Test-path findings and hallucinated files are rejected by the pre-filter, not repairable — the finding itself is noise.",
     ],
     parameters: Type.Object(
@@ -1866,7 +1886,7 @@ ${formatCaseDetail(record)}`,
 
   // ── Tool: ScratchpadInit ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "ScratchpadInit",
     label: "Init Scratchpad",
     description:
@@ -1904,7 +1924,7 @@ ${formatCaseDetail(record)}`,
 
   // ── Tool: ScratchpadResume ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "ScratchpadResume",
     label: "Resume Scratchpad",
     description:
@@ -1963,7 +1983,7 @@ ${formatCaseDetail(record)}`,
 
   // ── Tool: ScratchpadCheckpoint ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "ScratchpadCheckpoint",
     label: "Checkpoint Phase",
     description:
@@ -2013,7 +2033,7 @@ ${formatCaseDetail(record)}`,
 
   // ── Tool: ScratchpadWrite ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "ScratchpadWrite",
     label: "Write Artifact",
     description:
@@ -2059,7 +2079,7 @@ ${formatCaseDetail(record)}`,
 
   // ── Tool: ScratchpadRead ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "ScratchpadRead",
     label: "Read Artifact",
     description:
@@ -2116,7 +2136,7 @@ ${formatCaseDetail(record)}`,
 
   // ── Tool: ScratchpadPhaseDone ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "ScratchpadPhaseDone",
     label: "Phase Done?",
     description:
@@ -2159,7 +2179,7 @@ ${formatCaseDetail(record)}`,
 
   // ── Tool: ScratchpadClear ──
 
-  pi.registerTool({
+  registerCaseTool({
     name: "ScratchpadClear",
     label: "Clear Run",
     description:

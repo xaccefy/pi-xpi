@@ -87,6 +87,12 @@ describe("pipeline_submit > schemas/*.json parity with SPECS", () => {
     ]);
   });
 
+  it("hunt vuln_class is agent-chosen, not enum-restricted", () => {
+    const schema = loadSchema("hunt");
+    expect(schema.properties?.vuln_class?.enum).toBeUndefined();
+    expect(SPECS.hunt.required.find((field) => field.name === "vuln_class")?.enum).toBeUndefined();
+  });
+
   it("stages with conditionals: JSON allOf mirrors SPECS.conditional", () => {
     for (const stage of Object.keys(SPECS) as SubmitStage[]) {
       const conditional = SPECS[stage].conditional ?? [];

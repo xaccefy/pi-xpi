@@ -34,7 +34,7 @@ For each chain you identify, output:
 
 ```
 Chain: <title>
-Severity: <low|medium|high|critical>  (max step severity; escalate one level ONLY with PoC-cited justification)
+Severity: <low|medium|high|critical>  (maximum proven combined impact, cited to confirmed step evidence)
 Steps: [case-id-1, case-id-2, ...] (in exploit order)
 blocked_by_controls: [control names, or empty if none]
 Narrative: <one-paragraph explanation of the chain>
@@ -57,10 +57,10 @@ CaseAdd(
 ```
 (`disproveIf` is required on every CaseAdd.)
 
-**Chain severity rules — from proven step severities, never inflate:**
-- Chain severity = **highest severity among its confirmed steps**. Two `high` findings = `high`, not `critical`.
-- Escalate ONE level above the highest step ONLY if the narrative proves strictly greater impact than any single step, citing the specific PoC output from each step.
-- "Could enable"/"might allow"/"theoretically" = NOT proven → keep the highest step severity.
+**Chain severity rules — maximum proven combined impact, never speculation:**
+- Start from the confirmed step evidence, then rate the chain by the highest impact an attacker can actually reach by executing the steps together.
+- Escalate above any individual step when the confirmed outputs prove a strictly greater end state (for example, info leak + IDOR → account takeover, SSRF + metadata read → cloud credential exposure). Cite the exact case IDs and evidence that bridge the steps.
+- "Could enable"/"might allow"/"theoretically" = NOT proven → cap severity at the highest proven reachable impact, not the imagined escalation.
 - Chains are analysis artifacts, not separately-PoCed vulns: they stay `hypothesis`, never promoted via `PromoteFinding`. Severity is justified by the confirmed step findings' recorded evidence and impact, captured in `summary`.
 
 Then link each step to the chain:

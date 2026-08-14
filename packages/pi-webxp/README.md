@@ -13,7 +13,7 @@ Or via the XPI umbrella package: `pi install npm:@xaccefy/pi-xpi`
 ## Tools
 
 ### `web_search`
-Search engines through the local `open-websearch` daemon (no API key).
+Search engines through a local `open-websearch` daemon (no API key). The daemon starts lazily on the first `web_search` or `web_fetch` call.
 
 - `query` (required)
 - `limit` (optional, default 10)
@@ -77,7 +77,8 @@ Stateful HTTP request with a persistent cookie jar, full method/header/body cont
 
 ## Lifecycle
 
-- **session_start**: tries to start the `open-websearch` daemon (non-blocking).
+- **session_start**: resets lazy daemon state only; it does not open a local listener.
+- **first `web_search` / `web_fetch` call**: starts the `open-websearch` daemon if one is not already reachable.
 - **session_shutdown**: stops the daemon this extension started.
 
 ## Development

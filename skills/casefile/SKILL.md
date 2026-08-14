@@ -15,9 +15,9 @@ Use Casefile to maintain durable security investigation state across agent turns
 1. Check existing cases before opening a new one with CaseList or CaseSearch.
 2. Open new leads with CaseAdd as `hypothesis` or `investigating`.
 3. Promote cases with CaseUpdate only after materially new evidence, proof, impact, blockers, remediation, or status changes.
-4. Mark `confirmed` only via the two-phase gate — `PromoteFinding` (PoC 2× target + 1× operator-approved control, nonce-bound body evidence, then a DNS-pinned conclusive `target_only` replay; use the post-PoC harness-generated canary for reflection-capable requests) → the main agent personally reviews → `ConfirmFinding`, which captures a fresh second harness replay before commit. Never delegate phase 2; worker calls are rejected. Exit zero is run integrity, never vulnerability proof. A predicate differential is evidence, not an automatic exploit verdict. Blind/OOB findings remain investigating without a source-separated oracle.
+4. Mark `confirmed` only via the two-phase gate — main-agent `PromoteFinding` (PoC 2× target + 1× operator-approved control, nonce-bound body evidence, then a DNS-pinned conclusive `target_only` replay; use the post-PoC harness-generated canary for reflection-capable requests) → the main agent personally reviews → `ConfirmFinding`, which captures a fresh second harness replay before commit. Never delegate validation or confirmation; worker/subagent gate calls are rejected. Exit zero is run integrity, never vulnerability proof. A predicate differential is evidence, not an automatic exploit verdict. Blind/OOB findings remain investigating without a source-separated oracle.
 5. Use CaseLink and CaseUnlink for exploit chains. Do not edit linked case IDs directly.
-6. Use CaseContext only for confirmed or already reported cases: it writes the full context bundle (complete record, verification logs, links, pipeline artifacts) and records the report path. Then have the report written (reporter agent in the full pipeline; yourself in lite mode) and CaseUpdate status=`reported`.
+6. Use CaseContext only for confirmed or already reported cases: it writes the full context bundle (complete record, verification logs, links, pipeline artifacts) and records the report path. Then write the report and CaseUpdate status=`reported`.
 7. Use `killed` for disproven, duplicate, or dead-end leads, and include evidence, blockers, next step, or assumptions explaining why.
 
 ## State machine
@@ -43,4 +43,4 @@ hypothesis → investigating → confirmed → reported
 - `CaseSearch`: search all fields or a scoped field.
 - `CaseLink`: bidirectionally link two cases.
 - `CaseUnlink`: remove a bidirectional case link.
-- `CaseContext`: write the case context bundle (complete record, PoC/disconfirmation logs, links, pipeline artifacts) for a confirmed or reported case and record the report path for the report writer.
+- `CaseContext`: write the case context bundle (complete record, PoC/disconfirmation logs, links, pipeline artifacts) for a confirmed or reported case and record the report path for the main agent.

@@ -137,6 +137,7 @@ function validRegexArray(v: unknown): v is string[] {
     boundedStringArray(v, MAX_REGEX_VALUES, MAX_REGEX_CHARS) &&
     v.every((re) => {
       try {
+        // nosemgrep: javascript.lang.security.audit.detect-non-literal-regexp.detect-non-literal-regexp -- compile-only validation; evaluation runs in a worker with a hard timeout.
         new RegExp(re);
         return true;
       } catch {

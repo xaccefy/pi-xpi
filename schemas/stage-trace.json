@@ -8,8 +8,8 @@
   "properties": {
     "trace_result": {
       "type": "string",
-      "enum": ["REACHABLE", "UNREACHABLE"],
-      "description": "Whether attacker-controlled input reaches the sink"
+      "enum": ["REACHABLE", "UNREACHABLE", "UNDETERMINED"],
+      "description": "REACHABLE = attacker-controlled input reaches the sink. UNREACHABLE = a concrete defense, deployment boundary, or missing sink blocks the path. UNDETERMINED = tracer could not resolve reachability with available evidence; validation must wait for re-dispatch or main-agent resolution."
     },
     "entry_point": {
       "type": "string",
@@ -52,6 +52,10 @@
     "unreachable_reason": {
       "type": "string",
       "description": "Why the sink is unreachable (required when UNREACHABLE)"
+    },
+    "uncertainty_reason": {
+      "type": "string",
+      "description": "Why reachability could not be resolved (required when UNDETERMINED); validation must wait for re-dispatch or main-agent resolution."
     }
   },
   "allOf": [
@@ -62,6 +66,10 @@
     {
       "if": { "properties": { "trace_result": { "const": "UNREACHABLE" } } },
       "then": { "required": ["unreachable_reason"] }
+    },
+    {
+      "if": { "properties": { "trace_result": { "const": "UNDETERMINED" } } },
+      "then": { "required": ["uncertainty_reason"] }
     }
   ]
 }

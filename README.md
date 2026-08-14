@@ -26,7 +26,8 @@ Works on **Pi Agent** and its fork **OMP** (`@oh-my-pi/pi-coding-agent`). One ma
 
 ```bash
 ./install.sh            # auto-detects pi or omp in PATH
-./install.sh --pi       # force Pi  (adds pi-subagents + optional fff search)
+./install.sh --pi       # force Pi  (installs pi-subagents + optional fff search)
+./install.sh --pi --no-subagents  # minimal Pi install; use /xp lite because swarm dispatch is unavailable
 ./install.sh --omp      # force OMP (copies agents/*.md to ~/.omp/agent/agents)
 ```
 
@@ -42,11 +43,12 @@ Set `PREVIEW_IS_API_KEY` for `exploit_search` (see [docs/guide.md](docs/guide.md
 ## Quick start
 
 ```
-/xp on     # enable the cyber workflow (subagent pipeline)
-/xp lite   # single-agent variant
+/xp        # toggle bounded swarm XP mode on/off
+/xp lite   # explicit single-agent security workflow
+/xp swarm  # bounded multi-agent pipeline
 ```
 
-On Pi, `/xp on` dispatches specialist subagents via pi-subagents; on OMP it uses the native `task` tool with the same agent names (auditor, tracer, skeptic, exploit, chain, reporter — installed by `install.sh --omp`). PoC confirmation itself is deliberately not delegated: the main agent performs phase 2, whose `ConfirmFinding` call captures a fresh harness-owned target/control replay.
+Use `/xp` for the default bounded swarm workflow, or `/xp lite` for CTFs, focused reviews, and one-target work where dispatch is unnecessary. On Pi, swarm dispatches only `auditor`, `tracer`, `skeptic`, and `chain` via pi-subagents; on OMP it uses the native `task` tool with the same four agent names. Validation, patching, reporting, and `ConfirmFinding` stay with the main agent.
 
 Full tool reference, configuration, and pipeline docs: **[docs/guide.md](docs/guide.md)**.
 

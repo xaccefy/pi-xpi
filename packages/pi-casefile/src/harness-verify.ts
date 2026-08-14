@@ -1,12 +1,12 @@
 /**
  * Harness-side target/control replay — Tier 2 of docs/poc-trust-model.md.
  *
- * The machine floor cannot trust a worker's self-reported `re_executed`
+ * The machine floor cannot trust a caller's self-reported `re_executed`
  * boolean. This module makes the HARNESS re-send the evidence's `verify`
  * request with its own HTTP client and apply the same `expect` predicates
  * (status / body_contains / body_regex) to target and control responses. The
- * worker supplies the predicate; the harness owns both evidence acquisition
- * and predicate execution. The main agent performs the later semantic review.
+ * main agent supplies the predicate; the harness owns both evidence acquisition
+ * and predicate execution before the later semantic review.
  *
  * Policy:
  * - Private/internal hosts require explicit operator authorization; otherwise

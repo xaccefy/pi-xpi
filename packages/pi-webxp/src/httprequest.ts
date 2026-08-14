@@ -285,6 +285,7 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
           // TLS bypass on Bun: the dispatcher (with rejectUnauthorized:false for
           // Node) is ignored there, so the `tls` init option is the only path.
           if (!verifyTls && isBun) {
+            // nosemgrep: problem-based-packs.insecure-transport.js-node.bypass-tls-verification.bypass-tls-verification -- explicit verifyTls=false tool option for self-signed/internal test targets; default is verifyTls=true.
             (init as RequestInit & { tls?: unknown }).tls = { rejectUnauthorized: false };
           }
 

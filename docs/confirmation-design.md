@@ -4,10 +4,10 @@
 
 ## 1. Authority invariant
 
-Only the main/coordinator agent may decide whether a PoC is confirmed.
+Only the main/coordinator agent may run validation gates or decide whether a PoC is confirmed.
 
-- A worker may write and run a PoC and call `PromoteFinding` to create a pending evidence bundle.
-- A worker must report `pending_confirmation`; it cannot report or commit `confirmed`.
+- The main agent writes/runs the PoC and calls `PromoteFinding` to create a pending evidence bundle.
+- A worker or subagent may gather artifacts or challenge evidence, but it cannot call `PromoteFinding`, report `pending_confirmation`, or commit `confirmed`.
 - No confirmation worker is dispatched. `agents/confirmer.md` is intentionally absent.
 - The main agent must inspect the exact PoC and preserved evidence, attempt to disprove the claim, and call `ConfirmFinding` itself; that main-only call captures the fresh target/control replay.
 - `CaseUpdate(status: "confirmed")` remains invalid.
@@ -17,7 +17,7 @@ The machine gate establishes a reproducible evidence floor. The main agent owns 
 ## 2. Trust chain
 
 ```text
-worker's PoC
+main-agent PoC
   → complete zero-exit execution with complete output capture
   → nonce-bound, schema-valid evidence.json with a body predicate
   → two deterministic target runs and one same-byte-script control run
@@ -69,12 +69,12 @@ The contract is bounded and strict. A discriminating `body_contains` or `body_re
 
 For reflection-capable findings, `verify.canary` strengthens causality. The fixed placeholder must occur exactly once in the URL, body, or a header value. Only after the PoC process exits, the harness generates an unpredictable token, substitutes it into its own replay, and requires the token to appear in the target response but not the control response. The raw token is never persisted—only its SHA-256 and the target/control observations are stored. This produces `proofStrength: "canary_differential"`; evidence without a canary is honestly labeled `predicate_differential`.
 
-## 4. Phase 1 — worker-capable evidence production
+## 4. Phase 1 — main-agent evidence production
 
 `PromoteFinding` does not promote the case. It:
 
 1. Checks the case prerequisites and requires an earlier artifact-backed observation.
-2. Requires `poc_path` and `control_path` to contain identical bytes.
+2. Defaults `control_path` to `poc_path`; if an override is supplied, both paths must contain identical bytes.
 3. Requires `control_target` to be distinct and present in the operator-owned `PI_POC_CONTROL_TARGETS` allowlist.
 4. Runs the PoC twice against the target and once against the control.
 5. Requires every run to complete, capture all output, exit zero, and produce valid nonce-bound evidence.
@@ -106,11 +106,11 @@ On `CONFIRMED`, the tool re-sends the immutable request against the target and a
 
 The design uses several independent controls:
 
-- Worker agent definitions omit `ConfirmFinding`.
-- Workflow text forbids delegating phase 2.
-- The extension captures `PI_SUBAGENT_CHILD` when it initializes and omits `ConfirmFinding` when that snapshot says worker. Its role check is monotonic (`started as worker` OR `currently marked worker`), so unsetting the variable in a child shell cannot upgrade the already-running extension.
+- Worker agent definitions omit `PromoteFinding` and `ConfirmFinding`.
+- Workflow text forbids delegating validation or confirmation.
+- The extension captures `PI_SUBAGENT_CHILD` when it initializes and omits `PromoteFinding` and `ConfirmFinding` when that snapshot says worker. Its role check is monotonic (`started as worker` OR `currently marked worker`), so unsetting the variable in a child shell cannot upgrade the already-running extension.
 - The ledger captures the same module-start role and independently checks the authority snapshot supplied by the extension before committing.
-- Validation-stage worker output has `pending_confirmation`, not `confirmed`.
+- Validation-stage worker output is no longer accepted; the main agent runs PromoteFinding and owns the pending bundle.
 - The ledger is the only component that can transition the case to `confirmed`, and it records main-agent provenance.
 
 The `confirmer_verdict_json` database column and a few internal `confirmerVerdict` identifiers are retained for backward compatibility with existing casefiles. They do not represent a confirmer worker.

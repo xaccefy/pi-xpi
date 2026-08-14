@@ -12,8 +12,8 @@
     },
     "verdict": {
       "type": "string",
-      "enum": ["CONFIRMED", "DISPROVEN"],
-      "description": "CONFIRMED = skeptic agrees the finding is real and reachable. DISPROVEN = skeptic found it to be a false positive, overstated, or unreachable."
+      "enum": ["CONFIRMED", "DISPROVEN", "UNDETERMINED"],
+      "description": "CONFIRMED = skeptic found no concrete disproof after independent review. DISPROVEN = skeptic found it to be a false positive, overstated, or unreachable. UNDETERMINED = skeptic could not resolve the review and the finding must not advance to validation yet."
     },
     "reasoning": {
       "type": "string",
@@ -21,7 +21,7 @@
     },
     "evidence_reviewed": {
       "type": "array",
-      "description": "Source files the skeptic independently opened and read to reach the verdict.",
+      "description": "Source files, endpoints, or artifacts the skeptic independently reviewed to reach the verdict.",
       "items": { "type": "string" },
       "minItems": 1
     },
@@ -48,6 +48,10 @@
         "refuted"
       ],
       "description": "Why the finding is disproven (required when verdict is DISPROVEN)"
+    },
+    "uncertainty_reason": {
+      "type": "string",
+      "description": "Why the skeptic could not resolve the review (required when verdict is UNDETERMINED); validation must wait for re-dispatch or main-agent resolution."
     }
   },
   "allOf": [
@@ -58,6 +62,10 @@
     {
       "if": { "properties": { "verdict": { "const": "CONFIRMED" } } },
       "then": { "required": ["disconfirmation_attempt"] }
+    },
+    {
+      "if": { "properties": { "verdict": { "const": "UNDETERMINED" } } },
+      "then": { "required": ["uncertainty_reason"] }
     }
   ]
 }

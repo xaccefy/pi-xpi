@@ -1,7 +1,7 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Stage Validation",
-  "description": "Result of adversarial validation from the exploit agent. Produces a pending machine-evidence bundle or kills the lead; only the main agent can semantically confirm it. Later records the patch.",
+  "description": "Result of main-agent adversarial validation. Produces a pending machine-evidence bundle or kills the lead; only the main agent can semantically confirm it. Later records the patch.",
   "type": "object",
   "additionalProperties": false,
   "required": ["finding_id", "status", "technique_used", "detection_method"],
@@ -30,7 +30,7 @@
     },
     "evidence_extracted": {
       "type": "string",
-      "description": "Data extracted or state changed that supports the pending claim; the worker does not decide confirmation"
+      "description": "Data extracted or state changed that supports the pending claim; this stage output does not decide confirmation"
     },
     "kill_reason": {
       "type": "string",

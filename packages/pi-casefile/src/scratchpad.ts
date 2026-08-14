@@ -16,7 +16,7 @@
  *     verify/     — PoC logs, run outputs (validate phase)
  *     chain/      — exploit-chain analysis
  *     patch/      — remediation work
- *     report/     — report-writer context
+ *     report/     — final report context
  *     state.json  — checkpoint file with phase completion + key IDs
  *
  * Resume re-reads scratchpad artifacts; it does not re-run completed phases
@@ -73,7 +73,9 @@ export interface ScratchpadResume {
 
 // ── Constants ────────────────────────────────────────────────────────
 
-export const PHASE_ORDER: ScratchpadPhase[] = [
+// All accepted artifact buckets. Some are legacy/manual-only and should not be
+// scheduled by ScratchpadResume for new swarm runs.
+export const SCRATCHPAD_PHASES: ScratchpadPhase[] = [
   "recon",
   "hunt",
   "gapfil",
@@ -82,6 +84,17 @@ export const PHASE_ORDER: ScratchpadPhase[] = [
   "validate",
   "chain",
   "patch",
+  "report",
+];
+
+// Active pipeline order for new/resumed runs.
+export const PHASE_ORDER: ScratchpadPhase[] = [
+  "recon",
+  "hunt",
+  "trace",
+  "skeptic",
+  "validate",
+  "chain",
   "report",
 ];
 
@@ -218,7 +231,7 @@ function ensureRunDirs(runDir: string): void {
   const projectRoot = dirname(scratchpadRoot);
   const runName = basename(runDir);
   ensureSafeStateDirectory(projectRoot, [SCRATCHPAD_DIR, runName]);
-  for (const phase of PHASE_ORDER) {
+  for (const phase of SCRATCHPAD_PHASES) {
     ensureSafeStateDirectory(projectRoot, [SCRATCHPAD_DIR, runName, PHASE_DIRS[phase]]);
   }
 }
@@ -242,7 +255,7 @@ function readCheckpointRaw(runId: string, projectRoot?: string): ScratchpadCheck
     throw new Error(`Corrupt scratchpad state for ${runId}: completed_phases must be an array`);
   }
   for (const phase of cp.completed_phases) {
-    if (!PHASE_ORDER.includes(phase)) {
+    if (!SCRATCHPAD_PHASES.includes(phase)) {
       throw new Error(`Corrupt scratchpad state for ${runId}: invalid phase ${phase}`);
     }
   }
@@ -399,7 +412,7 @@ export function scratchpad_checkpoint(
   if (!cp.completed_phases.includes(phase)) {
     cp.completed_phases.push(phase);
     // Keep completed_phases in pipeline order for predictable resume.
-    cp.completed_phases.sort((a, b) => PHASE_ORDER.indexOf(a) - PHASE_ORDER.indexOf(b));
+    cp.completed_phases.sort((a, b) => SCRATCHPAD_PHASES.indexOf(a) - SCRATCHPAD_PHASES.indexOf(b));
   }
   cp.last_phase_at = new Date().toISOString();
   if (data.ids) cp.phase_ids[phase] = data.ids;

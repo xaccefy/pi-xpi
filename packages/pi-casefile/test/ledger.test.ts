@@ -1943,7 +1943,7 @@ describe("casefile sqlite ledger", () => {
       disconfirmation: "Checked if data is public by default; it is not.",
     });
     promote(live.id);
-    // CaseContext records reportPath; the report writer then creates the file
+    // CaseContext records reportPath; the main agent then creates the file
     // (the confirmed→reported gate requires it on disk AND passing the content
     // gate: non-trivial size, required sections, no internal identifiers).
     const { path } = writeCaseContext(live.id);
@@ -2134,9 +2134,9 @@ describe("casefile sqlite ledger", () => {
       !context.includes(join(tempDir, "poc.sh")),
       "context must NOT leak the absolute PoC path",
     );
-    // The report path is reserved for the reporter agent; the report file does
-    // not exist until the reporter writes it.
-    assert.ok(!existsSync(path), "report file not yet written (reporter writes it)");
+    // The report path is reserved for the main agent's final report; the report file
+    // does not exist until the writer creates it.
+    assert.ok(!existsSync(path), "report file not yet written");
   });
 
   it("writeCaseContext surfaces a run whose artifacts name the case even when phase_ids are empty", () => {
