@@ -79,6 +79,9 @@ jobs:
 
       - name: Publish workspaces in dependency order, then umbrella
         env:
+          # The committed .npmrc authenticates with ${NPM_TOKEN}; NODE_AUTH_TOKEN
+          # is what actions/setup-node wires up. Provide both, scoped to this step.
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           echo "Authenticated to npm as: $(npm whoami)"
