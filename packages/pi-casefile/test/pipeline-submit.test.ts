@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 
 import { pipeline_submit } from "../src/pipeline-submit.ts";
-import { scratchpad_init, scratchpad_read, setScratchpadRoot } from "../src/scratchpad.ts";
+import { scratchpad_init, setScratchpadRoot } from "../src/scratchpad.ts";
 
 let tempDir: string;
 
@@ -73,6 +73,16 @@ describe("pipeline_submit", () => {
     assert.ok(res.errors.some((e) => e.includes("confidence")));
   });
 
+  it("returns repair for an unknown top-level field", () => {
+    const res = pipeline_submit("run-1", "hunt", {
+      ...VALID_HUNT,
+      confidence: "high",
+      invented_by_agent: true,
+    });
+    assert.strictEqual(res.verdict, "repair");
+    assert.ok(res.errors.includes("invented_by_agent: unknown top-level field"));
+  });
+
   it("enforces the locator XOR: file+line OR endpoint, not both/neither", () => {
     const both = { ...VALID_HUNT, vuln_class: "xss", endpoint: "GET /api/users" };
     const resBoth = pipeline_submit("run-1", "hunt", both);
@@ -131,10 +141,10 @@ describe("pipeline_submit", () => {
     assert.ok(res.errors.some((e) => e.includes("unreachable_reason")));
   });
 
-  it("validate confirmed requires poc_path + run_log + evidence_extracted", () => {
+  it("validate pending_confirmation requires poc_path + run_log + evidence_extracted", () => {
     const res = pipeline_submit("run-1", "validate", {
       finding_id: "case_1",
-      status: "confirmed",
+      status: "pending_confirmation",
       technique_used: "error-based",
       detection_method: "response diff",
     });
@@ -284,11 +294,11 @@ describe("pipeline_submit", () => {
     assert.ok(readFileSync(res.artifact, "utf8").includes("CONFIRMED"));
   });
 
-  it('junk ids ("false") never merge distinct findings into one artifact or repair bucket', () => {
+  it('junk ids ("false") are rejected without merging distinct repair buckets', () => {
     withRealFile({});
-    // Two DISTINCT findings that both claim finding_id "false" (observed in a
-    // real run: every submission keyed hunt:false). They must get distinct
-    // content-hash keys and distinct artifacts — no last-write-wins clobber.
+    // Hunt does not allow finding_id, and the value "false" carries no useful
+    // identity anyway. Distinct invalid submissions still need independent
+    // content-hash repair buckets so one cannot exhaust the other's budget.
     const a = pipeline_submit("run-1", "hunt", {
       ...VALID_HUNT,
       vuln_class: "injection",
@@ -301,18 +311,15 @@ describe("pipeline_submit", () => {
       sink: "innerHTML(b)",
       finding_id: "false",
     });
-    assert.strictEqual(a.verdict, "accepted");
-    assert.strictEqual(b.verdict, "accepted");
+    assert.strictEqual(a.verdict, "repair");
+    assert.strictEqual(b.verdict, "repair");
+    assert.strictEqual(a.repair_attempt, 1);
+    assert.strictEqual(b.repair_attempt, 1);
+    assert.ok(a.errors.some((e) => e.startsWith("finding_id: unknown")));
+    assert.ok(b.errors.some((e) => e.startsWith("finding_id: unknown")));
     assert.notStrictEqual(a.key, b.key, "distinct findings must not share a key");
-    assert.notStrictEqual(a.artifact, b.artifact, "distinct findings must not share an artifact");
-    assert.ok(a.artifact && !a.artifact.includes(":"), "artifact name sanitized (no colon)");
-    const aBack = scratchpad_read("run-1", "hunt", (a.artifact ?? "").split("/").pop() ?? "");
-    const bBack = scratchpad_read("run-1", "hunt", (b.artifact ?? "").split("/").pop() ?? "");
-    assert.ok(aBack?.includes("db.query(a)"), "first artifact content preserved");
-    assert.ok(bBack?.includes("innerHTML(b)"), "second artifact content preserved");
 
-    // Same junk id on a REJECTED (unparseable) submission no longer shares the
-    // repair budget with the accepted ones.
+    // Unparseable output has its own fixed bucket as well.
     const bad = pipeline_submit("run-1", "hunt", "not json{");
     assert.strictEqual(bad.repair_attempt, 1);
     assert.strictEqual(bad.key, "hunt:unparseable");

@@ -3,6 +3,7 @@
   "title": "Stage Skeptic",
   "description": "Adversarial disconfirmation verdict from the skeptic subagent. Runs between TRACE and VALIDATE for confidence == high (severity doesn't exist yet; it's assigned only after the PoC runs). The skeptic independently re-reads source — or re-probes live endpoints read-only — and tries to disprove the finding.",
   "type": "object",
+  "additionalProperties": false,
   "required": ["finding_id", "verdict", "reasoning", "evidence_reviewed"],
   "properties": {
     "finding_id": {
@@ -32,14 +33,19 @@
       "type": "string",
       "enum": [
         "unreachable",
+        "intended_behavior",
+        "duplicate",
         "framework_protection",
         "input_validation_blocks",
         "requires_privilege_attacker_lacks",
-        "intended_behavior",
-        "overstated_impact",
-        "duplicate",
+        "exploit_unreliable",
+        "insufficient_impact",
+        "environmental_issue",
+        "not_applicable",
+        "out_of_scope",
         "test_artifact",
-        "out_of_scope"
+        "no_attack_path",
+        "refuted"
       ],
       "description": "Why the finding is disproven (required when verdict is DISPROVEN)"
     }

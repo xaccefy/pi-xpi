@@ -13,7 +13,7 @@ Use Casefile to maintain durable security investigation state across agent turns
 1. Check existing cases before opening a new one with CaseList or CaseSearch.
 2. Open new leads with CaseAdd as `hypothesis` or `investigating`.
 3. Promote cases with CaseUpdate only after materially new evidence, proof, impact, blockers, remediation, or status changes.
-4. Mark `confirmed` only via the two-phase gate — `PromoteFinding` (runs the PoC 2× against the target + 1× against a distinct control target; every run must write nonce-bound `evidence.json` and complete with captured output) → dispatch the `confirmer` subagent → commit its verdict with `ConfirmFinding`. Markers and exit codes are diagnostics, not gates.
+4. Mark `confirmed` only via the two-phase gate — `PromoteFinding` (PoC 2× target + 1× operator-approved control, nonce-bound body evidence, then a DNS-pinned conclusive `target_only` replay; use the post-PoC harness-generated canary for reflection-capable requests) → the main agent personally reviews → `ConfirmFinding`, which captures a fresh second harness replay before commit. Never delegate phase 2; worker calls are rejected. Exit zero is run integrity, never vulnerability proof. A predicate differential is evidence, not an automatic exploit verdict. Blind/OOB findings remain investigating without a source-separated oracle.
 5. Use CaseLink and CaseUnlink for exploit chains. Do not edit linked case IDs directly.
 6. Use CaseContext only for confirmed or already reported cases: it writes the full context bundle (complete record, verification logs, links, pipeline artifacts) and records the report path. Then have the report written (reporter agent in the full pipeline; yourself in lite mode) and CaseUpdate status=`reported`.
 7. Use `killed` for disproven, duplicate, or dead-end leads, and include evidence, blockers, next step, or assumptions explaining why.
@@ -34,8 +34,8 @@ hypothesis → investigating → confirmed → reported
 
 - `CaseAdd`: create a new case.
 - `CaseUpdate`: update an existing case.
-- `PromoteFinding`: phase 1 of confirmation — run an on-disk PoC script (Docker sandbox or local) against the target 2× plus a same-script control run; machine-validates nonce-bound evidence.json, determinism, and the target/control differential; records a 1h pending bundle and returns the confirmer dispatch instruction.
-- `ConfirmFinding`: phase 2 — commit the confirmer's verdict (CONFIRMED promotes to confirmed; NOT_CONFIRMED keeps investigating, no tie-breaker).
+- `PromoteFinding`: phase 1 — require a body predicate, bind the verify URL, pin DNS, and send the same request to target and an operator-approved `PI_POC_CONTROL_TARGETS` control. Both responses must be conclusive and only `target_only` passes. For reflection, place `{{PI_POC_CANARY}}` exactly once in the request and declare `verify.canary`; the harness creates the secret after the PoC exits and requires target-only reflection. Network/private access remains operator-gated; OOB fails closed without source separation.
+- `ConfirmFinding`: phase 2 — main-agent-only review and fresh harness replay before commit (CONFIRMED promotes; NOT_CONFIRMED keeps investigating; worker/subagent calls are rejected). Record `canary_assessment=verified` when requested, otherwise `not_applicable` with a concrete reason.
 - `CaseGet`: read one case by ID.
 - `CaseList`: list cases with filters and pagination.
 - `CaseSearch`: search all fields or a scoped field.

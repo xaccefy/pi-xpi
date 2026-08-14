@@ -15,7 +15,7 @@
 XPI turns the Pi agent into a security researcher: a case ledger with enforced gates, real exploit-technique grounding, web lookup, fast code search, and a pipeline that keeps findings honest.
 
 - **Casefile** — hypothesis → investigating → confirmed → reported, with gates at every step
-- **Honest PoC gates** — exit 0 + verification marker + mandatory control-target run with liveness marker on every promotion (no fake confirms)
+- **Machine-owned PoC gates** — zero exit is necessary but never proof: direct-response findings require nonce-bound body evidence plus a DNS-pinned, conclusive `target_only` replay against an operator-approved control; reflection-capable requests can add a harness-generated target-only canary; only the main agent may make the semantic decision and commit phase 2
 - **Exploit chains** — `ChainSuggest` surfaces combinations the model missed
 - **Coverage matrix** — machine-checkable "we tested everything" claims
 - **Code search** — fff-powered grep/find, frecency-ranked
@@ -46,7 +46,7 @@ Set `PREVIEW_IS_API_KEY` for `exploit_search` (see [docs/guide.md](docs/guide.md
 /xp lite   # single-agent variant
 ```
 
-On Pi, `/xp on` dispatches specialist subagents via pi-subagents; on OMP it uses the native `task` tool with the same agent names (auditor, tracer, skeptic, exploit, chain, reporter, confirmer — installed by `install.sh --omp`).
+On Pi, `/xp on` dispatches specialist subagents via pi-subagents; on OMP it uses the native `task` tool with the same agent names (auditor, tracer, skeptic, exploit, chain, reporter — installed by `install.sh --omp`). PoC confirmation itself is deliberately not delegated: the main agent performs phase 2, whose `ConfirmFinding` call captures a fresh harness-owned target/control replay.
 
 Full tool reference, configuration, and pipeline docs: **[docs/guide.md](docs/guide.md)**.
 

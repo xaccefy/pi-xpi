@@ -1,11 +1,22 @@
 import assert from "node:assert";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import type { ConfirmerVerdict, PoCEvidence } from "../src/evidence.ts";
+import type { HarnessVerifyResult } from "../src/harness-verify.ts";
 import {
   addEvidenceItemResult,
   applyConfirmationResult,
@@ -16,7 +27,9 @@ import {
   addCaseResult as ledgerAddCaseResult,
   linkCasesResult,
   listEvidenceItems,
+  type MainAgentVerification,
   type PendingConfirmation,
+  POC_EVIDENCE_GC_GRACE_MS,
   type PocEvidenceRun,
   readCasefile,
   recordCoverageResult,
@@ -28,6 +41,7 @@ import {
   updateCaseResult,
   writeCaseContext,
 } from "../src/ledger.ts";
+import { suggestChainsAsync, writeCaseContextAsync } from "../src/ledger-worker.ts";
 import {
   scratchpad_checkpoint,
   scratchpad_init,
@@ -127,20 +141,22 @@ function writeGoodReport(reportPath: string): void {
   );
 }
 
-/** Default disconfirmation prose is gone — the confirmer's attempt becomes it. */
+/** Default disconfirmation prose is gone — the main agent's attempt becomes it. */
 const sha256hex = (s: string) => createHash("sha256").update(s).digest("hex");
 
 function makeEvidence(
   nonce: string,
   contains: string[] = ["root:"],
   claim = "read /etc/passwd of target",
+  target = "target.test",
 ): PoCEvidence {
+  const origin = /^https?:\/\//i.test(target) ? new URL(target).origin : `http://${target}`;
   return {
     nonce,
     claim,
     verify: {
       method: "GET",
-      url: "http://target/read?file=/etc/passwd",
+      url: `${origin}/read?file=/etc/passwd`,
       expect: { status: [200], body_contains: contains },
     },
     observations: ["response body contains the claimed entry"],
@@ -192,12 +208,33 @@ function pendingBundle(
   const target = getCaseById(id)?.target ?? "target";
   const pocPath = opts.pocPath ?? pocScriptPath("poc.sh");
   const controlPath = opts.controlPath ?? pocPath; // same file by default
-  const controlTarget = opts.controlTarget ?? `${target}#control`;
+  const controlTarget = opts.controlTarget ?? "control.test";
   const n1 = "nonce-target-1";
   const n2 = "nonce-target-2";
   const nc = "nonce-control";
-  const tEv = opts.targetEvidence ?? makeEvidence(n1);
-  const cEv = opts.controlEvidence ?? makeEvidence(nc, ["no-such-entry"], "control lacks the vuln");
+  const tEv =
+    opts.targetEvidence ?? makeEvidence(n1, ["root:"], "read /etc/passwd of target", target);
+  const cEv =
+    opts.controlEvidence ??
+    makeEvidence(nc, ["no-such-entry"], "control lacks the vuln", controlTarget);
+  const targetRuns: [PocEvidenceRun, PocEvidenceRun] = [
+    evidenceRun("poc", target, n1, tEv),
+    evidenceRun(
+      "poc",
+      target,
+      n2,
+      opts.secondTargetEvidence ??
+        makeEvidence(n2, ["root:"], "read /etc/passwd of target", target),
+    ),
+  ];
+  const controlRun = evidenceRun("control", controlTarget, nc, cEv);
+  const durableDir = join(tempDir, ".pi", "poc-evidence");
+  mkdirSync(durableDir, { recursive: true });
+  for (const run of [...targetRuns, controlRun]) {
+    const evidencePath = join(durableDir, `${run.nonce}.evidence.json`);
+    writeFileSync(evidencePath, JSON.stringify(run.evidence), "utf8");
+    run.evidencePath = evidencePath;
+  }
   return {
     caseId: id,
     ranAt: opts.bundleRanAt ?? new Date().toISOString(),
@@ -205,11 +242,29 @@ function pendingBundle(
     pocSha256: opts.pocSha256 ?? sha256hex(readFileSync(pocPath, "utf8")),
     controlPath,
     controlTarget,
-    targetRuns: [
-      evidenceRun("poc", target, n1, tEv),
-      evidenceRun("poc", target, n2, opts.secondTargetEvidence ?? makeEvidence(n2)),
-    ],
-    controlRun: evidenceRun("control", controlTarget, nc, cEv),
+    targetRuns,
+    controlRun,
+    harnessVerified: {
+      attempted: true,
+      pass: true,
+      status: 200,
+      differential: "target_only",
+      target: {
+        attempted: true,
+        matched: true,
+        status: 200,
+        url: tEv.verify.url,
+        note: "fixture target matched",
+      },
+      control: {
+        attempted: true,
+        matched: false,
+        status: 404,
+        url: cEv.verify.url,
+        note: "fixture control did not match",
+      },
+      note: "fixture harness differential target_only",
+    },
   };
 }
 
@@ -218,14 +273,25 @@ function makeVerdict(overrides: Partial<ConfirmerVerdict> = {}): ConfirmerVerdic
     verdict: "CONFIRMED",
     reasoning: "re-sent the verify request: target returned the claimed entry, control did not",
     evidence_reviewed: ["evidence.json (target run 1)", "evidence.json (control run)"],
-    re_executed: true,
     re_execution_note: "GET /read?file=/etc/passwd → 200 with root: on target; 403 on control",
     differential: "target_only",
     severity_match: "ok",
     disconfirmation_attempt:
       "tried /read?file=/etc/shadow and a patched replica → no entry; the effect is target-dependent",
+    canary_assessment: "not_applicable",
+    canary_reason: "file-read output is fixed target state and has no attacker-reflected field",
     model: "test-model",
     ...overrides,
+  };
+}
+
+function freshMainAgentVerification(id: string): MainAgentVerification {
+  const bundle = getCaseById(id)?.pendingConfirmation;
+  assert.ok(bundle, "pending confirmation fixture exists");
+  assert.ok(bundle.harnessVerified, "phase-1 harness fixture exists");
+  return {
+    at: new Date().toISOString(),
+    result: bundle.harnessVerified,
   };
 }
 
@@ -235,7 +301,7 @@ function promote(
   opts: { verdict?: ConfirmerVerdict; bundle?: PendingConfirmation } = {},
 ): ReturnType<typeof applyConfirmationResult> {
   storePendingConfirmation(id, opts.bundle ?? pendingBundle(id));
-  return applyConfirmationResult(id, opts.verdict ?? makeVerdict());
+  return applyConfirmationResult(id, opts.verdict ?? makeVerdict(), freshMainAgentVerification(id));
 }
 
 let tempDir: string;
@@ -244,16 +310,70 @@ let ledgerPath: string;
 beforeEach(async () => {
   tempDir = mkdtempSync(join(tmpdir(), "casefile-test-"));
   ledgerPath = join(tempDir, "casefile.db");
+  process.env.CASEFILE_WORKSPACE_ROOT = tempDir;
   setCasefilePath(ledgerPath);
 });
 
 afterEach(async () => {
   setCasefilePath(undefined);
   setScratchpadRoot(undefined);
+  delete process.env.CASEFILE_WORKSPACE_ROOT;
   await rm(tempDir, { recursive: true, force: true });
 });
 
 describe("casefile sqlite ledger", () => {
+  it("garbage-collects only old, unreferenced harness evidence", () => {
+    const record = addCase({ title: "Evidence GC fixture" });
+    const evidenceDir = join(tempDir, ".pi", "poc-evidence");
+    mkdirSync(evidenceDir, { recursive: true });
+    const referenced = join(evidenceDir, "referenced.evidence.json");
+    const pending = join(evidenceDir, "pending.evidence.json");
+    const orphan = join(evidenceDir, "orphan.evidence.json");
+    const young = join(evidenceDir, "young.evidence.json");
+    for (const path of [referenced, pending, orphan, young]) {
+      writeFileSync(path, JSON.stringify({ fixture: path }), "utf8");
+    }
+    addEvidenceItemResult(record.id, {
+      role: "cleanup",
+      summary: "protect referenced durable evidence",
+      artifactPath: referenced,
+    });
+
+    // Seed a pending-bundle reference directly: this test exercises GC's
+    // conservative path discovery, not confirmation-bundle validation.
+    setCasefilePath(undefined);
+    const raw = new DatabaseSync(ledgerPath);
+    raw
+      .prepare("UPDATE cases SET pending_confirmation_json = ? WHERE id = ?")
+      .run(JSON.stringify({ targetRuns: [{ evidencePath: pending }], controlRun: {} }), record.id);
+    raw.close();
+
+    const old = new Date(Date.now() - POC_EVIDENCE_GC_GRACE_MS - 60_000);
+    for (const path of [referenced, pending, orphan]) utimesSync(path, old, old);
+
+    // Reopening runs the best-effort sweep.
+    setCasefilePath(ledgerPath);
+    readCasefile();
+    assert.ok(existsSync(referenced), "ledger evidence item remains protected");
+    assert.ok(existsSync(pending), "pending confirmation evidence remains protected");
+    assert.ok(!existsSync(orphan), "old orphan is removed");
+    assert.ok(existsSync(young), "recent orphan remains inside the grace window");
+  });
+
+  it("rejects a symlinked casefile database", () => {
+    const outside = mkdtempSync(join(tmpdir(), "casefile-db-outside-"));
+    try {
+      const victim = join(outside, "victim.db");
+      writeFileSync(victim, "operator data", "utf8");
+      symlinkSync(victim, ledgerPath);
+
+      assert.throws(() => readCasefile(), /regular, non-symlink file/);
+      assert.strictEqual(readFileSync(victim, "utf8"), "operator data");
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   it("whitespace-only PI_CASEFILE_PATH falls through to the default ledger path", () => {
     // Regression: truthiness was checked on the raw env value, so "   " passed
     // and resolve("") returned the process cwd (a directory) — every tool call
@@ -808,7 +928,8 @@ describe("casefile sqlite ledger", () => {
     assert.strictEqual(refused.record.status, "investigating");
 
     // CONFIRMED requires a disconfirmation attempt, a target-only differential,
-    // and a re-execution — a verdict missing any of these is rejected. A
+    // a concrete review note, and a fresh harness replay. A verdict missing
+    // any of these is rejected. A
     // NOT_CONFIRMED attempt above already recorded a verdict; re-store a fresh
     // bundle so the CONFIRMED path has one to commit against.
     storePendingConfirmation(rec.id, pendingBundle(rec.id));
@@ -825,11 +946,26 @@ describe("casefile sqlite ledger", () => {
       /target_only/,
     );
     assert.throws(
-      () => applyConfirmationResult(rec.id, makeVerdict({ re_executed: false })),
-      /re_executed/,
+      () => applyConfirmationResult(rec.id, makeVerdict({ re_execution_note: undefined })),
+      /re_execution_note/,
+    );
+    assert.throws(
+      () => applyConfirmationResult(rec.id, makeVerdict()),
+      /MAIN-AGENT REPLAY REQUIRED/,
+    );
+    const misboundReplay = freshMainAgentVerification(rec.id);
+    if (misboundReplay.result.target) {
+      misboundReplay.result = {
+        ...misboundReplay.result,
+        target: { ...misboundReplay.result.target, url: "https://unrelated.test/proof" },
+      };
+    }
+    assert.throws(
+      () => applyConfirmationResult(rec.id, makeVerdict(), misboundReplay),
+      /target transcript is not bound/,
     );
     // A complete CONFIRMED verdict promotes.
-    const ok = applyConfirmationResult(rec.id, makeVerdict());
+    const ok = applyConfirmationResult(rec.id, makeVerdict(), freshMainAgentVerification(rec.id));
     assert.strictEqual(ok.record.status, "confirmed");
   });
 
@@ -909,6 +1045,110 @@ describe("casefile sqlite ledger", () => {
     assert.throws(() => storePendingConfirmation(rec.id, equalsCase), /CONTROL BINDING FAILED/);
   });
 
+  it("store rejects a bundle whose harness verify replay failed", () => {
+    const rec = addCase({
+      title: "Harness replay gate",
+      status: "investigating",
+      evidence: "observed leak",
+      confidence: "high",
+      impact: "data leak",
+      severity: "high",
+      poc: "/tmp/poc.sh",
+      target: "host-a",
+    });
+    const bundle = pendingBundle(rec.id);
+    bundle.harnessVerified = {
+      attempted: true,
+      pass: false,
+      status: 200,
+      note: "harness replayed the verify request — body_contains missing: root:",
+    };
+    assert.throws(() => storePendingConfirmation(rec.id, bundle), /HARNESS DIFFERENTIAL FAILED/);
+  });
+
+  it("store rejects a skipped harness replay (private targets fail closed)", () => {
+    const rec = addCase({
+      title: "Private target replay skip",
+      status: "investigating",
+      evidence: "observed leak",
+      confidence: "high",
+      impact: "data leak",
+      severity: "high",
+      poc: "/tmp/poc.sh",
+      target: "10.0.0.5",
+    });
+    const bundle = pendingBundle(rec.id);
+    bundle.harnessVerified = {
+      attempted: false,
+      note: "skipped: 127.0.0.1 is a private/internal host — main-agent review cannot bypass the machine gate",
+    };
+    assert.throws(() => storePendingConfirmation(rec.id, bundle), /HARNESS DIFFERENTIAL FAILED/);
+  });
+
+  it("store rejects an OOB-verified bundle with zero target-token hits", () => {
+    const rec = addCase({
+      title: "OOB silent target",
+      status: "investigating",
+      evidence: "observed SSRF",
+      confidence: "high",
+      impact: "internal fetch",
+      severity: "high",
+      poc: "/tmp/poc.sh",
+      target: "host-a",
+    });
+    const bundle = pendingBundle(rec.id);
+    bundle.callbackVerified = {
+      attempted: true,
+      targetHits: 0,
+      controlHits: 0,
+      note: "listener logged 0 interactions",
+    };
+    assert.throws(() => storePendingConfirmation(rec.id, bundle), /OOB VERIFY FAILED/);
+  });
+
+  it("store rejects an OOB-verified bundle whose control token was hit", () => {
+    const rec = addCase({
+      title: "OOB self-caller",
+      status: "investigating",
+      evidence: "observed SSRF",
+      confidence: "high",
+      impact: "internal fetch",
+      severity: "high",
+      poc: "/tmp/poc.sh",
+      target: "host-a",
+    });
+    const bundle = pendingBundle(rec.id);
+    bundle.callbackVerified = {
+      attempted: true,
+      targetHits: 1,
+      controlHits: 1,
+      note: "listener logged 2 interactions",
+    };
+    assert.throws(() => storePendingConfirmation(rec.id, bundle), /OOB VERIFY FAILED/);
+  });
+
+  it("store rejects loopback OOB telemetry without source separation", () => {
+    const rec = addCase({
+      title: "OOB self-call boundary",
+      status: "investigating",
+      evidence: "observed SSRF",
+      confidence: "high",
+      impact: "internal fetch",
+      severity: "high",
+      poc: "/tmp/poc.sh",
+      target: "host-a",
+    });
+    const bundle = pendingBundle(rec.id);
+    bundle.callbackVerified = {
+      attempted: true,
+      targetHits: 1,
+      controlHits: 0,
+      sourceSeparated: false,
+      note: "loopback listener logged one target-token interaction",
+    };
+    assert.throws(() => storePendingConfirmation(rec.id, bundle), /source separation/i);
+  });
+
   it("reproduction evidence item is backed by the preserved evidence file", () => {
     const rec = addCase({
       title: "Preserved evidence",
@@ -923,14 +1163,42 @@ describe("casefile sqlite ledger", () => {
     const bundle = pendingBundle(rec.id);
     // The runner preserves each evidence.json into .pi/poc-evidence/; the
     // reproduction item must reference that surviving copy, not a temp file.
-    bundle.targetRuns[0].evidencePath = `/tmp/poc-evidence/${bundle.targetRuns[0].nonce}.evidence.json`;
     storePendingConfirmation(rec.id, bundle);
-    const confirmed = applyConfirmationResult(rec.id, makeVerdict());
+    const confirmed = applyConfirmationResult(
+      rec.id,
+      makeVerdict(),
+      freshMainAgentVerification(rec.id),
+    );
     assert.strictEqual(confirmed.record.status, "confirmed");
     const repro = listEvidenceItems(rec.id).find((e) => e.role === "reproduction");
     assert.ok(repro, "reproduction item recorded");
     assert.match(repro!.artifactPath ?? "", /\.evidence\.json$/);
     assert.strictEqual(repro!.sha256, bundle.targetRuns[0].evidenceSha256);
+  });
+
+  it("rejects missing or tampered durable PoC evidence", () => {
+    const rec = addCase({
+      title: "Durable PoC evidence binding",
+      status: "investigating",
+      evidence: "observed leak",
+      confidence: "high",
+      impact: "data leak",
+      severity: "high",
+      poc: "/tmp/poc.sh",
+      target: "host-a",
+    });
+    const missing = pendingBundle(rec.id);
+    missing.targetRuns[0].evidencePath = undefined;
+    assert.throws(
+      () => storePendingConfirmation(rec.id, missing),
+      /ephemeral evidence cannot confirm/,
+    );
+
+    const tampered = pendingBundle(rec.id);
+    const evidencePath = tampered.targetRuns[0].evidencePath;
+    assert.ok(evidencePath);
+    writeFileSync(evidencePath, '{"tampered":true}', "utf8");
+    assert.throws(() => storePendingConfirmation(rec.id, tampered), /hash does not match/);
   });
 
   it("expires stale pending confirmations (1h TTL)", () => {
@@ -949,6 +1217,32 @@ describe("casefile sqlite ledger", () => {
     });
     storePendingConfirmation(rec.id, stale);
     assert.throws(() => applyConfirmationResult(rec.id, makeVerdict()), /expired/);
+  });
+
+  it("rejects a phase-2 ledger commit from a worker process", () => {
+    const rec = addCase({
+      title: "Worker cannot commit",
+      status: "investigating",
+      evidence: "observed",
+      confidence: "high",
+      impact: "leak",
+      severity: "medium",
+      poc: "/tmp/poc.sh",
+      target: "example-app",
+    });
+    storePendingConfirmation(rec.id, pendingBundle(rec.id));
+    process.env.PI_SUBAGENT_CHILD = "1";
+    const startupAuthority = { startedAsSubagent: true };
+    delete process.env.PI_SUBAGENT_CHILD;
+    try {
+      assert.throws(
+        () => applyConfirmationResult(rec.id, makeVerdict(), undefined, startupAuthority),
+        /reserved for the main\/coordinator agent/,
+      );
+    } finally {
+      delete process.env.PI_SUBAGENT_CHILD;
+    }
+    assert.strictEqual(getCaseById(rec.id)?.status, "investigating");
   });
 
   it("NOT_CONFIRMED records the verdict, keeps investigating, and allows a fresh attempt", () => {
@@ -973,11 +1267,13 @@ describe("casefile sqlite ledger", () => {
     );
     assert.strictEqual(refused.record.status, "investigating");
     assert.strictEqual(refused.record.confirmerVerdict?.verdict, "NOT_CONFIRMED");
+    assert.strictEqual(refused.record.confirmerVerdict?.reviewer, "main_agent");
+    assert.strictEqual(refused.record.pendingConfirmation, undefined);
     assert.ok(refused.record.assumptions?.some((a) => a.includes("NOT_CONFIRMED")));
     assert.strictEqual(refused.record.pocVerified, undefined);
     // A second, successful attempt after a fresh phase 1.
     storePendingConfirmation(rec.id, pendingBundle(rec.id));
-    const ok = applyConfirmationResult(rec.id, makeVerdict());
+    const ok = applyConfirmationResult(rec.id, makeVerdict(), freshMainAgentVerification(rec.id));
     assert.strictEqual(ok.record.status, "confirmed");
   });
 
@@ -994,7 +1290,7 @@ describe("casefile sqlite ledger", () => {
     });
     const bundle = pendingBundle(rec.id);
     storePendingConfirmation(rec.id, bundle);
-    const ok = applyConfirmationResult(rec.id, makeVerdict());
+    const ok = applyConfirmationResult(rec.id, makeVerdict(), freshMainAgentVerification(rec.id));
     assert.strictEqual(ok.record.status, "confirmed");
     const confirmed = getCaseById(rec.id)!;
     assert.strictEqual(confirmed.pendingConfirmation, undefined, "pending bundle cleared");
@@ -1004,10 +1300,63 @@ describe("casefile sqlite ledger", () => {
     assert.strictEqual(confirmed.controlVerified?.mode, "control");
     assert.strictEqual(confirmed.confirmerVerdict?.verdict, "CONFIRMED");
     assert.strictEqual(confirmed.confirmerVerdict?.model, "test-model");
+    assert.strictEqual(confirmed.confirmerVerdict?.reviewer, "main_agent");
+    assert.strictEqual(
+      confirmed.confirmerVerdict?.phase2Verification?.result.differential,
+      "target_only",
+    );
     const repro = listEvidenceItems(rec.id).find((e) => e.role === "reproduction");
     assert.ok(repro, "reproduction item recorded");
     assert.strictEqual(repro!.sha256, bundle.targetRuns[0].evidenceSha256);
-    assert.strictEqual(repro!.artifactPath, "evidence.json");
+    assert.match(repro!.artifactPath ?? "", /\.evidence\.json$/);
+  });
+
+  it("records canary-differential strength only for a machine-observed target-only canary", () => {
+    const rec = addCase({
+      title: "Reflected canary proof",
+      status: "investigating",
+      evidence: "target reflected attacker-controlled marker",
+      confidence: "high",
+      severity: "medium",
+      poc: "send marker and compare target/control",
+      impact: "attacker-controlled reflection",
+      target: "target.test",
+    });
+    const bundle = pendingBundle(rec.id);
+    for (const run of [...bundle.targetRuns, bundle.controlRun]) {
+      run.evidence.verify.url += "&marker={{PI_POC_CANARY}}";
+      run.evidence.verify.canary = {
+        mode: "reflection",
+        placeholder: "{{PI_POC_CANARY}}",
+      };
+      run.evidenceSha256 = sha256hex(JSON.stringify(run.evidence));
+      assert.ok(run.evidencePath);
+      writeFileSync(run.evidencePath, JSON.stringify(run.evidence), "utf8");
+    }
+    bundle.harnessVerified = {
+      ...(bundle.harnessVerified as HarnessVerifyResult),
+      canary: {
+        mode: "reflection",
+        attempted: true,
+        pass: true,
+        tokenSha256: "a".repeat(64),
+        targetObserved: true,
+        controlObserved: false,
+        note: "fixture target-only canary",
+      },
+      proofStrength: "canary_differential",
+    };
+    storePendingConfirmation(rec.id, bundle);
+    const confirmed = applyConfirmationResult(
+      rec.id,
+      makeVerdict({
+        canary_assessment: "verified",
+        canary_reason: undefined,
+      }),
+      freshMainAgentVerification(rec.id),
+    ).record;
+    assert.strictEqual(confirmed.confirmerVerdict?.proofStrength, "canary_differential");
+    assert.strictEqual(confirmed.confirmerVerdict?.phase2Verification?.result.canary?.pass, true);
   });
 
   it("links coverage cells to artifact-backed evidence items and rejects bogus links", () => {
@@ -1114,6 +1463,12 @@ describe("casefile sqlite ledger", () => {
     // The digest must be the REAL sha256 of the artifact bytes, not a stub.
     const expected = createHash("sha256").update("HTTP/1.1 200 OK\nsecret-data").digest("hex");
     assert.strictEqual(item.sha256, expected);
+    // Durable copy: the artifact bytes survive in <ledger-dir>/evidence-items/
+    // keyed by the sha256 (artifact_path itself stays a basename — path-leak
+    // guard). The hash must stay re-verifiable after the source file is gone.
+    const durable = join(tempDir, "evidence-items", `${item.sha256}.bin`);
+    assert.ok(existsSync(durable), `durable copy missing at ${durable}`);
+    assert.strictEqual(readFileSync(durable, "utf8"), "HTTP/1.1 200 OK\nsecret-data");
     assert.throws(
       () => addEvidenceItemResult(c.id, { role: "nonsense" as any, summary: "x" }),
       /Invalid evidence role/,
@@ -1143,6 +1498,69 @@ describe("casefile sqlite ledger", () => {
     );
   });
 
+  it("keeps evidence artifact reads inside the workspace and rejects symlinks", () => {
+    const c = ledgerAddCaseResult({
+      title: "Evidence containment",
+      disproveIf: ["test: finding is actually intended behavior"],
+    }).record;
+    const outsideDir = mkdtempSync(join(tmpdir(), "casefile-outside-"));
+    try {
+      const outside = join(outsideDir, "secret.txt");
+      writeFileSync(outside, "must not be imported", "utf8");
+      assert.throws(
+        () =>
+          addEvidenceItemResult(c.id, {
+            role: "observation",
+            summary: "outside file",
+            artifactPath: outside,
+          }),
+        /must stay inside the workspace/,
+      );
+
+      const linked = join(tempDir, "linked-secret.txt");
+      symlinkSync(outside, linked);
+      assert.throws(
+        () =>
+          addEvidenceItemResult(c.id, {
+            role: "observation",
+            summary: "symlink file",
+            artifactPath: linked,
+          }),
+        /must not be a symbolic link/,
+      );
+      assert.strictEqual(listEvidenceItems(c.id).length, 0);
+    } finally {
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a symlinked durable evidence store", () => {
+    const c = ledgerAddCaseResult({
+      title: "Durable evidence containment",
+      disproveIf: ["test: finding is actually intended behavior"],
+    }).record;
+    const artifact = join(tempDir, "probe.txt");
+    writeFileSync(artifact, "verified bytes", "utf8");
+    const outside = mkdtempSync(join(tmpdir(), "casefile-evidence-outside-"));
+    try {
+      symlinkSync(outside, join(tempDir, "evidence-items"), "dir");
+      assert.throws(
+        () =>
+          addEvidenceItemResult(c.id, {
+            role: "observation",
+            summary: "must not escape",
+            artifactPath: artifact,
+          }),
+        /real directory, not a symlink/,
+      );
+      assert.deepStrictEqual(readFileSync(artifact, "utf8"), "verified bytes");
+      assert.deepStrictEqual(listEvidenceItems(c.id), []);
+      assert.deepStrictEqual(readdirSync(outside), []);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   it("control evidence must exist and differ from the target (differential gate)", () => {
     const rec = addCase({
       title: "Live IDOR",
@@ -1169,7 +1587,14 @@ describe("casefile sqlite ledger", () => {
     // Control evidence IDENTICAL to the target (normalized, nonce stripped)
     // means the claimed impact is not target-dependent — the unconditional-
     // success cheat, now judged on structured evidence instead of markers.
-    const same = pendingBundle(rec.id, { controlEvidence: makeEvidence("nonce-control") });
+    const same = pendingBundle(rec.id, {
+      controlEvidence: makeEvidence(
+        "nonce-control",
+        ["root:"],
+        "read /etc/passwd of target",
+        "example-app",
+      ),
+    });
     assert.throws(() => storePendingConfirmation(rec.id, same), /not target-dependent/);
     // A clean differential (control lacks the claimed entry) promotes.
     const ok = promote(rec.id);
@@ -1346,7 +1771,7 @@ describe("casefile sqlite ledger", () => {
     assert.ok(ato, "credential_endpoint chain suggested");
     assert.strictEqual(ato!.sourceId, cred.id);
     assert.strictEqual(ato!.targetId, endpoint.id);
-    assert.strictEqual(ato!.confidence, 55); // neither confirmed
+    assert.strictEqual(ato!.confidence, 60); // investigating pair (neither confirmed)
 
     // Only pairs on the same asset chain.
     const other = addCase({
@@ -1356,6 +1781,90 @@ describe("casefile sqlite ledger", () => {
     });
     const xssSuggestions = suggestChains(other.id).filter((s) => s.pattern === "xss_csrf");
     assert.strictEqual(xssSuggestions.length, 0);
+  });
+
+  it("does not suggest chains from ruled-out evidence sentences", () => {
+    const cred = addCase({
+      title: "Leaked API key in repo",
+      status: "investigating",
+      evidence: "Key in public repo",
+      confidence: "high",
+      impact: "credential exposure",
+      severity: "high",
+      target: "negation-app",
+    });
+    // The credential keyword appears only in a ruled-out sentence.
+    const endpoint = addCase({
+      title: "Admin login endpoint",
+      status: "investigating",
+      evidence: "Login accepts credentials. SSRF ruled out on all hosts.",
+      confidence: "high",
+      impact: "auth",
+      severity: "medium",
+      target: "negation-app",
+    });
+    const suggestions = suggestChains();
+    assert.ok(
+      suggestions.some((s) => s.pattern === "credential_endpoint"),
+      "the positive credential sentence still chains",
+    );
+    assert.ok(
+      !suggestions.some((s) => s.pattern === "info_disclosure_ssrf" && s.sourceId === endpoint.id),
+      "the ruled-out SSRF sentence must not produce an SSRF chain",
+    );
+    void cred;
+  });
+
+  it("does not re-suggest pairs that are already linked", () => {
+    const cred = addCase({
+      title: "Leaked API key in repo",
+      status: "investigating",
+      evidence: "Key in public repo",
+      confidence: "high",
+      impact: "credential exposure",
+      severity: "high",
+      target: "linked-app",
+    });
+    const endpoint = addCase({
+      title: "Admin login endpoint",
+      status: "investigating",
+      evidence: "Login accepts credentials",
+      confidence: "high",
+      impact: "auth",
+      severity: "medium",
+      target: "linked-app",
+    });
+    linkCasesResult(cred.id, endpoint.id, "depends-on");
+    const suggestions = suggestChains();
+    assert.ok(
+      !suggestions.some((s) => s.pattern === "credential_endpoint" && s.sourceId === cred.id),
+      "an already-linked pair is existing knowledge, not a suggestion",
+    );
+  });
+
+  it("async offload (worker thread) matches the inline implementation", async () => {
+    addCase({
+      title: "Leaked API key in repo",
+      status: "investigating",
+      evidence: "Key in public repo",
+      confidence: "high",
+      impact: "credential exposure",
+      severity: "high",
+      target: "worker-app",
+    });
+    addCase({
+      title: "Admin login endpoint",
+      status: "investigating",
+      evidence: "Login accepts credentials",
+      confidence: "high",
+      impact: "auth",
+      severity: "medium",
+      target: "worker-app",
+    });
+    const inline = suggestChains();
+    const offloaded = await suggestChainsAsync();
+    assert.deepStrictEqual(offloaded, inline);
+    assert.ok(offloaded.length > 0);
   });
 
   it("does not pair unrelated targets whose names overlap as substrings", () => {
@@ -1597,7 +2106,7 @@ describe("casefile sqlite ledger", () => {
     );
     assert.ok(
       context.includes("tried /read?file=/etc/shadow"),
-      "context must include the disconfirmation body (the confirmer's attempt becomes the case's disconfirmation)",
+      "context must include the disconfirmation body (the main agent's attempt becomes the case's disconfirmation)",
     );
     // …the complete record (every field, incl. tags/nextStep/timestamps)…
     assert.ok(context.includes("## Complete Case Record (all fields)"), "complete record section");
@@ -1674,6 +2183,41 @@ describe("casefile sqlite ledger", () => {
       context.includes(`skeptic_${record.id}.json`),
       "artifact named after the case is surfaced",
     );
+  });
+
+  it("worker-thread CaseContext reads artifacts from the configured scratchpad root", async () => {
+    const record = addCase({
+      title: "Worker context artifact",
+      status: "investigating",
+      evidence: "Observed a target-only response",
+      confidence: "high",
+      severity: "high",
+      impact: "Sensitive data disclosure",
+      poc: "GET /worker-proof",
+      target: "worker-app",
+    });
+    promote(record.id);
+
+    setScratchpadRoot(tempDir);
+    scratchpad_init("run-worker-context", tempDir);
+    scratchpad_checkpoint(
+      "run-worker-context",
+      "recon",
+      { ids: [record.id], summary: "worker context fixture" },
+      tempDir,
+    );
+    scratchpad_write(
+      "run-worker-context",
+      "recon",
+      "worker-proof.md",
+      "worker-thread-visible-artifact",
+      tempDir,
+    );
+
+    const { contextPath } = await writeCaseContextAsync(record.id);
+    const context = readFileSync(contextPath, "utf8");
+    assert.ok(context.includes("run-worker-context"));
+    assert.ok(context.includes("worker-thread-visible-artifact"));
   });
 
   it("writeCaseContext rejects non-confirmed cases", () => {
@@ -1755,7 +2299,7 @@ describe("casefile sqlite ledger", () => {
       () => storePendingConfirmation(rec.id, pendingBundle(rec.id, { pocSha256: "deadbeef" })),
       /pocSha256 does not match/,
     );
-    // Script edited BETWEEN phase 1 and phase 2 → the confirmer would review
+    // Script edited BETWEEN phase 1 and phase 2 → the main agent would review
     // different bytes than ran; blocked at apply time.
     const edited = pendingBundle(rec.id, { pocPath });
     storePendingConfirmation(rec.id, edited);

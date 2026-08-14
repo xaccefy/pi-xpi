@@ -11,15 +11,33 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
 import {
-  type ConfirmerVerdict,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import {
   evidenceNonceMatches,
+  type MainAgentVerdict,
   normalizeEvidence,
   type PoCEvidence,
-  validateConfirmerVerdict,
+  parsePoCEvidence,
+  validateMainAgentVerdict,
 } from "./evidence.ts";
+import { type HarnessVerifyResult, verifyUrlBindingError } from "./harness-verify.ts";
+import {
+  assertSafeRegularFile,
+  ensureSafeStateDirectory,
+  readSafeFile,
+  writeSafeFileExclusive,
+} from "./safe-state.ts";
 import {
   findWorkspaceRoot,
   getScratchpadRoot,
@@ -53,6 +71,51 @@ export type CasePriority = (typeof PRIORITY_VALUES)[number];
 
 /** Cap on hashed evidence artifacts (10 MiB) — keeps readFileSync bounded. */
 const EVIDENCE_ARTIFACT_MAX_BYTES = 10 * 1024 * 1024;
+/** PoC evidence has a tighter runner-side cap and must remain equally bounded on re-read. */
+const POC_EVIDENCE_MAX_BYTES = 256 * 1024;
+/** Avoid racing an active or just-finished PoC whose bundle is not committed yet. */
+export const POC_EVIDENCE_GC_GRACE_MS = 24 * 60 * 60 * 1000;
+/** Immutable module-start role; child shells cannot upgrade this process by unsetting an env var. */
+const PROCESS_STARTED_AS_SUBAGENT = process.env.PI_SUBAGENT_CHILD === "1";
+
+function pathIsWithin(root: string, candidate: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+}
+
+function readWorkspaceArtifact(inputPath: string): { path: string; bytes: Buffer } {
+  const workspace = realpathSync(detectWorkspaceRoot());
+  const requested = resolve(workspace, inputPath);
+  if (!existsSync(requested)) {
+    throw new Error(`Evidence artifact not found on disk: ${inputPath}`);
+  }
+  const direct = lstatSync(requested);
+  if (direct.isSymbolicLink()) {
+    throw new Error(`Evidence artifact must not be a symbolic link: ${inputPath}`);
+  }
+  const canonical = realpathSync(requested);
+  if (!pathIsWithin(workspace, canonical)) {
+    throw new Error(
+      `Evidence artifact must stay inside the workspace (${workspace}): ${inputPath}`,
+    );
+  }
+  const stat = statSync(canonical);
+  if (!stat.isFile()) {
+    throw new Error(`Evidence artifact is not a regular file: ${inputPath}`);
+  }
+  if (stat.size > EVIDENCE_ARTIFACT_MAX_BYTES) {
+    throw new Error(
+      `Evidence artifact too large (${stat.size} bytes; max ${EVIDENCE_ARTIFACT_MAX_BYTES}): ${inputPath}`,
+    );
+  }
+  const bytes = readFileSync(canonical);
+  if (bytes.byteLength > EVIDENCE_ARTIFACT_MAX_BYTES) {
+    throw new Error(
+      `Evidence artifact too large (${bytes.byteLength} bytes; max ${EVIDENCE_ARTIFACT_MAX_BYTES}): ${inputPath}`,
+    );
+  }
+  return { path: canonical, bytes };
+}
 
 /** Role-typed evidence roles (Black-cat style). cleanup = engagement cleanup item. */
 export const EVIDENCE_ROLE_VALUES = [
@@ -198,9 +261,9 @@ export type CaseRecord = {
   disconfirmationVerified?: PocVerificationRecord;
   /** Verification of a control-target run (set only by the confirmation gate). */
   controlVerified?: PocVerificationRecord;
-  /** Phase-1 evidence bundle awaiting a confirmer verdict (ConfirmFinding). */
+  /** Phase-1 evidence bundle awaiting main-agent review (ConfirmFinding). */
   pendingConfirmation?: PendingConfirmation;
-  /** Last confirmer verdict (CONFIRMED commits the promotion; NOT_CONFIRMED keeps investigating). */
+  /** Last phase-2 verdict (legacy field name retained for database compatibility). */
   confirmerVerdict?: ConfirmerVerdictRecord;
   /** ISO timestamp when CaseContext first wrote the context bundle. */
   reportedAt?: string;
@@ -239,7 +302,7 @@ export type PocEvidenceRun = {
   sandbox: boolean;
   completed: boolean;
   outputComplete: boolean;
-  /** Display-sliced output (diagnostic; exit codes are not gates). */
+  /** Display-sliced output (diagnostic; zero exit is necessary, not proof). */
   output: string;
   evidence: PoCEvidence;
   evidenceSha256: string;
@@ -249,10 +312,16 @@ export type PocEvidenceRun = {
   evidencePath?: string;
 };
 
-/**
- * Phase-1 bundle PromoteFinding records; ConfirmFinding commits on a verdict.
- * Contains everything the confirmer reviews and the ledger re-checks.
- */
+/** Harness-observed out-of-band interactions (Tier 1, docs/poc-trust-model.md). */
+export type OobVerification = {
+  attempted: boolean;
+  targetHits: number;
+  controlHits: number;
+  /** True only when the PoC runner cannot directly reach the listener. */
+  sourceSeparated?: boolean;
+  note: string;
+};
+
 export type PendingConfirmation = {
   caseId: string;
   ranAt: string;
@@ -263,10 +332,30 @@ export type PendingConfirmation = {
   controlTarget: string;
   targetRuns: [PocEvidenceRun, PocEvidenceRun];
   controlRun: PocEvidenceRun;
+  /** Harness's own replay of evidence.verify (public targets). Absent = legacy bundle. */
+  harnessVerified?: HarnessVerifyResult;
+  /** Harness-owned OOB listener log for the run (opt-in blind classes). */
+  callbackVerified?: OobVerification;
 };
 
-/** Persisted confirmer verdict with the commit timestamp. */
-export type ConfirmerVerdictRecord = ConfirmerVerdict & { at: string };
+/** Fresh machine transcript produced inside the main agent's ConfirmFinding call. */
+export type MainAgentVerification = {
+  at: string;
+  result: HarnessVerifyResult;
+};
+
+/** Persisted main-agent verdict; `confirmer` naming is retained for DB compatibility. */
+export type MainAgentVerdictRecord = MainAgentVerdict & {
+  at: string;
+  reviewer: "main_agent";
+  /** Harness-owned phase-2 replay bound to this verdict. */
+  phase2Verification?: MainAgentVerification;
+  /** What the machine actually established; semantic vulnerability judgment remains main-agent-owned. */
+  proofStrength?: "predicate_differential" | "canary_differential";
+};
+
+/** @deprecated Compatibility alias for the legacy database/API field name. */
+export type ConfirmerVerdictRecord = MainAgentVerdictRecord;
 
 /** Pending confirmation expires after 1h — re-run PromoteFinding for a fresh bundle. */
 export const PENDING_CONFIRM_TTL_MS = 60 * 60 * 1000;
@@ -382,6 +471,101 @@ function detectWorkspaceRoot(): string {
   );
 }
 
+export type PocEvidenceGcResult = {
+  scanned: number;
+  removed: number;
+  skipped: boolean;
+  reason?: string;
+};
+
+/**
+ * Delete only old harness evidence copies that no ledger row or pending
+ * confirmation bundle references. Malformed pending JSON fails closed because
+ * it may contain paths we cannot safely identify.
+ */
+function gcOrphanedPocEvidenceForDb(db: DatabaseSync, nowMs = Date.now()): PocEvidenceGcResult {
+  const evidenceDir = join(detectWorkspaceRoot(), ".pi", "poc-evidence");
+  if (!existsSync(evidenceDir)) return { scanned: 0, removed: 0, skipped: false };
+  try {
+    const dirStat = lstatSync(evidenceDir);
+    if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) {
+      return {
+        scanned: 0,
+        removed: 0,
+        skipped: true,
+        reason: "poc-evidence is not a regular directory",
+      };
+    }
+
+    const protectedNames = new Set<string>();
+    const items = db
+      .prepare("SELECT artifact_path FROM evidence_items WHERE artifact_path IS NOT NULL")
+      .all() as { artifact_path: string }[];
+    for (const item of items) protectedNames.add(basename(item.artifact_path));
+
+    const collectPendingPaths = (value: unknown): void => {
+      if (Array.isArray(value)) {
+        for (const item of value) collectPendingPaths(item);
+        return;
+      }
+      if (typeof value !== "object" || value === null) return;
+      for (const [key, nested] of Object.entries(value)) {
+        if (key === "evidencePath" && typeof nested === "string") {
+          protectedNames.add(basename(nested));
+        } else {
+          collectPendingPaths(nested);
+        }
+      }
+    };
+
+    const pendingRows = db
+      .prepare(
+        "SELECT pending_confirmation_json FROM cases WHERE pending_confirmation_json IS NOT NULL",
+      )
+      .all() as { pending_confirmation_json: string }[];
+    for (const row of pendingRows) {
+      let pending: unknown;
+      try {
+        pending = JSON.parse(row.pending_confirmation_json);
+      } catch {
+        return {
+          scanned: 0,
+          removed: 0,
+          skipped: true,
+          reason: "malformed pending confirmation JSON",
+        };
+      }
+      collectPendingPaths(pending);
+    }
+
+    let scanned = 0;
+    let removed = 0;
+    for (const entry of readdirSync(evidenceDir, { withFileTypes: true })) {
+      if (!entry.name.endsWith(".evidence.json") || !entry.isFile()) continue;
+      scanned++;
+      if (protectedNames.has(entry.name)) continue;
+      const candidate = join(evidenceDir, entry.name);
+      const file = lstatSync(candidate);
+      if (!file.isFile() || nowMs - file.mtimeMs < POC_EVIDENCE_GC_GRACE_MS) continue;
+      unlinkSync(candidate);
+      removed++;
+    }
+    return { scanned, removed, skipped: false };
+  } catch (error) {
+    return {
+      scanned: 0,
+      removed: 0,
+      skipped: true,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/** Run the same conservative orphan sweep used when the ledger opens. */
+export function gcOrphanedPocEvidence(nowMs = Date.now()): PocEvidenceGcResult {
+  return gcOrphanedPocEvidenceForDb(getDb(), nowMs);
+}
+
 export function getCasefilePath(): string {
   if (ledgerPathOverride) return ledgerPathOverride;
   // Trim BEFORE the truthiness check: a whitespace-only value must not
@@ -410,10 +594,17 @@ function getDb(): DatabaseSync {
 
   const dbPath = getCasefilePath();
   const dbDir = dirname(dbPath);
-  if (!existsSync(dbDir)) {
+  const workspace = detectWorkspaceRoot();
+  const defaultStateDir = join(workspace, ".pi");
+  if (resolve(dbDir) === resolve(defaultStateDir)) {
+    ensureSafeStateDirectory(workspace, [".pi"]);
+  } else if (!existsSync(dbDir)) {
     try {
       mkdirSync(dbDir, { recursive: true });
     } catch {}
+  }
+  for (const candidate of [dbPath, `${dbPath}-wal`, `${dbPath}-shm`]) {
+    assertSafeRegularFile(candidate, "Casefile database state");
   }
 
   const db = new DatabaseSync(dbPath);
@@ -554,6 +745,9 @@ function getDb(): DatabaseSync {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_cases_priority ON cases(priority)`);
 
   dbInstance = db;
+  // Best-effort housekeeping: failures and ambiguous state fail closed and do
+  // not prevent the ledger from opening.
+  gcOrphanedPocEvidenceForDb(db);
   return db;
 }
 
@@ -786,9 +980,6 @@ function validateCase(record: CaseRecord): void {
       "Killed cases require evidence, next step, blockers, or assumptions explaining why",
     );
   }
-  // A case becomes REPORTED only after the report FILE exists on disk (the
-  // report writer writes it at the path CaseContext recorded). Require both
-  // here so validation stays consistent with the confirmed→reported gate.
   // A case becomes REPORTED only after a report FILE that passes the content
   // gate exists on disk (the report writer writes it at the path CaseContext
   // recorded). Existence is not enough: any non-empty file — or a directory —
@@ -862,15 +1053,18 @@ const REPORT_REQUIRED_SECTIONS = ["summary", "impact", "remediation"];
  * text (workflow.ts imports this) must not drift apart.
  */
 export const KILL_REASON_VALUES = [
+  "unreachable",
   "intended_behavior",
   "duplicate",
   "framework_protection",
+  "input_validation_blocks",
+  "requires_privilege_attacker_lacks",
   "exploit_unreliable",
   "insufficient_impact",
   "environmental_issue",
   "not_applicable",
   "out_of_scope",
-  "skeptic-disproven",
+  "test_artifact",
   "no_attack_path",
   "refuted",
 ] as const;
@@ -937,7 +1131,7 @@ function validateTransition(
             : "Cannot kill without justification: add refutation evidence (EvidenceAdd role=refutation, " +
                 "artifact_path recommended) or state a kill reason in assumptions/nextStep/blockers " +
                 "(intended_behavior, duplicate, framework_protection, out_of_scope, " +
-                "skeptic-disproven, no_attack_path, ...)",
+                "insufficient_impact, no_attack_path, ...)",
         );
       }
     }
@@ -965,7 +1159,7 @@ function validateTransition(
     },
     investigating: {
       confirmed: () =>
-        "investigating → confirmed requires a verified PoC run; use the promote_finding tool",
+        "investigating → confirmed requires a verified PoC run; use the PromoteFinding tool",
       hypothesis: () => null,
     },
     confirmed: {
@@ -1495,22 +1689,29 @@ export function addEvidenceItemResult(
   if (!summary) throw new Error("Evidence summary must not be empty");
 
   let artifactPath: string | undefined;
+
   let sha256: string | undefined;
   if (input.artifactPath) {
-    if (!existsSync(input.artifactPath)) {
-      throw new Error(`Evidence artifact not found on disk: ${input.artifactPath}`);
+    const artifact = readWorkspaceArtifact(input.artifactPath);
+    artifactPath = basename(artifact.path);
+    sha256 = createHash("sha256").update(artifact.bytes).digest("hex");
+    // Durable copy: artifact_path stores the basename only (path-leak guard),
+    // so the bytes must survive somewhere re-verifiable by the sha256. Copy
+    // into <ledger-dir>/evidence-items/<sha256>.bin — the location is
+    // derivable from the hash column, so no new column or path persistence.
+    const ledgerDir = dirname(getCasefilePath());
+    const evidenceDir = ensureSafeStateDirectory(ledgerDir, ["evidence-items"]);
+    const durable = join(evidenceDir, `${sha256}.bin`);
+    if (!assertSafeRegularFile(durable, "Durable evidence artifact")) {
+      writeSafeFileExclusive(durable, artifact.bytes);
+    } else {
+      const durableHash = createHash("sha256")
+        .update(readSafeFile(durable, "Durable evidence artifact"))
+        .digest("hex");
+      if (durableHash !== sha256) {
+        throw new Error(`Durable evidence artifact hash mismatch: ${durable}`);
+      }
     }
-    const stat = statSync(input.artifactPath);
-    if (!stat.isFile()) {
-      throw new Error(`Evidence artifact is not a regular file: ${input.artifactPath}`);
-    }
-    if (stat.size > EVIDENCE_ARTIFACT_MAX_BYTES) {
-      throw new Error(
-        `Evidence artifact too large (${stat.size} bytes; max ${EVIDENCE_ARTIFACT_MAX_BYTES}): ${input.artifactPath}`,
-      );
-    }
-    artifactPath = basename(input.artifactPath);
-    sha256 = createHash("sha256").update(readFileSync(input.artifactPath)).digest("hex");
   }
 
   const item: EvidenceItem = {
@@ -1814,6 +2015,11 @@ function validateRunEvidence(run: PocEvidenceRun, label: string): void {
   if (!run.outputComplete) {
     throw new Error(`${label} output capture was incomplete; evidence checks are unsafe`);
   }
+  if (run.exitCode !== 0) {
+    throw new Error(
+      `${label} exited with ${run.exitCode}; exit 0 is required for a complete run but is never sufficient proof`,
+    );
+  }
   if (!run.evidence || !run.evidenceSha256) {
     throw new Error(
       `${label} has no evidence.json — the PoC must write evidence to $PI_POC_EVIDENCE_DIR`,
@@ -1821,6 +2027,39 @@ function validateRunEvidence(run: PocEvidenceRun, label: string): void {
   }
   if (!evidenceNonceMatches(run.evidence, run.nonce)) {
     throw new Error(`${label} evidence nonce mismatch — evidence not bound to this run`);
+  }
+  const parsed = parsePoCEvidence(run.evidence);
+  if (!parsed.ok) {
+    throw new Error(`${label} evidence contract invalid: ${parsed.error}`);
+  }
+  if (!run.evidencePath) {
+    throw new Error(`${label} has no durable evidencePath; ephemeral evidence cannot confirm`);
+  }
+  const artifact = readWorkspaceArtifact(run.evidencePath);
+  if (artifact.bytes.byteLength > POC_EVIDENCE_MAX_BYTES) {
+    throw new Error(
+      `${label} durable evidence exceeds ${POC_EVIDENCE_MAX_BYTES} bytes; evidence cannot be revalidated safely`,
+    );
+  }
+  const durableHash = createHash("sha256").update(artifact.bytes).digest("hex");
+  if (durableHash !== run.evidenceSha256) {
+    throw new Error(`${label} durable evidence hash does not match evidenceSha256`);
+  }
+  let durableRaw: unknown;
+  try {
+    durableRaw = JSON.parse(artifact.bytes.toString("utf8"));
+  } catch (error) {
+    throw new Error(`${label} durable evidence is not valid JSON: ${(error as Error).message}`);
+  }
+  const durable = parsePoCEvidence(durableRaw);
+  if (!durable.ok) {
+    throw new Error(`${label} durable evidence contract invalid: ${durable.error}`);
+  }
+  if (
+    normalizeEvidence(durable.evidence) !== normalizeEvidence(run.evidence) ||
+    JSON.stringify(durable.evidence.observations) !== JSON.stringify(run.evidence.observations)
+  ) {
+    throw new Error(`${label} durable evidence bytes do not match the stored evidence object`);
   }
 }
 
@@ -1839,10 +2078,116 @@ function assertEvidenceDifferential(bundle: PendingConfirmation): void {
   }
 }
 
+function assertMachineConfirmation(bundle: PendingConfirmation): void {
+  const oob = bundle.callbackVerified;
+  if (oob?.attempted) {
+    if (oob.targetHits === 0) {
+      throw new Error(
+        `OOB VERIFY FAILED: no interaction with the target-run callback token. ${oob.note}`,
+      );
+    }
+    if (oob.controlHits > 0) {
+      throw new Error(
+        `OOB VERIFY FAILED: the control-run callback token received ${oob.controlHits} interaction(s) — the callback is not target-dependent. ${oob.note}`,
+      );
+    }
+    if (oob.sourceSeparated !== true) {
+      throw new Error(
+        "OOB VERIFY FAILED: callback source separation was not established. " +
+          "A loopback listener reachable by the PoC is diagnostic telemetry, not proof that the target caused the interaction.",
+      );
+    }
+    return;
+  }
+
+  assertHarnessTargetOnly(
+    bundle.harnessVerified,
+    "HARNESS DIFFERENTIAL FAILED",
+    "no machine-owned target/control replay was recorded",
+  );
+}
+
+function assertHarnessTargetOnly(
+  harness: HarnessVerifyResult | undefined,
+  label: string,
+  missingNote: string,
+): asserts harness is HarnessVerifyResult {
+  if (
+    !harness?.attempted ||
+    harness.pass !== true ||
+    harness.differential !== "target_only" ||
+    harness.target?.matched !== true ||
+    harness.control?.matched !== false
+  ) {
+    throw new Error(`${label}: ${harness?.note ?? missingNote}`);
+  }
+}
+
+function assertHarnessCanary(
+  harness: HarnessVerifyResult | undefined,
+  required: boolean,
+  label: string,
+): void {
+  if (!required) return;
+  if (
+    harness?.canary?.attempted !== true ||
+    harness.canary.pass !== true ||
+    harness.canary.targetObserved !== true ||
+    harness.canary.controlObserved !== false ||
+    harness.proofStrength !== "canary_differential"
+  ) {
+    throw new Error(`${label}: ${harness?.canary?.note ?? "required canary transcript missing"}`);
+  }
+}
+
+function assertMainAgentVerification(
+  bundle: PendingConfirmation,
+  verification: MainAgentVerification | undefined,
+): asserts verification is MainAgentVerification {
+  if (!verification) {
+    throw new Error(
+      "MAIN-AGENT REPLAY REQUIRED: ConfirmFinding must produce a fresh harness-owned target/control transcript",
+    );
+  }
+  const at = Date.parse(verification.at);
+  const bundleAt = Date.parse(bundle.ranAt);
+  const now = Date.now();
+  if (
+    !Number.isFinite(at) ||
+    !Number.isFinite(bundleAt) ||
+    at < bundleAt ||
+    at > now + 30_000 ||
+    now - at > 5 * 60 * 1000
+  ) {
+    throw new Error(
+      "MAIN-AGENT REPLAY FAILED: transcript timestamp must be valid, newer than phase 1, and no more than 5 minutes old",
+    );
+  }
+  assertHarnessTargetOnly(
+    verification.result,
+    "MAIN-AGENT REPLAY FAILED",
+    "no fresh phase-2 target/control replay was recorded",
+  );
+  assertHarnessCanary(
+    verification.result,
+    bundle.targetRuns[0].evidence.verify.canary !== undefined,
+    "MAIN-AGENT CANARY FAILED",
+  );
+  const targetUrl = verification.result.target?.url;
+  const controlUrl = verification.result.control?.url;
+  const targetIdentity = bundle.targetRuns[0].target;
+  if (!targetUrl || verifyUrlBindingError(targetUrl, targetIdentity)) {
+    throw new Error("MAIN-AGENT REPLAY FAILED: target transcript is not bound to the case target");
+  }
+  if (!controlUrl || verifyUrlBindingError(controlUrl, bundle.controlTarget)) {
+    throw new Error("MAIN-AGENT REPLAY FAILED: control transcript is not bound to control_target");
+  }
+}
+
 /**
  * Gate for phase 1 of promotion: case must exist, be investigating, and have
  * poc/evidence/impact/severity/target. The disconfirmation is provided by the
- * confirmer at confirm time, so it is NOT a precondition here. Returns the
+ * main agent at confirm time, so it is NOT a precondition here. Returns the
  * record when promotable, throws otherwise. Exported so PromoteFinding can
  * validate BEFORE paying for (potentially slow) sandboxed PoC runs.
  */
@@ -1890,7 +2235,7 @@ export function assertPromotable(id: string): CaseRecord {
  * contract is validated here — same-file control, nonce binding, run
  * completion, determinism across the two target runs, and the target/control
  * differential — so a bundle that cannot promote is rejected before the
- * confirmer is ever dispatched.
+ * main agent performs phase-2 review.
  */
 export function storePendingConfirmation(id: string, bundle: PendingConfirmation): CaseRecord {
   const db = getDb();
@@ -1961,6 +2306,23 @@ export function storePendingConfirmation(id: string, bundle: PendingConfirmation
       validateRunEvidence(run, `${run.mode} run`);
     }
     assertEvidenceDifferential(bundle);
+    if (!bundle.callbackVerified?.attempted) {
+      for (const run of bundle.targetRuns) {
+        const bindingError = verifyUrlBindingError(run.evidence.verify.url, targetRunTarget);
+        if (bindingError) throw new Error(`TARGET BINDING FAILED: ${bindingError}`);
+      }
+      const controlBindingError = verifyUrlBindingError(
+        bundle.controlRun.evidence.verify.url,
+        bundle.controlTarget,
+      );
+      if (controlBindingError) {
+        throw new Error(`CONTROL BINDING FAILED: ${controlBindingError}`);
+      }
+    }
+    // A clean exit and model-authored evidence are necessary inputs, never the
+    // proof. Promotion requires a harness-observed target/control differential
+    // or a harness-owned OOB interaction differential.
+    assertMachineConfirmation(bundle);
 
     const next = buildRecord({ pendingConfirmation: bundle }, current);
     validateCase(next);
@@ -1970,19 +2332,28 @@ export function storePendingConfirmation(id: string, bundle: PendingConfirmation
 }
 
 /**
- * Phase 2: commit (or refuse) the promotion on a confirmer verdict.
+ * Phase 2: commit (or refuse) the promotion on the main agent's verdict.
  *
  * CONFIRMED requires the full bundle to still hold (completion, nonce,
  * determinism, differential), the PoC script to be unchanged since the runs
- * (pocSha256 — otherwise the confirmer reviewed different bytes), and a
- * verdict that re-executed the verify request with a target-only differential
- * and a disconfirmation attempt. NOT_CONFIRMED records the verdict and keeps
- * the case investigating — no tie-breaker.
+ * (pocSha256 — otherwise the main agent reviewed different bytes), and a
+ * verdict accompanied by a fresh harness-owned target-only replay, a concrete
+ * review note, and a disconfirmation attempt. NOT_CONFIRMED records the
+ * verdict and keeps the case investigating — no tie-breaker.
  */
 export function applyConfirmationResult(
   id: string,
-  verdictInput: ConfirmerVerdict,
+  verdictInput: MainAgentVerdict,
+  phase2Verification?: MainAgentVerification,
+  authority: { startedAsSubagent: boolean } = {
+    startedAsSubagent: PROCESS_STARTED_AS_SUBAGENT || process.env.PI_SUBAGENT_CHILD === "1",
+  },
 ): CaseUpdateResult {
+  if (authority.startedAsSubagent) {
+    throw new Error(
+      "ConfirmFinding is reserved for the main/coordinator agent; worker processes cannot commit confirmation",
+    );
+  }
   const db = getDb();
   return withImmediateTransaction(db, () => {
     const current = getCaseById(id);
@@ -2003,17 +2374,48 @@ export function applyConfirmationResult(
         "Pending confirmation expired or has an invalid timestamp (1h TTL) — re-run PromoteFinding for a fresh bundle",
       );
     }
-    const parsed = validateConfirmerVerdict(verdictInput);
-    if (!parsed.ok) throw new Error(`Invalid confirmer verdict: ${parsed.error}`);
+    const parsed = validateMainAgentVerdict(verdictInput);
+    if (!parsed.ok) throw new Error(`Invalid main-agent confirmation verdict: ${parsed.error}`);
     const verdict = parsed.verdict;
-    const recorded: ConfirmerVerdictRecord = { ...verdict, at: new Date().toISOString() };
+    const canaryRequested = bundle.targetRuns[0].evidence.verify.canary !== undefined;
+    if (verdict.verdict === "CONFIRMED") {
+      if (canaryRequested && verdict.canary_assessment !== "verified") {
+        throw new Error(
+          "CONFIRMED canary mismatch: evidence requested a harness canary, so canary_assessment must be verified",
+        );
+      }
+      if (!canaryRequested && verdict.canary_assessment !== "not_applicable") {
+        throw new Error(
+          "CONFIRMED canary mismatch: this evidence has no canary template; record canary_assessment=not_applicable and explain why",
+        );
+      }
+    }
+    const recorded: MainAgentVerdictRecord = {
+      ...verdict,
+      at: new Date().toISOString(),
+      reviewer: "main_agent",
+      phase2Verification: verdict.verdict === "CONFIRMED" ? phase2Verification : undefined,
+      proofStrength:
+        verdict.verdict === "CONFIRMED"
+          ? canaryRequested
+            ? "canary_differential"
+            : "predicate_differential"
+          : undefined,
+    };
 
     if (verdict.verdict === "NOT_CONFIRMED") {
-      const note = `confirmer NOT_CONFIRMED${verdict.model ? ` (${verdict.model})` : ""}: ${verdict.reasoning}`;
+      const note = `main agent NOT_CONFIRMED${verdict.model ? ` (${verdict.model})` : ""}: ${verdict.reasoning}`;
       const next = buildRecord(
-        { confirmerVerdict: recorded, assumptions: [...(current.assumptions ?? []), note] },
+        {
+          confirmerVerdict: recorded,
+          pendingConfirmation: undefined,
+          assumptions: [...(current.assumptions ?? []), note],
+        },
         current,
       );
+      // buildRecord's nullish fallback preserves the old value; consume the
+      // rejected attempt explicitly so a retry must produce fresh evidence.
+      next.pendingConfirmation = undefined;
       validateCase(next);
       upsertCase(db, next);
       return { record: next, changed: true };
@@ -2025,6 +2427,8 @@ export function applyConfirmationResult(
       validateRunEvidence(run, `${run.mode} run`);
     }
     assertEvidenceDifferential(bundle);
+    assertMachineConfirmation(bundle);
+    assertHarnessCanary(bundle.harnessVerified, canaryRequested, "PHASE-1 CANARY FAILED");
     let pocHash: string | undefined;
     try {
       pocHash = createHash("sha256").update(readFileSync(bundle.pocPath)).digest("hex");
@@ -2033,7 +2437,7 @@ export function applyConfirmationResult(
     }
     if (!pocHash || pocHash !== bundle.pocSha256) {
       throw new Error(
-        "PoC script changed since the runs — re-run PromoteFinding (the confirmer must review the exact bytes that ran)",
+        "PoC script changed since the runs — re-run PromoteFinding (the main agent must review the exact bytes that ran)",
       );
     }
     // The case target must still be the host the PoC ran against, and still
@@ -2062,6 +2466,11 @@ export function applyConfirmationResult(
       );
     }
 
+    // Phase 1 proves the evidence floor. Phase 2 must freshly replay that same
+    // request inside the main agent's ConfirmFinding call; a caller-provided
+    // boolean is not accepted as proof of re-execution.
+    assertMainAgentVerification(bundle, phase2Verification);
+
     const reproductionItem: EvidenceItem = {
       id: `ev_${stableShortId(`${id}\nreproduction\n${targetRun.ranAt}`)}`,
       caseId: id,
@@ -2071,7 +2480,7 @@ export function applyConfirmationResult(
       // exists, so the item stays artifact-backed and re-verifiable.
       artifactPath: targetRun.evidencePath ? basename(targetRun.evidencePath) : "evidence.json",
       sha256: targetRun.evidenceSha256,
-      summary: `PoC evidence verified (2 target runs + control) — confirmer CONFIRMED${verdict.model ? ` (${verdict.model})` : ""}`,
+      summary: `PoC evidence accepted (2 target runs + control; ${recorded.proofStrength}) — main agent semantic confirmation${verdict.model ? ` (${verdict.model})` : ""}`,
       createdAt: targetRun.ranAt,
     };
 
@@ -2080,7 +2489,8 @@ export function applyConfirmationResult(
       `### PoC Execution Capture (${targetRun.ranAt})\n` +
       `- **Evidence sha256:** ${targetRun.evidenceSha256}\n` +
       `- **Target:** ${targetRun.target}\n` +
-      `- **Confirmer:** ${verdict.model ?? "unknown model"} — CONFIRMED\n` +
+      `- **Machine evidence:** ${recorded.proofStrength} (a differential is not by itself proof of exploitation)\n` +
+      `- **Main-agent reviewer:** ${verdict.model ?? "unknown model"} — semantic confirmation\n` +
       `#### Target Run Output\n\`\`\`\n${targetRun.output ?? ""}\n\`\`\``;
 
     const update: NormalizedCaseInput = {
@@ -2194,8 +2604,21 @@ function eTLDPlus1(host: string): string {
   return parts.slice(-2).join(".");
 }
 
+/**
+ * Ruled-out phrasings that must not contribute to chain matching. Sentence
+ * granularity keeps the positive signals intact: "no CSRF token on /transfer"
+ * (a reason XSS→state-change chains) is NOT dropped — only explicit
+ * "this class is not a finding" sentences are.
+ */
+const CHAIN_NEGATION_RE =
+  /\b(not vulnerable|not susceptible|not exploitable|not present|not found|not affected|ruled out|no vulnerability|no vuln|no evidence of|absence of|false positive|not a finding|no issue found|dismissed|non-?vulnerable|not reachable)\b/i;
+
 function chainText(c: CaseRecord): string {
-  return [c.title, c.bugClass ?? "", c.evidence ?? ""].join(" ");
+  const raw = [c.title, c.bugClass ?? "", c.evidence ?? ""].join(" ");
+  return raw
+    .split(/[.;\n]+/)
+    .filter((s) => !CHAIN_NEGATION_RE.test(s))
+    .join(" ");
 }
 
 function hasChainClass(c: CaseRecord, re: RegExp): boolean {
@@ -2225,23 +2648,29 @@ function sameAssetOrRelated(a: CaseRecord, b: CaseRecord): boolean {
   return eTLDPlus1(ta) === eTLDPlus1(tb);
 }
 
-/**
- * Scan non-terminal cases for exploitable chains (CyberStrike-style detection
- * over XPI's case records). Emits ranked suggestions; the agent decides
- * whether to CaseLink or open an escalation case.
- */
 export function suggestChains(caseId?: string): ChainSuggestion[] {
   // Pair over ALL non-terminal cases; the caseId filter narrows the RESULTS
   // to suggestions involving that case (filtering the inputs first would drop
   // unlinked partner cases and kill cross-case pairing).
   const cases = readCasefile().filter((c) => c.status !== "killed" && c.status !== "reported");
+  // Already-linked pairs are existing knowledge, not a missed combination —
+  // suggesting them again is noise. One query for every link row.
+  const linkedPairs = new Set<string>();
+  const linkRows = getDb().prepare("SELECT source_id, target_id FROM case_links").all() as {
+    source_id: string;
+    target_id: string;
+  }[];
+  for (const row of linkRows) linkedPairs.add([row.source_id, row.target_id].sort().join("+"));
   const suggestions: ChainSuggestion[] = [];
   const seen = new Set<string>();
   const confirmed = (c: CaseRecord) => c.status === "confirmed";
   const confidenceFor = (a: CaseRecord, b?: CaseRecord) => {
     const both = confirmed(a) && (!b || confirmed(b));
     const one = confirmed(a) || (b ? confirmed(b) : false);
-    return both ? 90 : one ? 75 : 55;
+    const anyHypothesis = a.status === "hypothesis" || (b ? b.status === "hypothesis" : false);
+    if (both) return 90;
+    if (anyHypothesis) return 40; // unproven primitives chain weakly
+    return one ? 75 : 60;
   };
   const add = (
     pattern: ChainPattern,
@@ -2250,6 +2679,7 @@ export function suggestChains(caseId?: string): ChainSuggestion[] {
     rationale: string,
     kind?: CaseLinkKind,
   ) => {
+    if (b && linkedPairs.has([a.id, b.id].sort().join("+"))) return; // already known
     const key = b ? `${pattern}:${[a.id, b.id].sort().join("+")}` : `${pattern}:${a.id}`;
     if (seen.has(key)) return;
     seen.add(key);
@@ -2815,11 +3245,13 @@ function buildScratchpadSection(caseId: string): string {
     : "No scratchpad run found containing this case id (manual/CTF run without pipeline artifacts).";
 }
 
-export function writeCaseContext(id: string): {
+export type CaseContextResult = {
   path: string;
   contextPath: string;
   record: CaseRecord;
-} {
+};
+
+export function writeCaseContext(id: string): CaseContextResult {
   const current = getCaseById(id);
   if (!current) throw new Error(`Case not found: ${id}`);
   if (current.status !== "confirmed" && current.status !== "reported") {
@@ -2896,7 +3328,7 @@ export function writeCaseContext(id: string): {
     current.controlVerified
       ? mdSection(
           "Control-Target Check (anti-cheat)",
-          `### Control Run Verification\n- **Timestamp:** ${current.controlVerified.ranAt}\n- **Script:** \`${basename(current.controlVerified.path)}\`\n- **Sandbox:** ${current.controlVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.controlVerified.exitCode}\n- **Control target:** ${current.controlVerified.target ?? "not recorded"}\n- **Differential (machine-checked):** control evidence differs from the target runs' evidence — the claimed impact is target-dependent (assertEvidenceDifferential, re-checked at confirm).\n- **Note:** exit codes and output markers are diagnostics, not gates; the machine floor is the evidence differential + the confirmer's re-execution.\n\n#### Output\n\`\`\`\n${current.controlVerified.output ?? ""}\n\`\`\``,
+          `### Control Run Verification\n- **Timestamp:** ${current.controlVerified.ranAt}\n- **Script:** \`${basename(current.controlVerified.path)}\`\n- **Sandbox:** ${current.controlVerified.sandbox ? "yes" : "no"}\n- **Exit Code:** ${current.controlVerified.exitCode}\n- **Control target:** ${current.controlVerified.target ?? "not recorded"}\n- **Differential (machine-checked):** control evidence differs from the target runs' evidence — the claimed impact is target-dependent (assertEvidenceDifferential, re-checked at confirm).\n- **Note:** zero exit is necessary run integrity, never vulnerability proof; output markers are diagnostic only. The machine floor is the harness differential plus main-agent review.\n\n#### Output\n\`\`\`\n${current.controlVerified.output ?? ""}\n\`\`\``,
         )
       : undefined,
     mdSection("Disconfirmation Attempt", current.disconfirmation),

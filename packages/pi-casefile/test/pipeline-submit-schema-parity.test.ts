@@ -9,7 +9,7 @@ import { describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-
+import { KILL_REASON_VALUES } from "../src/ledger.ts";
 import { SPECS, type SubmitStage } from "../src/pipeline-submit.ts";
 
 const SCHEMAS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "schemas");
@@ -24,6 +24,7 @@ const STAGE_TO_SCHEMA: Record<SubmitStage, string> = {
 };
 
 function loadSchema(stage: SubmitStage): {
+  additionalProperties?: boolean;
   required?: string[];
   properties?: Record<string, { enum?: string[] }>;
   oneOf?: { required?: string[] }[];
@@ -56,7 +57,22 @@ describe("pipeline_submit > schemas/*.json parity with SPECS", () => {
         expect([...(schemaEnum ?? [])].sort()).toEqual([...field.enum].sort());
       }
     });
+
+    it(`${stage} (${STAGE_TO_SCHEMA[stage]}): top-level field policy matches`, () => {
+      const schema = loadSchema(stage);
+      expect(schema.additionalProperties).toBe(false);
+      expect(Object.keys(schema.properties ?? {}).sort()).toEqual([...SPECS[stage].allowed].sort());
+    });
   }
+
+  it("skeptic and validation terminal-reason enums share the ledger vocabulary", () => {
+    expect(loadSchema("skeptic").properties?.disproval_reason?.enum?.sort()).toEqual(
+      [...KILL_REASON_VALUES].sort(),
+    );
+    expect(loadSchema("validate").properties?.kill_reason?.enum?.sort()).toEqual(
+      [...KILL_REASON_VALUES].sort(),
+    );
+  });
 
   it("hunt locator XOR: JSON schema encodes exactly file+line OR endpoint", () => {
     const schema = loadSchema("hunt");

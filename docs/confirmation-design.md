@@ -1,104 +1,129 @@
-# PoC Confirmation — Implementation Spec
+# PoC Confirmation — Main-Agent Commit Design
 
-Supersedes the marker/exit-0 gate. Confirmation = harness-observed evidence + independent agent verdict. Exit code and markers are demoted to diagnostics.
+> Status: implemented. This supersedes marker- and exit-code-based confirmation and the former confirmer-worker design.
 
-## 1. Trust chain (what a promotion requires)
+## 1. Authority invariant
 
+Only the main/coordinator agent may decide whether a PoC is confirmed.
+
+- A worker may write and run a PoC and call `PromoteFinding` to create a pending evidence bundle.
+- A worker must report `pending_confirmation`; it cannot report or commit `confirmed`.
+- No confirmation worker is dispatched. `agents/confirmer.md` is intentionally absent.
+- The main agent must inspect the exact PoC and preserved evidence, attempt to disprove the claim, and call `ConfirmFinding` itself; that main-only call captures the fresh target/control replay.
+- `CaseUpdate(status: "confirmed")` remains invalid.
+
+The machine gate establishes a reproducible evidence floor. The main agent owns the semantic judgment: whether the observed differential actually proves the stated vulnerability and impact.
+
+## 2. Trust chain
+
+```text
+worker's PoC
+  → complete zero-exit execution with complete output capture
+  → nonce-bound, schema-valid evidence.json with a body predicate
+  → two deterministic target runs and one same-byte-script control run
+  → operator-approved distinct control target
+  → harness-owned DNS-pinned replay of one request against target and control
+  → optional harness-generated reflection canary observed on target only
+  → conclusive target match + conclusive control non-match (`target_only`)
+  → pending_confirmation bundle
+  → main agent reviews and tries to disprove
+  → ConfirmFinding performs a fresh harness-owned target/control replay
+  → ledger revalidates the bundle and commits or refuses the verdict
 ```
-writer's claim
-  → completed + outputComplete        (harness-measured: it ran, capture complete)
-  → evidence.json (nonce-bound)       (writer's structured claim; schema-validated)
-  → control-run evidence differential (code check: target ≈ control → not target-dependent)
-  → confirmer verdict CONFIRMED       (independent agent, re-executes, adversarial)
-  → ledger commit (re-checks all)     (defense-in-depth, same as today)
-```
 
-NOT_CONFIRMED is final for that attempt, no tie-breaker. Exit code recorded as diagnostic, never a gate.
+`exitCode === 0` is required only to show that the run completed normally. It never proves a vulnerability by itself. Stdout and the PoC-authored observations are retained as audit material, not treated as the deciding oracle.
 
-## 2. Evidence contract
+## 3. Evidence contract
 
-PoC gets two new env vars from the runner:
+The runner provides:
 
-- `PI_POC_EVIDENCE_DIR` — writable dir in the sandbox; the PoC writes `evidence.json` there.
-- `PI_POC_NONCE` — per-run random token; the PoC MUST echo it inside `evidence.json`. Binds the evidence to its run (kills copy-pasted evidence between runs).
+- `PI_POC_EVIDENCE_DIR`: a harness-created directory for `evidence.json`.
+- `PI_POC_NONCE`: a fresh per-run value that the evidence must echo.
+- `PI_POC_TARGET` and `PI_POC_MODE`: the target and execution mode.
 
-`evidence.json` schema (validated by the harness before anything else):
+Minimal evidence shape:
 
 ```jsonc
 {
-  "nonce": "must match PI_POC_NONCE of this run",
-  "claim": "what the exploit asserts (e.g. 'read /etc/passwd of target')",
-  "verify": {                       // request spec the confirmer re-executes
-    "method": "GET", "url": "...", "headers": {...}, "body": "...",
-    "expect": { "status": [200], "body_contains": ["root:"], "body_regex": [] }
+  "nonce": "must equal PI_POC_NONCE",
+  "claim": "the concrete effect being asserted",
+  "verify": {
+    "method": "GET",
+    "url": "https://target.example/path",
+    "headers": {},
+    "body": "",
+    "expect": {
+      "status": [200],
+      "body_contains": ["target-specific proof"]
+    },
+    "canary": {
+      "mode": "reflection",
+      "placeholder": "{{PI_POC_CANARY}}"
+    }
   },
-  "observations": ["free-form what the script itself saw"],  // corroboration only
-  "baseline": { "method": "GET", "url": "...", "body_contains": [] }  // optional differential
+  "observations": ["corroboration only"]
 }
 ```
 
-Control run produces its own `evidence.json` with its own nonce. The harness compares the two **structured evidence objects** (not strings): identical `claim`+`verify.expect` outcomes on target and control → blocked as not-target-dependent. This replaces marker-absence + liveness string checks.
+The contract is bounded and strict. A discriminating `body_contains` or `body_regex` assertion is mandatory; status-only and structurally trivial predicates such as one-character contains, `.*`, or `\\d+` are rejected. Authority/framing/hop-by-hop request headers are forbidden. The file must be a regular non-symlink file, is size-limited, read once, hashed from the validated bytes, and copied into the durable evidence store before the run can count.
 
-## 3. Two-phase flow (tool layer cannot dispatch subagents)
+For reflection-capable findings, `verify.canary` strengthens causality. The fixed placeholder must occur exactly once in the URL, body, or a header value. Only after the PoC process exits, the harness generates an unpredictable token, substitutes it into its own replay, and requires the token to appear in the target response but not the control response. The raw token is never persisted—only its SHA-256 and the target/control observations are stored. This produces `proofStrength: "canary_differential"`; evidence without a canary is honestly labeled `predicate_differential`.
 
-Phase 1 — **PromoteFinding** (reworked, breaking):
-1. `assertPromotable` (evidence chain, poc/impact/severity/target — observation artifact still required).
-2. Run PoC against case target → evidence A.
-3. Run same script against `control_target` → evidence B (same-script sha256 check stays).
-4. Require on both: `completed`, `outputComplete`, valid nonce-bound evidence.json.
-5. Cheap code differential: A and B both "succeed" → block.
-6. Record `pending_confirmation` bundle on the case (paths, outputs, evidence, ranAt).
-7. Return the bundle + the confirmer dispatch instruction (task text with case id + bundle path).
+## 4. Phase 1 — worker-capable evidence production
 
-Coordinator dispatches the confirmer subagent (`agents/confirmer.md`, fresh context):
-- Reads the PoC script, both evidence files, both raw outputs.
-- Re-sends the `verify` request itself via `http_request`; compares its own response to `expect`.
-- Compares target vs control evidence (behavior differential).
-- Hunts cheats: unconditional success, trivially-true checks, hardcoded values, local mocks.
-- Returns the structured verdict.
+`PromoteFinding` does not promote the case. It:
 
-Phase 2 — **ConfirmFinding** (new tool):
-1. Schema-validate the verdict.
-2. Pending bundle exists and is not stale.
-3. `NOT_CONFIRMED` → record reasoning on the case (assumptions), stays investigating. Retry allowed with a new confirmer dispatch; each attempt recorded.
-4. `CONFIRMED` → `promoteFindingResult` commits: status confirmed, verdict + evidence hashes recorded, `disconfirmation` filled from the confirmer's own disproof attempt, reproduction evidence item created from `evidence.json` (hash), pending bundle cleared.
+1. Checks the case prerequisites and requires an earlier artifact-backed observation.
+2. Requires `poc_path` and `control_path` to contain identical bytes.
+3. Requires `control_target` to be distinct and present in the operator-owned `PI_POC_CONTROL_TARGETS` allowlist.
+4. Runs the PoC twice against the target and once against the control.
+5. Requires every run to complete, capture all output, exit zero, and produce valid nonce-bound evidence.
+6. Requires the two target evidence specifications to be deterministic.
+7. Replays the target evidence request with the harness HTTP client against both origins. DNS is pinned at connect time, redirects remain on the bound hostname, and unsafe addresses are rejected unless explicitly authorized.
+8. Requires both responses to be conclusive and the result to be `target_only`.
+9. If the request declares a reflection canary, also requires target-only reflection of the harness-generated token.
+10. Records a one-hour `pending_confirmation` bundle and returns control to the main agent.
 
-## 4. What the confirmer's disconfirmation replaces
+A control transport failure is inconclusive, not a passing negative control. Blind/OOB claims fail closed because the current runner cannot prove that a callback came from the target rather than the PoC.
 
-The old `disconfirmation_path` script + non-zero-exit gate goes away. The confirmer's adversarial attempt ("assume fabricated, prove it real") is executed by an independent actor and becomes the case's `disconfirmation`. The `exit 1` cheat dies with the mechanism.
+## 5. Phase 2 — main-agent-only decision
 
-## 5. File-by-file update map
+The main agent must personally:
 
-**New**
-- `agents/confirmer.md` — agent definition: mandate, tool list (read, http_request, CaseGet, bash for re-run later), verdict contract, cheat-hunting checklist, severity sanity.
-- `schemas/stage-confirm.json` — verdict schema (mirror pattern: doc) + parity test against the executable validator.
-- `packages/pi-casefile/src/evidence.ts` — evidence schema + validator (TypeBox), nonce check, bundle builder (what the confirmer reviews), verdict validator.
-- `docs/confirmation-design.md` — this spec.
+1. Read the PoC bytes identified by the stored SHA-256.
+2. Read the preserved target/control evidence and harness observations.
+3. Check for trivial predicates, unconditional success, hard-coded proof, local mocks, and severity inflation.
+4. Perform a concrete disconfirmation attempt.
+5. Call `ConfirmFinding` with `CONFIRMED` or `NOT_CONFIRMED`.
 
-**Modified**
-- `packages/pi-casefile/src/poc-runner.ts` — create evidence dir in sandbox workspace, inject `PI_POC_EVIDENCE_DIR` + `PI_POC_NONCE`, parse/validate `evidence.json` into `PocRun.evidence`; exitCode re-documented as diagnostic.
-- `packages/pi-casefile/src/index.ts` — PromoteFinding → phase 1 (drop marker/liveness/disconfirmation-param gates; add bundle + instruction); new ConfirmFinding tool; renderers + descriptions.
-- `packages/pi-casefile/src/ledger.ts` — new columns (`pending_confirmation_json`, `confirmer_verdict_json`) via idempotent ALTER; `assertPromotable` drops the `disconfirmation` pre-requirement; `promoteFindingResult` rewritten: verdict-gated, nonce re-check, control differential, records verdict + evidence hashes, fills disconfirmation, clears pending.
-- `packages/pi-casefile/src/workflow.ts` — "At VALIDATE" rewritten: two-phase flow, confirmer dispatch, evidence.json, demoted exit-0/marker language, disconfirmation-by-confirmer.
-- `skills/cyberwf/SKILL.md`, `packages/pi-casefile/skills/casefile/SKILL.md`, `docs/guide.md`, `packages/pi-casefile/README.md` — tool reference + gate descriptions.
-- Tests: `poc-runner.test.ts` (evidence collection, nonce), `ledger.test.ts` (verdict-gated promotion, differential block), `index.test.ts` (two-phase, stale bundle), new parity test for stage-confirm.
+On `CONFIRMED`, the tool re-sends the immutable request against the target and approved control with the harness HTTP client. Both responses must again be conclusive and `target_only`; the transcript is timestamped and stored with the verdict. A caller-supplied `re_executed` boolean is not accepted.
 
-**Removed**
-- PromoteFinding params: `verification_marker`, `control_liveness_marker`, `disconfirmation_path` (breaking change).
-- Marker presence/absence checks, liveness check, disconfirmation-script gate in index.ts + ledger.ts.
+`CONFIRMED` requires `re_execution_note`, `differential: "target_only"`, reviewed evidence, reasoning, and the main agent's `disconfirmation_attempt`. It also requires `canary_assessment: "verified"` when the evidence requested a canary, or `canary_assessment: "not_applicable"` plus a concrete reason when that oracle does not fit the exploit class. Before committing, the ledger rechecks the pending bundle, its age, both machine differentials, the canary transcript when requested, the current case target, the PoC hash, and evidence provenance. The persisted verdict is stamped `reviewer: "main_agent"` and with the derived proof strength.
 
-## 6. Unchanged (keep-list)
+`NOT_CONFIRMED` records the reasoning, keeps the case investigating, and consumes the pending bundle. Any retry requires a fresh `PromoteFinding` run.
 
-Sandbox + sentinel + containment, `completed`/`outputComplete`, same-script control sha256, observation artifact requirement, state machine + proof-bound field locks, report content gate, scratchpad + PipelineSubmit, evidence-chain closure at report time.
+## 6. Enforcement boundaries
 
-## 7. Open decisions (block on these before coding)
+The design uses several independent controls:
 
-1. **Double target run for determinism** — run the PoC twice and require both evidence files consistent, or once? (Cost: +1 sandbox run per promotion. Lean: yes — it also gives the confirmer two transcripts to compare.)
-2. **Confirmer model** — must differ from the writer. Enforce via operator env (`PI_CONFIRMER_MODEL`) with a hard fail when unset, or soft (workflow text only)?
-3. **Confirmer re-running the PoC** — v1: replay-only (http_request). Sandboxed re-run via a harness tool is v2. Confirm.
-4. **Pending-bundle staleness** — TTL between phase 1 and ConfirmFinding (e.g. 1h) or unlimited?
-5. **Cheap code differential** — in v1 (step 2.5) or deferred to the confirmer only?
+- Worker agent definitions omit `ConfirmFinding`.
+- Workflow text forbids delegating phase 2.
+- The extension captures `PI_SUBAGENT_CHILD` when it initializes and omits `ConfirmFinding` when that snapshot says worker. Its role check is monotonic (`started as worker` OR `currently marked worker`), so unsetting the variable in a child shell cannot upgrade the already-running extension.
+- The ledger captures the same module-start role and independently checks the authority snapshot supplied by the extension before committing.
+- Validation-stage worker output has `pending_confirmation`, not `confirmed`.
+- The ledger is the only component that can transition the case to `confirmed`, and it records main-agent provenance.
+
+The `confirmer_verdict_json` database column and a few internal `confirmerVerdict` identifiers are retained for backward compatibility with existing casefiles. They do not represent a confirmer worker.
+
+## 7. Honest limits
+
+- The fresh phase-2 network transcript is harness-owned, but the main agent's semantic review and disconfirmation are not cryptographically bound to an orchestration identity. The monotonic role snapshot closes the environment-unset gap inside a running extension; it does not stop a same-UID shell user from starting a new clean process or editing SQLite directly.
+- The main agent still defines the semantic strength of the predicate and the severity judgment.
+- A useful control must be supplied and approved by the operator; the harness can enforce identity and differential behavior, not prove that the control is an ideal patched twin.
+- Reflection canaries are implemented, but source-separated OOB verification and general file/account/state canary oracles are not, so claims needing those channels remain investigating.
+
+The next authority hardening step is an unforgeable, orchestration-issued main-agent capability (or OS-isolated broker) bound to the final verdict and ledger write.
 
 ## 8. Migration
 
-Existing confirmed cases keep their marker-based verification records (read-only, backward compatible). Only new promotions use the new path. No data rewrite needed; new columns are additive.
+Existing stored verdicts remain readable. New verdicts add `reviewer: "main_agent"`. Existing marker-era records are historical evidence only; all new promotions use the two-phase gate above.

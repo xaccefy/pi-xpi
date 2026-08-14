@@ -1,7 +1,7 @@
 /**
  * Casefile — offensive security case tracker for Pi.
  *
- * Tools: CaseAdd, CaseUpdate, PromoteFinding, EvidenceAdd, CoverageAdd, CoverageReport, ChainSuggest, CaseGet, CaseList, CaseSearch, CaseLink, CaseUnlink, CaseContext, PipelineSubmit, ScratchpadInit, ScratchpadResume, ScratchpadCheckpoint, ScratchpadWrite, ScratchpadRead, ScratchpadPhaseDone, ScratchpadClear
+ * Tools: CaseAdd, CaseUpdate, PromoteFinding, ConfirmFinding, EvidenceAdd, CoverageAdd, CoverageReport, ChainSuggest, CaseGet, CaseList, CaseSearch, CaseLink, CaseUnlink, CaseContext, PipelineSubmit, ScratchpadInit, ScratchpadResume, ScratchpadCheckpoint, ScratchpadWrite, ScratchpadRead, ScratchpadPhaseDone, ScratchpadClear
  * Command: /casefile — interactive dashboard
  * Event: before_agent_start — injects cyber workflow once per session, refreshes the active case list per prompt
  */
@@ -13,11 +13,17 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
+  CANARY_ASSESSMENT_VALUES,
   CONFIRM_DIFFERENTIAL_VALUES,
   CONFIRM_VERDICT_VALUES,
-  type ConfirmerVerdict,
   SEVERITY_MATCH_VALUES,
+  validateMainAgentVerdict,
 } from "./evidence.ts";
+import {
+  controlTargetAuthorizationError,
+  type HarnessVerifyResult,
+  replayDifferential,
+} from "./harness-verify.ts";
 import {
   addCaseResult,
   addEvidenceItemResult,
@@ -47,6 +53,7 @@ import {
   getCasefilePath,
   LINK_KIND_VALUES,
   linkCasesResult,
+  type MainAgentVerification,
   type PendingConfirmation,
   type PocEvidenceRun,
   PRIORITY_VALUES,
@@ -58,11 +65,10 @@ import {
   STATUS_VALUES,
   searchCases,
   storePendingConfirmation,
-  suggestChains,
   unlinkCasesResult,
   updateCaseResult,
-  writeCaseContext,
 } from "./ledger.ts";
+import { suggestChainsAsync, writeCaseContextAsync } from "./ledger-worker.ts";
 import { pipeline_submit, SUBMIT_STAGES, type SubmitStage } from "./pipeline-submit.ts";
 import { type PocRun, type PocRunOptions, runPoc } from "./poc-runner.ts";
 import {
@@ -167,8 +173,7 @@ const EvidenceAddSchema = Type.Object(
     artifact_path: Type.Optional(
       Type.String({
         description:
-          "Path to the artifact file on disk. Stored as basename + SHA-256 hash " +
-          "(full path is never persisted).",
+          "Path to a regular, non-symlink artifact inside the workspace. The bytes are copied durably and stored as basename + SHA-256 (full source path is never persisted).",
       }),
     ),
   },
@@ -177,12 +182,12 @@ const EvidenceAddSchema = Type.Object(
 
 // ── Tool: PromoteFinding (phase 1) / ConfirmFinding (phase 2) ──────────
 //
-// Confirmation is TWO-PHASE because tools cannot dispatch subagents: the
-// coordinator runs PromoteFinding (harness runs the PoC 2x + control,
-// validates nonce-bound evidence.json, records the bundle), dispatches the
-// confirmer subagent (fresh context, re-executes the verify request), then
-// commits the verdict via ConfirmFinding. Exit codes and markers are
-// diagnostics — the gate is evidence + verdict.
+// Confirmation is TWO-PHASE: a worker may run PromoteFinding (the harness runs
+// the PoC 2x + control, validates nonce-bound evidence.json, and records the
+// bundle), but only the MAIN coordinator agent may review/re-execute and commit
+// a verdict via ConfirmFinding. Zero exit is necessary run integrity and
+// markers are diagnostic only; the machine records predicate/canary
+// differentials and the main agent owns the semantic vulnerability judgment.
 
 const PromoteSchema = Type.Object(
   {
@@ -197,12 +202,18 @@ const PromoteSchema = Type.Object(
     control_target: Type.String({
       minLength: 1,
       description:
-        "REQUIRED: a distinct baseline target that lacks the vulnerability (patched replica, second account, baseline endpoint).",
+        "REQUIRED: a distinct baseline target that lacks the vulnerability and is operator-approved through PI_POC_CONTROL_TARGETS (patched replica, second account, baseline service).",
     }),
     local: Type.Optional(
       Type.Boolean({
         description:
-          "Run with network access (Docker sandbox with --network host — still read-only FS, dropped capabilities, unprivileged user) instead of the isolated --network none sandbox. True host execution is NOT agent-selectable: it requires the operator to set PI_POC_ALLOW_LOCAL=1, and is used only as a fallback when Docker is unavailable.",
+          "Run with network access instead of --network none. Requires operator authorization via PI_POC_ALLOW_NETWORK=1. True host fallback additionally requires PI_POC_ALLOW_LOCAL=1.",
+      }),
+    ),
+    oob: Type.Optional(
+      Type.Boolean({
+        description:
+          "Reserved for source-separated out-of-band verification. Currently fails closed because a loopback listener reachable by the PoC cannot prove target causation.",
       }),
     ),
   },
@@ -219,14 +230,13 @@ const ConfirmSchema = Type.Object(
           description: "Why the evidence does or does not demonstrate the claim",
         }),
         evidence_reviewed: Type.Array(Type.String(), {
-          description: "Files/evidence the confirmer actually reviewed",
-        }),
-        re_executed: Type.Boolean({
-          description:
-            "True iff the confirmer re-sent the verify request itself. Mandatory for CONFIRMED.",
+          description: "Files/evidence the main agent actually reviewed",
         }),
         re_execution_note: Type.Optional(
-          Type.String({ description: "What the confirmer observed when re-executing" }),
+          Type.String({
+            description:
+              "What the main agent observed during review and the fresh harness-owned target/control replay. Mandatory for CONFIRMED.",
+          }),
         ),
         differential: Type.String({
           enum: [...CONFIRM_DIFFERENTIAL_VALUES],
@@ -241,7 +251,20 @@ const ConfirmSchema = Type.Object(
         disconfirmation_attempt: Type.Optional(
           Type.String({
             description:
-              "The confirmer's own failed attempt to disprove — becomes the case's disconfirmation",
+              "The main agent's own failed attempt to disprove — becomes the case's disconfirmation",
+          }),
+        ),
+        canary_assessment: Type.Optional(
+          Type.String({
+            enum: [...CANARY_ASSESSMENT_VALUES],
+            description:
+              "verified when the replay carried a harness-generated reflection canary; otherwise not_applicable with a concrete reason",
+          }),
+        ),
+        canary_reason: Type.Optional(
+          Type.String({
+            description:
+              "Why a causal reflection canary is not meaningful for this exploit class. Required when canary_assessment=not_applicable.",
           }),
         ),
         model: Type.Optional(
@@ -752,6 +775,11 @@ export function parseXpModeArg(args: string, current: XpMode): XpMode {
 // ── Main extension ────────────────────────────────────────────────────
 
 export default function casefileExtension(pi: ExtensionAPI) {
+  // Process role is immutable for this extension instance. A worker may spawn
+  // shells, but unsetting PI_SUBAGENT_CHILD in a child shell cannot upgrade the
+  // already-loaded extension or reveal a tool that was omitted at startup.
+  const startedAsSubagent = process.env.PI_SUBAGENT_CHILD === "1";
+  const isSubagentProcess = () => startedAsSubagent || process.env.PI_SUBAGENT_CHILD === "1";
   // Pin the workspace root ONCE at extension load. Every scratchpad / pipeline
   // / PoC-path lookup otherwise re-walks the ambient cwd on each call — a
   // mid-session `cd` would split state across two .scratchpad roots and
@@ -901,7 +929,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
     name: "EvidenceAdd",
     label: "Add Evidence Item",
     description:
-      "Record a role-typed, artifact-backed evidence item on a case (observation, reproduction, impact, refutation, cleanup). Artifact files are stored as basename + SHA-256 — the full path is never persisted. refutation items justify a kill; cleanup items track engagement cleanup before REPORT.",
+      "Record a role-typed, artifact-backed evidence item on a case. Artifact reads are restricted to regular, non-symlink files inside the workspace; bytes are copied durably and stored as basename + SHA-256. refutation items justify a kill; cleanup items track engagement cleanup before REPORT.",
     promptSnippet: "Record a role-typed evidence item",
     promptGuidelines: [
       "Use EvidenceAdd for artifact-backed evidence: raw responses, logs, screenshots, disproof attempts — anything a claim should trace back to.",
@@ -1103,22 +1131,23 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
   });
 
-  // ── Tool: PromoteFinding ──
   // ── Tool: PromoteFinding (phase 1) ──
 
   pi.registerTool({
     name: "PromoteFinding",
     label: "Run PoC Evidence",
     description:
-      "Phase 1 of confirmation: run the PoC twice against the case target plus once against control_target (same script, sha256-enforced), then validate the nonce-bound evidence.json each run writes to $PI_POC_EVIDENCE_DIR. Records a pending confirmation bundle (expires in 1h) and returns the confirmer dispatch instruction. Exit codes and markers are DIAGNOSTICS — the gate is evidence + confirmer verdict. After PromoteFinding: dispatch the confirmer subagent, then commit its verdict with ConfirmFinding. Host execution is never agent-selectable — local:true uses a host-network Docker sandbox; true host runs need PI_POC_ALLOW_LOCAL=1.",
+      "Phase 1 of confirmation: run the same PoC twice against the case target and once against an operator-approved control_target, validate nonce-bound evidence.json with a response-body assertion, then have the harness execute one immutable HTTP request template against both target and control. The machine records a predicate differential, or a stronger canary differential when a reflection placeholder is requested and observed only on target; neither is automatically a vulnerability verdict. Exit 0 is necessary run integrity, never proof. Networked execution, controls, and private replay are operator-gated. Blind/OOB confirmation fails closed until source separation exists. Records a pending bundle for main-agent semantic review via ConfirmFinding.",
     promptSnippet: "Phase 1: run PoC evidence (target x2 + control) and record the pending bundle",
     promptGuidelines: [
-      "Use PromoteFinding when an investigating case has a concrete PoC script on disk and you are ready to prove it.",
-      "Prerequisites: status='investigating' and non-empty poc, evidence, impact, severity, target, plus an artifact-backed EvidenceAdd 'observation' item on the case (the initial signal, with artifact_path). The disconfirmation comes from the confirmer at confirm time.",
-      "The PoC MUST write evidence.json to $PI_POC_EVIDENCE_DIR: { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status/body_contains/body_regex } }, observations }. The harness validates it and binds it to the run — missing/invalid/misnonced evidence blocks promotion.",
-      "control_path (REQUIRED): the SAME script as poc_path (sha256-equality is ENFORCED). The harness runs it with PI_POC_MODE=control and PI_POC_TARGET=control_target. The control's evidence must DIFFER from the target's (not target-dependent → blocked).",
-      "Default sandbox: docker run --rm --network none. Use local:true for network-dependent bugs (host-network sandbox; host execution needs operator PI_POC_ALLOW_LOCAL=1).",
-      "After the bundle is recorded, dispatch the confirmer subagent (agents/confirmer.md, fresh context, different model) and commit its verdict with ConfirmFinding. Never CaseUpdate status='confirmed' directly.",
+      "Use PromoteFinding when an investigating case has a concrete PoC script on disk and you are ready to subject its claim to the machine gate.",
+      "Prerequisites: status='investigating' and non-empty poc, evidence, impact, severity, target, plus an artifact-backed EvidenceAdd 'observation' item on the case (the initial signal, with artifact_path). The final disconfirmation comes from the main agent at confirm time.",
+      "The PoC MUST write evidence.json to $PI_POC_EVIDENCE_DIR: { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status?, body_contains/body_regex } }, observations }. A non-empty body predicate is mandatory; status-only evidence is rejected. verify.url must belong to the case target.",
+      "For reflection-capable requests, place {{PI_POC_CANARY}} exactly once in verify.url/body/header values and declare verify.canary={mode:'reflection',placeholder:'{{PI_POC_CANARY}}'}. The harness substitutes an unpredictable value only after the PoC exits and requires target-only reflection; the raw token is not persisted.",
+      "control_path (REQUIRED): the SAME script as poc_path. control_target must be pre-approved by the operator in PI_POC_CONTROL_TARGETS. The harness derives the control request from the target request, changes only its origin, and applies the same predicates to two conclusive responses.",
+      "local:true requires PI_POC_ALLOW_NETWORK=1. Private/internal harness replay additionally requires PI_POC_ALLOW_PRIVATE_REPLAY=1. Neither silently falls back to a model verdict.",
+      "Blind/OOB classes are not promotable through the built-in loopback listener because the PoC can self-call it; obtain a direct-response or state oracle, otherwise keep the case investigating.",
+      "After the bundle is recorded, return control to the main agent. The main agent must inspect the script/evidence, attempt disconfirmation, and call ConfirmFinding itself; that call performs a fresh harness-owned target/control replay. Never delegate phase 2 and never CaseUpdate status='confirmed' directly.",
     ],
     parameters: PromoteSchema,
 
@@ -1154,6 +1183,20 @@ export default function casefileExtension(pi: ExtensionAPI) {
           { controlTargetEqualsCaseTarget: true },
         );
       }
+      if (params.local === true && process.env.PI_POC_ALLOW_NETWORK !== "1") {
+        return fail(
+          "Networked PoC execution is operator-gated. Set PI_POC_ALLOW_NETWORK=1 to authorize the host-network sandbox for this session.",
+          { networkNotAuthorized: true },
+        );
+      }
+      const controlAuthorization = controlTargetAuthorizationError(controlTarget);
+      if (controlAuthorization) {
+        return fail(
+          `CONTROL AUTHORIZATION FAILED: ${controlAuthorization}. ` +
+            "The operator must set PI_POC_CONTROL_TARGETS to the exact approved control host/origin before this control can anchor confirmation.",
+          { controlNotAuthorized: true },
+        );
+      }
 
       // Same-file contract (anti-cheat): control must be the SAME bytes as the
       // PoC, differing only via the harness-set env. Check BEFORE any run.
@@ -1176,16 +1219,30 @@ export default function casefileExtension(pi: ExtensionAPI) {
         );
       }
 
+      // ── OOB callback (Tier 1, opt-in for blind classes) ──
+      const oobRequested = params.oob === true;
+      if (oobRequested) {
+        return fail(
+          "OOB confirmation is fail-closed: the built-in loopback listener is reachable by the PoC and cannot prove the target caused a callback. A source-separated, operator-owned callback service is required before blind findings can be promoted.",
+          { oobSourceSeparationRequired: true },
+        );
+      }
       const runOptions = (pocMode: string, target: string): PocRunOptions => ({
         network: params.local === true ? "host" : "none",
         local: params.local === true,
-        env: { PI_POC_MODE: pocMode, PI_POC_TARGET: target },
+        env: {
+          PI_POC_MODE: pocMode,
+          PI_POC_TARGET: target,
+        },
       });
 
       const caseTarget = current.target ?? "";
-      // Determinism: TWO target runs + one control run. Exit codes are
-      // diagnostics; completion, evidence validity, determinism, and the
-      // differential are the gate.
+      let targetRuns!: [PocEvidenceRun, PocEvidenceRun];
+      let control!: PocEvidenceRun;
+      let harnessVerified!: HarnessVerifyResult;
+      // Determinism: TWO target runs + one control run. Exit 0 is run
+      // integrity only; nonce-bound body evidence and the harness-owned
+      // target/control replay form the machine gate.
       const run1 = runPoc(pocPath, runOptions("poc", caseTarget));
       const run2 = runPoc(pocPath, runOptions("poc", caseTarget));
       const controlRun = runPoc(controlPath, runOptions("control", controlTarget));
@@ -1202,13 +1259,15 @@ export default function casefileExtension(pi: ExtensionAPI) {
         if (r.evidenceError) {
           return fail(
             `EVIDENCE CONTRACT FAILED (${mode} run): ${r.evidenceError}. ` +
-              "The PoC must write evidence.json to $PI_POC_EVIDENCE_DIR — { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status / body_contains / body_regex } }, observations } — " +
+              "The PoC must write evidence.json to $PI_POC_EVIDENCE_DIR — { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status?, body_contains / body_regex } }, observations }; a response-body assertion is mandatory — " +
               "the file is bound to this run and validated by the harness. Case remains investigating.",
             { run: r, evidenceError: r.evidenceError },
           );
         }
         if (!r.evidence || !r.evidenceSha256 || !r.nonce) {
-          return fail(`${mode} run produced no evidence. Case remains investigating.`, { run: r });
+          return fail(`${mode} run produced no evidence. Case remains investigating.`, {
+            run: r,
+          });
         }
         return {
           mode,
@@ -1226,11 +1285,18 @@ export default function casefileExtension(pi: ExtensionAPI) {
         };
       };
 
-      const targetRuns: [PocEvidenceRun, PocEvidenceRun] = [
-        evidenceRun(run1, "poc", caseTarget),
-        evidenceRun(run2, "poc", caseTarget),
-      ];
-      const control = evidenceRun(controlRun, "control", controlTarget);
+      targetRuns = [evidenceRun(run1, "poc", caseTarget), evidenceRun(run2, "poc", caseTarget)];
+      control = evidenceRun(controlRun, "control", controlTarget);
+
+      // Tier 2 (docs/poc-trust-model.md): the harness executes the SAME
+      // request template against target and operator-approved control, applying
+      // the target's predicates to both. DNS is pinned at connect time.
+      harnessVerified = await replayDifferential(
+        targetRuns[0].evidence,
+        caseTarget,
+        controlTarget,
+        { allowPrivate: process.env.PI_POC_ALLOW_PRIVATE_REPLAY === "1" },
+      );
 
       const bundle: PendingConfirmation = {
         caseId,
@@ -1241,6 +1307,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
         controlTarget,
         targetRuns,
         controlRun: control,
+        harnessVerified,
       };
 
       let record: CaseRecord;
@@ -1260,11 +1327,9 @@ export default function casefileExtension(pi: ExtensionAPI) {
               `Phase 1 complete — evidence bundle recorded on ${caseId} (expires in 1h).\n` +
               `Target runs: 2, Control run: 1 — all with validated nonce-bound evidence.json.\n` +
               `Evidence sha256: ${targetRuns[0].evidenceSha256}\n` +
-              `PoC script sha256 (at run time): ${pocHash}\n\n` +
-              (detectHost() === "omp"
-                ? `DISPATCH THE CONFIRMER now: task({ context: 'fresh', tasks: [{ name: 'confirm-${caseId}-1', agent: 'confirmer', task: 'Verify the PoC evidence for case ${caseId} (poc_path=${pocPath}, control_target=${controlTarget}, evidence_sha256=${targetRuns[0].evidenceSha256}, poc_sha256=${pocHash}). Assume fabricated, prove real. Re-send the verify request yourself. Return the verdict.' }] })\n`
-                : `DISPATCH THE CONFIRMER now: subagent({ workflowScript: "return runs.run('confirm-${caseId}-1', { agent: 'confirmer', task: 'Verify the PoC evidence for case ${caseId} (poc_path=${pocPath}, control_target=${controlTarget}, evidence_sha256=${targetRuns[0].evidenceSha256}, poc_sha256=${pocHash}). Assume fabricated, prove real. Re-send the verify request yourself. Return the verdict.' })", context: 'fresh', async: true })\n`) +
-              "Then commit the verdict with ConfirmFinding(case_id, verdict) — CONFIRMED promotes, NOT_CONFIRMED keeps investigating.",
+              `PoC script sha256 (at run time): ${pocHash}\n` +
+              `Harness verify replay: ${harnessVerified.attempted ? (harnessVerified.pass ? `PASS (status ${harnessVerified.status})` : `FAILED — ${harnessVerified.note}`) : harnessVerified.note}\n` +
+              `\nMAIN-AGENT REVIEW REQUIRED (do not delegate): inspect case ${caseId}, PoC ${pocPath}, control ${controlTarget}, evidence ${targetRuns[0].evidenceSha256}, and PoC hash ${pocHash}. Hunt for a trivial predicate or fabricated differential and perform a concrete disconfirmation attempt, then call ConfirmFinding yourself. A CONFIRMED call performs and stores a fresh harness-owned target/control replay; NOT_CONFIRMED keeps the case investigating.`,
           },
         ],
         details: {
@@ -1277,6 +1342,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
             controlTarget,
             pocSha256: pocHash,
             evidenceSha256: targetRuns[0].evidenceSha256,
+            harnessVerified,
           },
         },
       };
@@ -1303,55 +1369,95 @@ export default function casefileExtension(pi: ExtensionAPI) {
 
   // ── Tool: ConfirmFinding (phase 2) ──
 
-  pi.registerTool({
-    name: "ConfirmFinding",
-    label: "Commit Confirmer Verdict",
-    description:
-      "Phase 2 of confirmation: commit (or refuse) a promotion on the confirmer subagent's verdict. CONFIRMED requires a target-only differential, re_executed: true (the confirmer re-sent the verify request itself), a disconfirmation_attempt (becomes the case's disconfirmation), and the pending bundle from PromoteFinding still valid (nonce-bound evidence, determinism, control differential, PoC script unchanged — checked again at the ledger). NOT_CONFIRMED records the verdict and keeps the case investigating — no tie-breaker.",
-    promptSnippet: "Commit the confirmer verdict — promote or keep investigating",
-    promptGuidelines: [
-      "Run after PromoteFinding + the confirmer dispatch. The verdict comes from the confirmer subagent output, not from the writer.",
-      "CONFIRMED requires differential: 'target_only', re_executed: true, and disconfirmation_attempt (the confirmer's own failed disproof). A verdict missing any of these is rejected.",
-      "NOT_CONFIRMED is final for that attempt — the case stays investigating with the reasoning recorded in assumptions. Re-dispatch a new confirmer if you want a second opinion; every attempt is recorded.",
-      "Never CaseUpdate status='confirmed' directly — it is rejected. Always use PromoteFinding + ConfirmFinding.",
-    ],
-    parameters: ConfirmSchema,
+  // Do not expose the commit capability in a worker process at all. The
+  // execute-time check remains as defense in depth if process state changes
+  // after registration or another integration forwards a stale tool handle.
+  if (!startedAsSubagent)
+    pi.registerTool({
+      name: "ConfirmFinding",
+      label: "Main-Agent Confirmation",
+      description:
+        "Phase 2 of confirmation, reserved for the main/coordinator agent: commit or refuse promotion after personally reviewing the machine bundle. On CONFIRMED, this tool performs a fresh harness-owned target/control replay; the verdict requires a target-only differential, a concrete re_execution_note and disconfirmation_attempt, a canary assessment, and the still-valid PromoteFinding bundle. The machine transcript is evidence, not the semantic vulnerability verdict. Worker/subagent processes are rejected. NOT_CONFIRMED records the review and keeps the case investigating.",
+      promptSnippet: "Main agent: independently review and commit or refuse PoC confirmation",
+      promptGuidelines: [
+        "Run only in the main/coordinator agent after PromoteFinding returns. Do not dispatch a worker to decide or author this verdict.",
+        "Personally inspect the PoC and preserved evidence and try a concrete disconfirmation before deciding. ConfirmFinding itself re-sends the immutable verify request against target and operator-approved control so phase 2 has a harness-owned transcript.",
+        "CONFIRMED requires differential: 'target_only', re_execution_note, and disconfirmation_attempt (the main agent's failed disproof). A verdict missing any of these is rejected.",
+        "Set canary_assessment='verified' when the immutable request declared a canary; otherwise set not_applicable and explain why a reflection canary is not meaningful for this exploit class.",
+        "NOT_CONFIRMED is final for that attempt — the case stays investigating with the main agent's reasoning recorded. A fresh PromoteFinding run is required for another attempt.",
+        "Never CaseUpdate status='confirmed' directly — it is rejected. Always use PromoteFinding + ConfirmFinding.",
+      ],
+      parameters: ConfirmSchema,
 
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const caseId = params.id as string;
-      const result = applyConfirmationResult(caseId, params.verdict as ConfirmerVerdict);
-      const record = result.record;
-      const promoted = record.status === "confirmed";
-      return {
-        content: [
-          {
-            type: "text",
-            text: promoted
-              ? `Confirmer CONFIRMED. Case promoted:
+      async execute(_id, params, _signal, _onUpdate, _ctx) {
+        if (isSubagentProcess()) {
+          throw new Error(
+            "ConfirmFinding is reserved for the main/coordinator agent. A worker or subagent may produce evidence but cannot confirm a PoC.",
+          );
+        }
+        const caseId = params.id as string;
+        const parsedVerdict = validateMainAgentVerdict(params.verdict);
+        if (!parsedVerdict.ok) {
+          throw new Error(`Invalid main-agent confirmation verdict: ${parsedVerdict.error}`);
+        }
+        let phase2Verification: MainAgentVerification | undefined;
+        if (parsedVerdict.verdict.verdict === "CONFIRMED") {
+          const current = getCaseById(caseId);
+          if (!current) throw new Error(`Case not found: ${caseId}`);
+          const bundle = current.pendingConfirmation;
+          if (!bundle) {
+            throw new Error("No pending confirmation on this case — run PromoteFinding first");
+          }
+          const controlAuthorizationError = controlTargetAuthorizationError(bundle.controlTarget);
+          if (controlAuthorizationError) {
+            throw new Error(`CONTROL AUTHORIZATION FAILED: ${controlAuthorizationError}`);
+          }
+          const replay = await replayDifferential(
+            bundle.targetRuns[0].evidence,
+            current.target ?? bundle.targetRuns[0].target,
+            bundle.controlTarget,
+            { allowPrivate: process.env.PI_POC_ALLOW_PRIVATE_REPLAY === "1" },
+          );
+          phase2Verification = {
+            at: new Date().toISOString(),
+            result: replay,
+          };
+        }
+        const result = applyConfirmationResult(caseId, parsedVerdict.verdict, phase2Verification, {
+          startedAsSubagent: isSubagentProcess(),
+        });
+        const record = result.record;
+        const promoted = record.status === "confirmed";
+        return {
+          content: [
+            {
+              type: "text",
+              text: promoted
+                ? `Main agent CONFIRMED. Case promoted:
 ${formatCaseDetail(record)}`
-              : `Confirmer NOT_CONFIRMED — case stays investigating (attempt recorded):
+                : `Main agent NOT_CONFIRMED — case stays investigating (attempt recorded):
 ${formatCaseDetail(record)}`,
-          },
-        ],
-        details: { record, promoted, changed: result.changed },
-      };
-    },
+            },
+          ],
+          details: { record, promoted, changed: result.changed },
+        };
+      },
 
-    renderCall(args, theme) {
-      return callLine(theme, "ConfirmFinding", (args.id as string) ?? "");
-    },
+      renderCall(args, theme) {
+        return callLine(theme, "ConfirmFinding", (args.id as string) ?? "");
+      },
 
-    renderResult(result, _opts, theme) {
-      const details = result.details as { promoted?: boolean } | undefined;
-      return new Text(
-        details?.promoted
-          ? theme.fg("success", "✓ Promoted")
-          : theme.fg("warning", "↷ Not confirmed"),
-        0,
-        0,
-      );
-    },
-  });
+      renderResult(result, _opts, theme) {
+        const details = result.details as { promoted?: boolean } | undefined;
+        return new Text(
+          details?.promoted
+            ? theme.fg("success", "✓ Promoted")
+            : theme.fg("warning", "↷ Not confirmed"),
+          0,
+          0,
+        );
+      },
+    });
 
   // ── Tool: CaseGet ──
 
@@ -1595,7 +1701,9 @@ ${formatCaseDetail(record)}`,
     parameters: ChainSuggestSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const suggestions = suggestChains((params.case_id as string | undefined) ?? undefined);
+      const suggestions = await suggestChainsAsync(
+        (params.case_id as string | undefined) ?? undefined,
+      );
       const lines: string[] = [
         suggestions.length
           ? `${suggestions.length} chain candidate(s):`
@@ -1641,7 +1749,7 @@ ${formatCaseDetail(record)}`,
     parameters: IdSchema,
 
     async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const { path, contextPath, record } = writeCaseContext(params.id as string);
+      const { path, contextPath, record } = await writeCaseContextAsync(params.id as string);
       return {
         content: [
           {
@@ -2135,7 +2243,7 @@ ${formatCaseDetail(record)}`,
     // the workflow + entire active-case ledger into every child dispatch is a
     // token multiplier (N subagents × workflow + growing case list per turn) —
     // workers get what they need via their task and tool guidelines.
-    if (process.env.PI_SUBAGENT_CHILD === "1") return;
+    if (isSubagentProcess()) return;
 
     const includeWorkflow = !workflowInjected;
 

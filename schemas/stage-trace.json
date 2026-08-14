@@ -3,6 +3,7 @@
   "title": "Stage Trace",
   "description": "Result of a reachability trace from the tracer agent. Must pass before a finding can be promoted to confirmed.",
   "type": "object",
+  "additionalProperties": false,
   "required": ["trace_result", "entry_point", "call_chain", "defenses_checked", "attacker_model"],
   "properties": {
     "trace_result": {

@@ -3,10 +3,14 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
+import { setHarnessFetchForTest } from "../src/harness-verify.ts";
 import { getCaseById, setCasefilePath } from "../src/ledger.ts";
 import { setScratchpadRoot } from "../src/scratchpad.ts";
-import { STATIC_CYBER_WORKFLOW, STATIC_CYBER_WORKFLOW_LITE } from "../src/workflow.ts";
+import {
+  STATIC_CYBER_WORKFLOW,
+  STATIC_CYBER_WORKFLOW_LITE,
+  STATIC_CYBER_WORKFLOW_OMP,
+} from "../src/workflow.ts";
 
 mock.module("@earendil-works/pi-ai", () => ({
   StringEnum: (values: readonly string[]) => ({ enum: values }),
@@ -61,6 +65,7 @@ let controlScriptPath: string;
 let observationArtifactPath: string;
 let disconfirmationScriptPath: string;
 let casefileExtension: (pi: any) => void;
+const nativeFetch = globalThis.fetch;
 
 // CaseAdd now requires disproveIf (falsification conditions); the tool-level
 // helper injects a default so the fixture-driven tests stay focused on the
@@ -122,6 +127,7 @@ async function executeTool(pi: FakePi, name: string, params: Record<string, unkn
         missingControl: text.includes("control_path is REQUIRED"),
         missingControlTarget: text.includes("control_target is REQUIRED"),
         controlTargetEqualsCase: text.includes("control_target must differ from the case target"),
+        controlNotAuthorized: text.includes("CONTROL AUTHORIZATION FAILED"),
         evidenceFailed: text.includes("EVIDENCE CONTRACT FAILED"),
         controlIdentical: text.includes("identical evidence to the target"),
         controlBindingFailed: text.includes("CONTROL BINDING FAILED"),
@@ -148,11 +154,13 @@ beforeEach(async () => {
       "#!/bin/sh",
       'E="$PI_POC_EVIDENCE_DIR"',
       'mkdir -p "$E"',
+      'T="$PI_POC_TARGET"',
+      'case "$T" in http://*|https://*) ;; *) T="http://$T" ;; esac',
       'if [ "$PI_POC_MODE" = "control" ]; then',
-      '  printf \'{"nonce":"%s","claim":"control baseline lacks the vuln","verify":{"method":"GET","url":"http://%s/read?file=/etc/passwd","expect":{"status":[403]}},"observations":["control returned 403"]}\' "$PI_POC_NONCE" "$PI_POC_TARGET" > "$E/evidence.json"',
+      '  printf \'{"nonce":"%s","claim":"control baseline lacks the vuln","verify":{"method":"GET","url":"%s/read?file=/etc/passwd","expect":{"status":[403],"body_contains":["not vulnerable"]}},"observations":["control returned 403"]}\' "$PI_POC_NONCE" "$T" > "$E/evidence.json"',
       "  exit 0",
       "fi",
-      'printf \'{"nonce":"%s","claim":"read /etc/passwd of target","verify":{"method":"GET","url":"http://%s/read?file=/etc/passwd","expect":{"status":[200],"body_contains":["root:"]}},"observations":["root: present"]}\' "$PI_POC_NONCE" "$PI_POC_TARGET" > "$E/evidence.json"',
+      'printf \'{"nonce":"%s","claim":"read /etc/passwd of target","verify":{"method":"GET","url":"%s/read?file=/etc/passwd","expect":{"status":[200],"body_contains":["root:"]}},"observations":["root: present"]}\' "$PI_POC_NONCE" "$T" > "$E/evidence.json"',
       "printf 'ok'",
       "exit 0",
       "",
@@ -165,11 +173,22 @@ beforeEach(async () => {
   disconfirmationScriptPath = join(tempDir, "disconf.sh");
   writeFileSync(disconfirmationScriptPath, "#!/bin/sh\nexit 1", "utf8");
   process.env.PI_POC_ROOT = tempDir;
+  process.env.CASEFILE_WORKSPACE_ROOT = tempDir;
   // Local (host) execution is operator-gated; the test harness FORCE_LOCAL
   // so promote tests run hermetically without Docker even when Docker is
   // installed — production still prefers the host-network sandbox.
   process.env.PI_POC_ALLOW_LOCAL = "1";
   process.env.PI_POC_FORCE_LOCAL = "1";
+  process.env.PI_POC_ALLOW_NETWORK = "1";
+  process.env.PI_POC_ALLOW_PRIVATE_REPLAY = "1";
+  process.env.PI_POC_CONTROL_TARGETS = "https://control.example,example-app";
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    return url.hostname.includes("control")
+      ? new Response("not vulnerable", { status: 403 })
+      : new Response("root:x:0:0:root:/root:/bin/sh", { status: 200 });
+  }) as typeof fetch;
+  setHarnessFetchForTest(globalThis.fetch as unknown as (input: string | URL) => Promise<Response>);
   // Hermeticity: the before_agent_start handler skips injection when
   // PI_SUBAGENT_CHILD=1 (the harness sets it when running inside pi-subagents);
   // without this, the whole XP-mode suite fails under subagent execution.
@@ -181,8 +200,15 @@ afterEach(async () => {
   setCasefilePath(undefined);
   setScratchpadRoot(undefined);
   delete process.env.PI_POC_ROOT;
+  delete process.env.CASEFILE_WORKSPACE_ROOT;
   delete process.env.PI_POC_ALLOW_LOCAL;
   delete process.env.PI_POC_FORCE_LOCAL;
+  delete process.env.PI_POC_ALLOW_NETWORK;
+  delete process.env.PI_POC_ALLOW_PRIVATE_REPLAY;
+  delete process.env.PI_POC_CONTROL_TARGETS;
+  delete process.env.PI_SUBAGENT_CHILD;
+  setHarnessFetchForTest(undefined);
+  globalThis.fetch = nativeFetch;
   await rm(tempDir, { recursive: true, force: true });
 });
 
@@ -229,6 +255,19 @@ describe("casefile extension", () => {
     expect(values).toContain("poc");
   });
 
+  test("does not register ConfirmFinding when a worker unsets its role after startup", () => {
+    process.env.PI_SUBAGENT_CHILD = "1";
+    try {
+      const pi = createFakePi();
+      casefileExtension(pi as any);
+      delete process.env.PI_SUBAGENT_CHILD;
+      expect(pi.tools.has("ConfirmFinding")).toBe(false);
+      expect(pi.tools.has("PromoteFinding")).toBe(true);
+    } finally {
+      delete process.env.PI_SUBAGENT_CHILD;
+    }
+  });
+
   test("executes the add, get, update, list, search, and report tools", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
@@ -267,7 +306,7 @@ describe("casefile extension", () => {
     expect(updated.details.changed).toBe(true);
 
     // Phase 1: PromoteFinding records the evidence bundle (2 target runs +
-    // control); the case stays investigating until the confirmer's verdict.
+    // control); the case stays investigating until main-agent review.
     const phase1 = await executeTool(pi, "PromoteFinding", {
       id: record.id,
       poc_path: pocScriptPath,
@@ -279,28 +318,33 @@ describe("casefile extension", () => {
     expect(phase1.details.record.pendingConfirmation).toBeDefined();
     expect(phase1.details.bundle.evidenceSha256).toMatch(/^[a-f0-9]{64}$/);
 
-    // Phase 2: ConfirmFinding commits a complete confirmer verdict.
+    // Phase 2: ConfirmFinding commits the main agent's complete verdict.
     const promoted = await executeTool(pi, "ConfirmFinding", {
       id: record.id,
       verdict: {
         verdict: "CONFIRMED",
         reasoning: "re-sent the verify request: target returned the claimed entry, control did not",
         evidence_reviewed: ["evidence.json (target run 1)", "evidence.json (control run)"],
-        re_executed: true,
         re_execution_note: "GET /read?file=/etc/passwd → 200 with root: on target; 403 on control",
         differential: "target_only",
         severity_match: "ok",
         disconfirmation_attempt:
           "tried /read?file=/etc/shadow and a patched replica → no entry; the effect is target-dependent",
+        canary_assessment: "not_applicable",
+        canary_reason: "file-read output has no attacker-reflected field",
         model: "test-model",
       },
     });
     expect(promoted.details.promoted).toBe(true);
     expect(promoted.details.record.status).toBe("confirmed");
+    expect(promoted.details.record.confirmerVerdict?.reviewer).toBe("main_agent");
+    expect(promoted.details.record.confirmerVerdict?.phase2Verification?.result.differential).toBe(
+      "target_only",
+    );
     expect(promoted.details.record.pocVerified?.exitCode).toBe(0);
     expect(promoted.details.record.evidence).toContain("PoC Execution Capture");
     expect(promoted.details.record.evidence).toContain("Target Run Output");
-    // The confirmer's attempt becomes the case's disconfirmation.
+    // The main agent's attempt becomes the case's disconfirmation.
     expect(promoted.details.record.disconfirmation).toContain("tried /read?file=/etc/shadow");
     // The reproduction evidence item is artifact-backed by the preserved copy.
     const repro = promoted.details.record.evidenceItems?.find(
@@ -332,6 +376,120 @@ describe("casefile extension", () => {
     expect(contextText).toContain("Output\n```\nok\n```");
     expect(contextText).toContain("Complete Case Record");
     expect(contextText).toContain("Linked Cases");
+  });
+
+  test("PromoteFinding oob:true fails closed until callback source separation exists", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+    const added = await addCase(pi, {
+      title: "OOB without network",
+      status: "investigating",
+      evidence: "blind SSRF suspected",
+      confidence: "high",
+      severity: "high",
+      poc: "send callback payload",
+      impact: "internal fetch",
+      target: "oob-app",
+    });
+    const phase1 = await executeTool(pi, "PromoteFinding", {
+      id: added.details.record.id,
+      poc_path: pocScriptPath,
+      control_path: controlScriptPath,
+      control_target: "https://control.example",
+      oob: true,
+    });
+    expect(phase1.content[0].text).toContain("source-separated");
+    expect(phase1.details.record.pendingConfirmation).toBeUndefined();
+  });
+
+  test("PromoteFinding rejects a poc-mode-only self-call without OOB source separation", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+    // PoC that calls the callback ONLY in poc mode — the target-run token must
+    // be hit; the control-run token must stay silent (mode-specific tokens).
+    const oobScript = join(tempDir, "oob.sh");
+    writeFileSync(
+      oobScript,
+      [
+        "#!/bin/sh",
+        'E="$PI_POC_EVIDENCE_DIR"',
+        'mkdir -p "$E"',
+        'if [ "$PI_POC_MODE" = "control" ]; then',
+        '  printf \'{"nonce":"%s","claim":"control lacks the vuln","verify":{"method":"GET","url":"http://localhost/read","expect":{"status":[403]}},"observations":[]}\' "$PI_POC_NONCE" > "$E/evidence.json"',
+        "  exit 0",
+        "fi",
+        'curl -s "$PI_POC_CALLBACK_URL" >/dev/null',
+        'printf \'{"nonce":"%s","claim":"blind SSRF fires","verify":{"method":"GET","url":"http://localhost/read","expect":{"status":[200]}},"observations":["callback sent"]}\' "$PI_POC_NONCE" > "$E/evidence.json"',
+        "exit 0",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    const added = await addCase(pi, {
+      title: "Blind SSRF",
+      status: "investigating",
+      evidence: "URL parameter fetched server-side",
+      confidence: "high",
+      severity: "high",
+      poc: "trigger callback to harness listener",
+      impact: "internal fetch",
+      target: "oob-app",
+    });
+    const phase1 = await executeTool(pi, "PromoteFinding", {
+      id: added.details.record.id,
+      poc_path: oobScript,
+      control_path: oobScript,
+      control_target: "https://control.example",
+      local: true,
+      oob: true,
+    });
+    expect(phase1.isError).toBe(true);
+    expect(phase1.content[0].text).toContain("source-separated");
+    expect(phase1.details.record.pendingConfirmation).toBeUndefined();
+  });
+
+  test("PromoteFinding oob:true rejects a PoC that calls its own callback in both modes", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+    const oobScript = join(tempDir, "oob-cheat.sh");
+    writeFileSync(
+      oobScript,
+      [
+        "#!/bin/sh",
+        'E="$PI_POC_EVIDENCE_DIR"',
+        'mkdir -p "$E"',
+        'if [ "$PI_POC_MODE" = "control" ]; then',
+        '  curl -s "$PI_POC_CALLBACK_URL" >/dev/null',
+        '  printf \'{"nonce":"%s","claim":"control lacks the vuln","verify":{"method":"GET","url":"http://localhost/read","expect":{"status":[403]}},"observations":[]}\' "$PI_POC_NONCE" > "$E/evidence.json"',
+        "  exit 0",
+        "fi",
+        'curl -s "$PI_POC_CALLBACK_URL" >/dev/null',
+        'printf \'{"nonce":"%s","claim":"callback fired","verify":{"method":"GET","url":"http://localhost/read","expect":{"status":[200]}},"observations":[]}\' "$PI_POC_NONCE" > "$E/evidence.json"',
+        "exit 0",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    const added = await addCase(pi, {
+      title: "Cheating callback",
+      status: "investigating",
+      evidence: "suspected SSRF",
+      confidence: "high",
+      severity: "high",
+      poc: "curl callback unconditionally",
+      impact: "internal fetch",
+      target: "oob-app",
+    });
+    const phase1 = await executeTool(pi, "PromoteFinding", {
+      id: added.details.record.id,
+      poc_path: oobScript,
+      control_path: oobScript,
+      control_target: "https://control.example",
+      local: true,
+      oob: true,
+    });
+    expect(phase1.content[0].text).toContain("source-separated");
+    expect(phase1.details.record.pendingConfirmation).toBeUndefined();
   });
 
   test("PromoteFinding requires control_path + control_target for EVERY promotion (sandboxed and live)", async () => {
@@ -392,6 +550,17 @@ describe("casefile extension", () => {
     expect(sameTarget.isError).toBe(true);
     expect(sameTarget.details.controlTargetEqualsCase).toBe(true);
     expect(sameTarget.details.record.status).toBe("investigating");
+
+    // A distinct but agent-invented host is not a valid control trust anchor.
+    const inventedControl = await executeTool(pi, "PromoteFinding", {
+      id,
+      poc_path: pocScriptPath,
+      control_path: controlScriptPath,
+      control_target: "invented-control.example",
+    });
+    expect(inventedControl.isError).toBe(true);
+    expect(inventedControl.details.controlNotAuthorized).toBe(true);
+    expect(inventedControl.details.record.status).toBe("investigating");
   });
 
   test("PromoteFinding rejects a PoC that exits 0 but writes no evidence.json", async () => {
@@ -626,9 +795,11 @@ describe("casefile extension", () => {
       verdict: "CONFIRMED",
       reasoning: "re-sent the verify request: effect reproduced on target only",
       evidence_reviewed: ["evidence.json (target run)"],
-      re_executed: true,
+      re_execution_note: "fresh harness replay matched only the target",
       differential: "target_only",
       disconfirmation_attempt: "tried a patched replica and a second account — no effect",
+      canary_assessment: "not_applicable",
+      canary_reason: "the fixture response has no attacker-reflected field",
       model: "test-model",
     };
 
@@ -651,17 +822,53 @@ describe("casefile extension", () => {
       local: true,
     });
     expect(phase1.details?.record?.status).toBe("investigating");
+
+    // Workers may produce evidence, but the phase-2 decision is main-agent-only.
+    process.env.PI_SUBAGENT_CHILD = "1";
+    let workerErr: Error | undefined;
+    try {
+      await executeTool(pi, "ConfirmFinding", { id, verdict: completeVerdict });
+    } catch (e) {
+      workerErr = e as Error;
+    } finally {
+      delete process.env.PI_SUBAGENT_CHILD;
+    }
+    expect(workerErr).toBeDefined();
+    expect(workerErr!.message).toContain("reserved for the main/coordinator agent");
+    expect(getCaseById(id)?.status).toBe("investigating");
+
     let badVerdictErr: Error | undefined;
     try {
       await executeTool(pi, "ConfirmFinding", {
         id,
-        verdict: { ...completeVerdict, re_executed: false },
+        verdict: { ...completeVerdict, re_execution_note: undefined },
       });
     } catch (e) {
       badVerdictErr = e as Error;
     }
     expect(badVerdictErr).toBeDefined();
-    expect(badVerdictErr!.message).toContain("re_executed");
+    expect(badVerdictErr!.message).toContain("re_execution_note");
+
+    // Phase 2 is not a caller-supplied checkbox: ConfirmFinding performs a
+    // fresh harness replay and fails closed if the control is inconclusive.
+    setHarnessFetchForTest(async (input: string | URL) => {
+      const url = new URL(String(input));
+      if (url.hostname.includes("control")) throw new Error("control unavailable");
+      return new Response("root:x:0:0:root:/root:/bin/sh", { status: 200 });
+    });
+    let replayErr: Error | undefined;
+    try {
+      await executeTool(pi, "ConfirmFinding", { id, verdict: completeVerdict });
+    } catch (e) {
+      replayErr = e as Error;
+    } finally {
+      setHarnessFetchForTest(
+        globalThis.fetch as unknown as (input: string | URL) => Promise<Response>,
+      );
+    }
+    expect(replayErr).toBeDefined();
+    expect(replayErr!.message).toContain("MAIN-AGENT REPLAY FAILED");
+    expect(getCaseById(id)?.status).toBe("investigating");
 
     // A complete verdict commits.
     const confirmed = await executeTool(pi, "ConfirmFinding", {
@@ -1070,9 +1277,11 @@ describe("casefile extension", () => {
           verdict: "CONFIRMED",
           reasoning: "re-sent the verify request: effect reproduced on target only",
           evidence_reviewed: ["evidence.json (target run)"],
-          re_executed: true,
+          re_execution_note: "fresh harness replay matched only the target",
           differential: "target_only",
           disconfirmation_attempt: "tried a patched replica — no effect; target-dependent",
+          canary_assessment: "not_applicable",
+          canary_reason: "the fixture response has no attacker-reflected field",
           model: "test-model",
         },
       });
@@ -1197,6 +1406,11 @@ describe("casefile extension", () => {
     expect(STATIC_CYBER_WORKFLOW_LITE).toContain("Report style checklist");
     expect(STATIC_CYBER_WORKFLOW_LITE).toContain("CaseContext");
     expect(STATIC_CYBER_WORKFLOW_LITE).not.toContain("CaseReport");
+    for (const workflow of [STATIC_CYBER_WORKFLOW, STATIC_CYBER_WORKFLOW_OMP]) {
+      expect(workflow).not.toContain("| CHAIN | INVESTIGATING |");
+      expect(workflow).toContain("| MAIN REVIEW | CONFIRMED |");
+      expect(workflow).toContain("| CHAIN | CONFIRMED |");
+    }
   });
 
   test("/xp command toggles mode and gates injection", async () => {
@@ -1289,9 +1503,11 @@ describe("casefile extension", () => {
         verdict: "CONFIRMED",
         reasoning: "re-sent the verify request: payload rendered on target only",
         evidence_reviewed: ["evidence.json (target run)"],
-        re_executed: true,
+        re_execution_note: "fresh harness replay matched only the target",
         differential: "target_only",
         disconfirmation_attempt: "rendered a control note without script — no execution",
+        canary_assessment: "not_applicable",
+        canary_reason: "legacy fixture has no canary placeholder",
         model: "test-model",
       },
     });

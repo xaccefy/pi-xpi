@@ -1,59 +1,50 @@
-# PoC Confirmation Trust Model — Research
+# PoC Confirmation Trust Model
 
-> Status: research / design. Not implemented.
-> Question: the PoC confirmation gate is not really *code judging* the exploit — it is the model judging itself. What would machine verification actually look like, and what can be done cheaply?
+> Status: Tier 2 direct-response verification and reflection canaries are implemented. Source-separated OOB and general file/account/state oracles remain design work and fail closed.
 
 ## 1. TL;DR
 
-Every gate that looks like machine verification (exit 0, verification marker, same-script control, liveness marker, executed disconfirmation, hashed observation artifact) runs on **files and strings the model itself wrote**. The harness checks *presence/absence of strings the model chose*, printed by *a script the model wrote*, describing *a claim the model made*. Nothing the harness independently observes — no network traffic, no target state, no planted secret — is used in the verdict.
+Exit status, stdout, and `evidence.json` are inputs to confirmation, not proof. For a direct-response finding, XPI promotes only after the harness sends one immutable request template to both the case target and a distinct control origin, evaluates the same non-empty predicates against both responses, and observes `target_only`. For reflection-capable requests, the harness can additionally inject a fresh unpredictable token after the PoC exits and require target-only reflection. The response status, body hash, byte count, final URL, matcher result, and redacted canary result are recorded by the harness.
 
-The fix is a trust-model shift, not more string checks:
+The governing rule is:
 
 > **The judge must own (1) the evidence channel, (2) the secret, and (3) the execution of the predicate.**
 
-Today the model owns all three. Industry systems that do real machine verification (CGC/AIxCC PoVs, interactsh/OAST, Nuclei matchers, canarytokens) each own at least one, usually two.
+The model still defines the request and success predicate, but it cannot author the observed response or weaken the control request. Blind/OOB classes are not confirmable through the built-in loopback listener because the PoC can reach it directly; those attempts remain investigating until source separation or an operator-owned external oracle exists.
 
 ## 2. What the gate actually verifies today
 
-The marker/exit-0 gates described in earlier drafts are gone: exit codes and output markers are **diagnostics**, and the current confirmation is the two-phase PromoteFinding → ConfirmFinding flow with a nonce-bound `evidence.json` contract and an independent confirmer re-execution.
+The current confirmation is the two-phase PromoteFinding → ConfirmFinding flow. A zero exit is required for run integrity, but it is never sufficient for promotion.
 
 | Check | Evidence source | Predicate owner | Machine-judged? |
 |---|---|---|---|
-| Script ran to completion + output capture complete | harness (sentinel / spawn result) | harness | yes |
-| `evidence.json` exists, schema-valid, nonce matches the run | harness-owned dir + per-run random nonce | harness | yes — binds the file to the exact run (kills copy-pasted evidence) |
+| Script exited zero, completed, and output capture completed | harness process result | harness | yes — necessary integrity only, never vulnerability proof |
+| `evidence.json` exists, has a non-empty assertion, and its nonce matches | harness-owned dir + per-run random nonce | harness | yes — binds intent to the exact run |
 | Two target runs deterministic (normalized evidence equal) | harness compares | harness | yes |
-| Control evidence differs from target's (target-dependent claim) | harness compares | harness | yes — but the evidence objects are **authored by the script** |
+| Target `verify.url` belongs to the case target; control evidence belongs to the declared control | harness URL binding | harness | yes |
+| Same request template executed against target and control | harness-owned HTTP client | harness | yes — only the origin changes; control-mode prose cannot weaken it |
+| Target matches and control does not | harness-observed responses | harness | yes — required `target_only` predicate differential |
+| Optional fresh canary appears on target but not control | harness-generated post-PoC token + harness responses | harness | yes — produces `canary_differential`; raw token is not persisted |
+| Redirects remain network-safe | harness validates every hop, pins approved DNS answers at connect time, and strips credentials cross-origin | harness | yes |
 | control == poc (sha256), PoC bytes unchanged at commit | harness | harness | yes — but only proves it is the *same* self-attesting script |
 | Case target still equals the bundle's target, differs from control target | harness | harness | yes |
-| Observation artifact exists + hashes, predates the repro | harness | harness | yes — existence/hash; **content never judged** |
-| Confirmer verdict: `re_executed: true`, `target_only`, `disconfirmation_attempt` | **confirmer agent's self-report** | **confirmer** | shape-checked only; the re-execution itself is not observed |
+| Observation artifact is workspace-contained, non-symlink, durable, hashed, and predates repro | harness | harness | yes — existence/provenance, not semantic content |
+| Main-agent verdict + fresh phase-2 replay: `re_execution_note`, `target_only`, `disconfirmation_attempt` | harness transcript + main agent's structured review | harness/main agent | yes for the replay; semantic review remains judgment |
+| Private/internal replay | operator authorization + harness HTTP client | operator/harness | fail closed unless `PI_POC_ALLOW_PRIVATE_REPLAY=1` |
+| Built-in loopback OOB callback | harness listener, but reachable by PoC | harness | diagnostic only; cannot promote without source separation |
 | sandbox isolation, path containment, symlink rejection | harness | harness | yes |
 | report file: size, required sections, forbidden identifiers | harness | harness | yes — but format, not truth |
 
-What is *not* verified anywhere: that the target was contacted, that a request caused the claimed effect, that data was actually exfiltrated, that the response contained what the script says it contained — and, in the current design, that the confirmer actually re-sent the verify request (its `re_executed` is a self-reported boolean). The PoC script still branches on `PI_POC_MODE`/`PI_POC_TARGET`, so the evidence differential can be script-authored; the confirmer's independent re-execution is the counter-check, and it is trusted on its word.
+What remains unverified: semantic impact, whether the selected predicate is strong enough for the claim, cryptographic main-agent identity provenance, blind interactions without source separation, and state-changing effects without a harness-owned account/state oracle. These are explicit limits, not paths that silently fall back to a worker verdict. A predicate-only differential is recorded as such; it is not relabeled as exploitation proof.
 
-## 3. Concrete cheat scripts that pass every gate today
+## 3. Cheats the current gate rejects
 
-A malicious model (or a prompt-injected PoC from a cloned repo — the workflow itself clones untrusted code) can pass the full gate with zero exploitation:
-
-```sh
-#!/bin/sh
-# poc.sh — passes all current checks, exploits nothing
-if [ "$PI_POC_MODE" = "control" ]; then
-  echo "CONTROL_REACHED_c1"        # liveness marker
-  exit 0                            # no vuln marker → control "clean"
-fi
-echo "VULN_CONFIRMED_c1"           # verification marker, unconditional
-exit 0
-```
-
-- sha256(control)==sha256(poc): same file. ✓
-- control prints liveness, no marker: ✓
-- disconfirmation script: `#!/bin/sh\nexit 1` — "finding survived disproof". ✓
-- observation artifact: any existing file, EvidenceAdd'd. ✓
-- PoC exit 0, marker present, output complete. ✓
-
-**The same-file control gate is circumventable by branching on `PI_POC_MODE`/`PI_POC_TARGET`** — the model knows both values. The gates are honestly calibrated against an *honest-but-sloppy* model (they reliably catch an honest PoC accidentally printing its marker unconditionally, and they make sloppiness costly), but they are *theater* against a model that chooses to cheat. The trust-chain review in `.review-output/trustchain.md` reached the same conclusion: "The ledger checks shapes, transitions, and string presence/absence — never provenance, never semantics."
+- `exit 0` with no evidence or an empty `expect` — rejected by the evidence contract.
+- Mode-specific target/control JSON with no target effect — the harness ignores the control-mode request and derives an identical control request from the target template.
+- A verify URL pointed at an unrelated known-good server — rejected by target binding.
+- A public URL redirecting to loopback/private infrastructure — rejected at the redirect hop.
+- Private-host replay without operator authorization — rejected; the main agent is not used as a fallback oracle.
+- A PoC that curls its own loopback OOB token only in target mode — rejected because source separation is absent.
 
 ## 4. How real systems do machine verification
 
@@ -93,11 +84,11 @@ A confirmation is machine-judged to the degree that the harness owns:
 2. **The secret** — the thing whose appearance proves the effect (interaction token, canary value, planted file content). If the secret is chosen by the model, the model can print it unconditionally.
 3. **Predicate execution** — the code that decides pass/fail (matcher on harness-fetched response, log query, file comparison). If the "predicate" is `output.includes(marker)` where the model chose the marker, the model chose the bar.
 
-Current XPI: owns none of the three at the confirmation step. Marker, liveness string, and control behavior are all model-authored; the only harness-owned checks are process-level (ran, completed, captured) and file-level (exists, hashes, same-file).
+Current XPI direct-response tier: the harness owns evidence acquisition and predicate execution for both target and control, including connect-time DNS pinning. The worker-authored PoC owns predicate definition; the main agent reviews its semantic strength. For reflection, the harness also owns a post-PoC random secret and checks target-only appearance. XPI does not yet own a source-separated OOB channel or a general file/account/state oracle.
 
-## 6. Proposal — per bug class
+## 6. Remaining design — per bug class
 
-The marker system stays as the *self-report* layer (it documents intent and catches honest sloppiness), but confirmation becomes a **harness-observed evidence check**. PoC scripts gain an optional `PI_POC_EVIDENCE_DIR` / `PI_POC_CALLBACK_URL` contract; promotion requires the harness-side check to pass *in addition to* the self-report.
+Structured PoC output stays as the self-report and audit layer, but it cannot promote a case without a harness-owned oracle. Tier 2 is implemented; the remaining work is to extend equally strong oracles to blind and stateful classes.
 
 ### Tier 1 — Harness-owned callback (OOB classes: SSRF, blind RCE, open redirect, blind XSS, DNS exfil)
 
@@ -110,12 +101,14 @@ The marker system stays as the *self-report* layer (it documents intent and catc
 
 ### Tier 2 — Request-spec + harness-side replay (direct-response classes: SQLi, reflected XSS, IDOR, traversal on live targets)
 
-- The PoC writes a machine-readable evidence record to `PI_POC_EVIDENCE_DIR/evidence.json`: `{ request: { method, url, headers, body }, expectation: { status: [..], body_contains: [...], body_regex: [...] } }` — i.e., the model supplies the *predicate*, not the result.
-- The harness **sends the request itself** with its own HTTP client and applies the expectation to the response *it* received.
-- Differential mode: the harness sends the baseline request and the attack request and applies a comparison predicate (e.g., "attack response contains a value the baseline response does not").
-- The model never gets to see the final response and assert on it — the harness's client and matcher code do. This kills the "print marker on any 200" cheat for response-visible classes.
+- The PoC writes a machine-readable evidence record to `PI_POC_EVIDENCE_DIR/evidence.json`: `{ verify: { method, url, headers, body, expect: { status, body_contains, body_regex } } }` — i.e., it supplies a bounded request and predicate, not the harness result.
+- The harness sends that immutable request with its own HTTP client to both the case target and the operator-approved control, and applies the same expectation to each response.
+- Only a conclusive target match and conclusive control non-match passes. A status-only expectation or a control transport failure is rejected.
+- The PoC cannot author the harness's response observations or matcher result. This kills the "print success on any 200" class of cheat for response-visible findings.
 
-### Tier 3 — Canary secrets + side-effect checks (sandbox-visible classes: local file read, file write, RCE on replica)
+### Tier 3 — General canary secrets + side-effect checks (sandbox-visible classes: local file read, file write, RCE on replica)
+
+Reflection canaries are implemented for Tier 2 HTTP replay: declare one fixed `{{PI_POC_CANARY}}` placeholder, let the harness replace it after the PoC exits, and require the fresh value only in the target response. The remaining Tier 3 work is planting and observing secrets outside a response-reflection channel:
 
 - The runner plants a canary file (random token) in a known path inside the sandbox before the run, and tells the PoC where via env.
 - For "read arbitrary file" claims: the verdict is "the token appears in the harness-observed exfil channel" (Tier 1 callback for OOB, or Tier 2 capture for response-visible).
@@ -134,22 +127,20 @@ The marker system stays as the *self-report* layer (it documents intent and catc
 
 ## 7. What still cannot be machine-verified (honest limits)
 
-- **State-changing bugs on live targets with no observable oracle.** If the exploit's only effect is "the victim's password changed" and the harness cannot observe the victim's account, no harness-owned channel exists. The marker stays the only signal. The fix is procedural, not mechanical: the workflow should demand an *oracle* (create a test account the harness controls, then verify the change against it — known-answer testing).
+- **State-changing bugs on live targets with no observable oracle.** If the exploit's only effect is "the victim's password changed" and the harness cannot observe the victim's account, no harness-owned channel exists. The case stays investigating. The fix is procedural: create a test account the harness controls, then verify the change against it.
 - **A malicious model that performs the real attack and lies about it.** If the response never transits a harness-owned channel, the claim is unverifiable by construction. This is why Tier 2 (harness sends the request itself) matters: it removes the response from the model's write path for the most common classes.
-- **Disconfirmation quality.** `exit 1` on an empty script will always pass the *executed* disconfirmation gate. The content of the disproof remains a judgment call — the skeptic agent (a different model, fresh context) is the right tool, but that stays prompt-level. Making the disconfirmation emit a structured record (what was tried, what was observed) at least makes it reviewable.
+- **Disconfirmation quality.** The main agent's disconfirmation remains a structured report. The phase-2 replay transcript is machine-bound to the verdict, but the orchestration identity and semantic quality of the disconfirmation are not.
+- **Main-agent identity against a same-UID adversary.** The extension snapshots the worker role and treats it monotonically, so unsetting `PI_SUBAGENT_CHILD` cannot upgrade the running process. A shell-capable agent can still start a new process without the marker or mutate SQLite directly. Closing that boundary requires an orchestrator-issued capability or an OS-isolated ledger broker.
 - **"Real impact" judgment** (is a leak actually sensitive, is RCE actually reachable from production). This is triage judgment; no harness channel exists. The report gate and human/vendor review remain the final arbiters.
 
 ## 8. Recommendation
 
 Do these in order:
 
-1. **Tier 2 (request-spec + harness-side replay)** — covers the largest share of real findings (direct-response web bugs), pure code, no new infra. Reuses the existing sandbox: the harness's own fetch to the live target or replica.
-2. **Tier 1 (harness-owned callback, three-box for replicas)** — covers the OOB classes where no other verification exists; the DNS/HTTP listener is ~200 lines; the three-box model makes it a hard guarantee for sandboxed targets.
-3. **Tier 4 (evidence.json schema)** — prerequisite discipline for both; also feeds the reporter.
-4. **Tier 5 (accuracy ledger + determinism)** — cheap, code-only, increases cost of cheating over time.
-5. **Tier 3 (canaries)** — where sandbox-visible classes matter; easy once the evidence contract exists.
-
-Keep the marker + same-file control + liveness checks: they remain the correct defense against honest sloppiness and they make the *self-report* explicit. But relabel them in docs as **self-report**, and make the harness-observed check the confirmation.
+1. **Tier 1 source separation** — attacker box can reach only target; target can reach the operator-owned callback service.
+2. **Tier 3 canaries/state oracles** for local replicas and test accounts.
+3. **Bind main-agent provenance** to an orchestration-issued run identity instead of relying on the process-role boundary.
+4. **Accuracy ledger** for agent/model promote-to-kill rates.
 
 ## 9. Sources
 

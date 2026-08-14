@@ -25,16 +25,15 @@
  */
 
 import { createHash } from "node:crypto";
+import { existsSync, readdirSync, rmSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import {
-  existsSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { dirname, join, resolve } from "node:path";
+  assertSafeRegularFile,
+  assertSafeStateDirectory,
+  ensureSafeStateDirectory,
+  readSafeFile,
+  writeSafeFileAtomic,
+} from "./safe-state.ts";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -215,17 +214,23 @@ function emptyCheckpoint(runId: string, projectRoot: string): ScratchpadCheckpoi
 }
 
 function ensureRunDirs(runDir: string): void {
-  if (!existsSync(runDir)) mkdirSync(runDir, { recursive: true });
+  const scratchpadRoot = dirname(runDir);
+  const projectRoot = dirname(scratchpadRoot);
+  const runName = basename(runDir);
+  ensureSafeStateDirectory(projectRoot, [SCRATCHPAD_DIR, runName]);
   for (const phase of PHASE_ORDER) {
-    const dir = join(runDir, PHASE_DIRS[phase]);
-    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    ensureSafeStateDirectory(projectRoot, [SCRATCHPAD_DIR, runName, PHASE_DIRS[phase]]);
   }
 }
 
 function readCheckpointRaw(runId: string, projectRoot?: string): ScratchpadCheckpoint | null {
+  const root = projectRoot ?? detectWorkspaceRoot();
   const statePath = getStatePath(runId, projectRoot);
-  if (!existsSync(statePath)) return null;
-  const raw = readFileSync(statePath, "utf8");
+  if (existsSync(statePath)) {
+    assertSafeStateDirectory(root, [SCRATCHPAD_DIR, runDirName(runId)]);
+  }
+  if (!assertSafeRegularFile(statePath, "Scratchpad checkpoint")) return null;
+  const raw = readSafeFile(statePath, "Scratchpad checkpoint").toString("utf8");
   const cp = JSON.parse(raw) as ScratchpadCheckpoint;
   if (typeof cp !== "object" || cp === null || Array.isArray(cp)) {
     throw new Error(`Corrupt scratchpad state for ${runId}: root must be an object`);
@@ -258,9 +263,7 @@ function writeCheckpointRaw(cp: ScratchpadCheckpoint, projectRoot?: string): voi
   cp.last_updated = new Date().toISOString();
   const statePath = getStatePath(cp.run_id, projectRoot);
   ensureRunDirs(getRunDir(cp.run_id, projectRoot));
-  const tmp = `${statePath}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(cp, null, 2), "utf8");
-  renameSync(tmp, statePath);
+  writeSafeFileAtomic(statePath, JSON.stringify(cp, null, 2));
 }
 
 // ── Public API ───────────────────────────────────────────────────────
@@ -309,7 +312,7 @@ export function scratchpad_write(
   const safeName = artifactFileName(artifactName);
   const dir = join(runDir, PHASE_DIRS[phase]);
   const filePath = join(dir, safeName);
-  writeFileSync(filePath, content, "utf8");
+  writeSafeFileAtomic(filePath, content);
   return filePath;
 }
 
@@ -325,8 +328,11 @@ export function scratchpad_read(
   const root = projectRoot ?? detectWorkspaceRoot();
   const safeName = artifactFileName(artifactName);
   const filePath = join(getRunDir(runId, root), PHASE_DIRS[phase], safeName);
-  if (!existsSync(filePath)) return null;
-  return readFileSync(filePath, "utf8");
+  if (existsSync(filePath)) {
+    assertSafeStateDirectory(root, [SCRATCHPAD_DIR, runDirName(runId), PHASE_DIRS[phase]]);
+  }
+  if (!assertSafeRegularFile(filePath, "Scratchpad artifact")) return null;
+  return readSafeFile(filePath, "Scratchpad artifact").toString("utf8");
 }
 
 /**
@@ -335,13 +341,16 @@ export function scratchpad_read(
 export function scratchpad_runs(projectRoot?: string): string[] {
   const root = getScratchpadRoot(projectRoot);
   if (!existsSync(root)) return [];
+  assertSafeStateDirectory(dirname(root), [SCRATCHPAD_DIR]);
   const out: string[] = [];
   for (const entry of readdirSync(root, { withFileTypes: true })) {
     if (!entry.isDirectory()) continue;
     const state = join(root, entry.name, "state.json");
-    if (!existsSync(state)) continue;
+    if (!assertSafeRegularFile(state, "Scratchpad checkpoint")) continue;
     try {
-      const cp = JSON.parse(readFileSync(state, "utf8")) as { run_id?: unknown };
+      const cp = JSON.parse(readSafeFile(state, "Scratchpad checkpoint").toString("utf8")) as {
+        run_id?: unknown;
+      };
       if (typeof cp.run_id !== "string") continue;
       if (getRunDir(cp.run_id, projectRoot) === join(root, entry.name)) {
         out.push(cp.run_id);
@@ -366,7 +375,10 @@ export function scratchpad_list(
   const root = projectRoot ?? detectWorkspaceRoot();
   const dir = join(getRunDir(runId, root), PHASE_DIRS[phase]);
   if (!existsSync(dir)) return [];
-  return readdirSync(dir).filter((f) => f !== "state.json");
+  assertSafeStateDirectory(root, [SCRATCHPAD_DIR, runDirName(runId), PHASE_DIRS[phase]]);
+  return readdirSync(dir).filter(
+    (f) => f !== "state.json" && assertSafeRegularFile(join(dir, f), "Scratchpad artifact"),
+  );
 }
 
 /**
@@ -437,5 +449,8 @@ export function scratchpad_phase_done(
 export function scratchpad_clear(runId: string, projectRoot?: string): void {
   const root = projectRoot ?? detectWorkspaceRoot();
   const runDir = getRunDir(runId, root);
-  if (existsSync(runDir)) rmSync(runDir, { recursive: true, force: true });
+  if (existsSync(runDir)) {
+    assertSafeStateDirectory(root, [SCRATCHPAD_DIR, runDirName(runId)]);
+    rmSync(runDir, { recursive: true, force: true });
+  }
 }

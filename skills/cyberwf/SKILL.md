@@ -208,10 +208,10 @@ OMP form: same `task` text in a `task({ context: "fresh", tasks: [{ name: "<run>
 Validate: finding_id, verdict (CONFIRMED|DISPROVEN), reasoning, evidence_reviewed; DISPROVEN must have disproval_reason.
 
 **Verdict handling:**
-- **CONFIRMED** — record the skeptic's `disconfirmation_attempt` on the case via `CaseUpdate(id, { disconfirmation: <attempt> })` AND as `EvidenceAdd(role: "observation", artifact_path: <saved skeptic artifact>)` — the field will be replaced by the confirmer's attempt at confirm time, but the artifact keeps the skeptic's independent disproof in the audit trail; finding advances to VALIDATE.
+- **CONFIRMED** — record the skeptic's `disconfirmation_attempt` on the case via `CaseUpdate(id, { disconfirmation: <attempt> })` AND as `EvidenceAdd(role: "observation", artifact_path: <saved skeptic artifact>)` — the field will be replaced by the main agent's phase-2 attempt, while the artifact keeps the skeptic's independent challenge in the audit trail; finding advances to VALIDATE.
 - **DISPROVEN** — first add the skeptic output as `EvidenceAdd(role: "refutation", artifact_path: <saved skeptic artifact>)`, then `CaseUpdate(id, { status: "killed", nextStep: "killed: skeptic-disproven — <disproval_reason>" })`. No tie-breaker.
 
-The skeptic's `disconfirmation_attempt` is the pre-promotion disconfirmation record — stronger than self-disconfirmation (independent agent). The confirmer's independent attempt replaces the field at confirm time; both live in the evidence trail.
+The skeptic's `disconfirmation_attempt` is the pre-promotion challenge. The main agent performs the final disconfirmation itself at ConfirmFinding time; both attempts remain in the evidence trail.
 
 ### VALIDATE: One agent per traced finding
 
@@ -229,13 +229,11 @@ The exploit agent runs the PoC through `PromoteFinding` (you do not). The case m
 
 **Evidence chain closure (before PromoteFinding):** promotion now REQUIRES an **artifact-backed** `observation` evidence item (EvidenceAdd role=observation with `artifact_path` — the initial signal, stored with its SHA-256) in addition to the reproduction item the gate auto-writes. A summary-only observation is agent prose and is rejected. If the case lacks one, the ledger rejects promotion with "Evidence chain incomplete". Record the observation (probe response, source snippet, log file) when the case is first created or when it reaches investigating — not at the last minute.
 
-**Two-phase promotion (REQUIRED for EVERY promotion — markers/exit codes are diagnostics, not gates):**
+**Two-phase promotion (REQUIRED for EVERY promotion — zero exit is necessary run integrity, never proof; markers are diagnostic only):**
 
-*Phase 1 — PromoteFinding.* Pass `poc_path`, `control_path` (the SAME bytes as the PoC — sha256-equality is enforced), a distinct `control_target`, and `local: true` when the bug needs network (host-network sandbox; true host execution remains operator-gated by `PI_POC_ALLOW_LOCAL=1`). The harness runs the script with `PI_POC_MODE=poc` against the case target twice, then `PI_POC_MODE=control` against `control_target`. Every run must complete with fully captured output and write nonce-bound `evidence.json` to `$PI_POC_EVIDENCE_DIR` (`{ nonce (echo $PI_POC_NONCE), claim, verify: { method, url, headers?, body?, expect: { status/body_contains/body_regex } }, observations }`). The machine gate checks completion + output capture, nonce binding, determinism across the two target runs, and that the control evidence differs from the target's (not target-dependent → blocked). A crashed, truncated, or evidence-less run proves nothing and blocks promotion.
+*Phase 1 — PromoteFinding.* Pass `poc_path`, same-byte `control_path`, an operator-approved `control_target` from `PI_POC_CONTROL_TARGETS`, and `local: true` when needed. Every run must complete with captured output and nonce-bound `evidence.json` containing a response-body predicate; status-only evidence is rejected. The harness pins DNS, locks redirects to the bound host, applies one request to target/control, and requires two conclusive responses with `target_only`. Crashed, truncated, evidence-less, or transport-inconclusive runs block promotion.
 
-*Dispatch the confirmer.* After the bundle is recorded, dispatch `agent: "confirmer"` (fresh context, different model) to verify the evidence: it re-sends the `verify` request itself, judges the differential, and writes its own disproof attempt.
-
-*Phase 2 — ConfirmFinding.* Commit the confirmer's verdict with `ConfirmFinding(case_id, verdict)`. CONFIRMED requires `re_executed: true`, `differential: "target_only"`, and a `disconfirmation_attempt` (becomes the case's `disconfirmation`). NOT_CONFIRMED keeps the case investigating — no tie-breaker. Never `CaseUpdate(status: "confirmed")` directly.
+*Phase 2 — ConfirmFinding (main agent only).* Do not dispatch confirmation. The main/coordinator reads the exact PoC and preserved evidence, hunts trivial predicates or fabrication, performs a concrete disconfirmation attempt, and calls `ConfirmFinding` itself. A CONFIRMED call performs and stores a fresh harness-owned target/control replay; there is no caller-supplied re-execution checkbox. CONFIRMED requires `re_execution_note`, `differential: "target_only"`, and the main agent's `disconfirmation_attempt`. Worker processes are rejected. Never `CaseUpdate(status: "confirmed")` directly.
 
 **Design & runtime check (VALIDATE, before promoting):** the case must carry the non-intentionality evidence — the skeptic's disconfirmation includes the docs/git-history/runtime search. For non-skeptic findings, the exploit agent searches docs, git history, and runtime/framework docs before promoting: documented intent → kill `intended_behavior`; runtime mitigates → kill `framework_protection`; neither → keep the notes in `disconfirmation` as non-intentionality proof.
 
@@ -323,6 +321,6 @@ Target budgets (cumulative in+out): HUNT ~50K/class, TRACE ~20K/finding, SKEPTIC
 - No finding advances without passing its stage schema. Malformed → send it back.
 - No finding is validated without a reachability trace showing REACHABLE.
 - A `confidence: high` finding is not validated until the skeptic runs — confirm or killed on DISPROVEN. **The skeptic independently verifies scope**: target mismatch → DISPROVEN `out_of_scope`, citing the instruction verbatim.
-- `confirmed` requires evidence + poc + impact + severity + target + disconfirmation, reached only through **PromoteFinding (evidence bundle) → confirmer dispatch → ConfirmFinding (CONFIRMED verdict)** — the PoC runs 2× against the real target (or faithful replica) + 1× against a distinct control with nonce-bound `evidence.json`; no mocks, no markers-as-gates. **Severity derives from what the PoC evidence demonstrates, not theory.** The auditor sets `confidence` only; the exploit agent sets severity after the evidence bundle is recorded. The skeptic and confirmer check for inflation.
+- `confirmed` requires evidence + poc + impact + severity + target + disconfirmation, reached only through **PromoteFinding machine bundle → main-agent review → ConfirmFinding**. The exploit worker may produce phase-1 evidence but must return `pending_confirmation`, never decide confirmation. The main agent checks severity and commits; no mocks, markers, or exit-code-only proof.
 - A patch isn't safe until a fresh tracer confirms the sink is unreachable.
 - Coverage is tracked per class with entry-point lists. Only `INCOMPLETE` re-queues in gapfill; `NOT_FOUND` requires an empty UNCHECKED list.

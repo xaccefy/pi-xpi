@@ -5,6 +5,8 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { rm } from "node:fs/promises";
@@ -69,6 +71,36 @@ describe("scratchpad", () => {
 
     const content = scratchpad_read("run-1", "trace", "finding-abc.json");
     assert.strictEqual(content, '{"reachable": true}');
+  });
+
+  it("rejects a pre-planted scratchpad-directory symlink", () => {
+    const outside = mkdtempSync(join(tmpdir(), "scratchpad-outside-"));
+    try {
+      symlinkSync(outside, join(tempDir, ".scratchpad"), "dir");
+      assert.throws(() => scratchpad_init("run-1"), /real directory, not a symlink/);
+      assert.deepStrictEqual(readdirSync(outside), []);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an artifact symlink without overwriting its target", () => {
+    const outside = mkdtempSync(join(tmpdir(), "scratchpad-outside-"));
+    try {
+      scratchpad_init("run-1");
+      const victim = join(outside, "victim.txt");
+      writeFileSync(victim, "operator data", "utf8");
+      const artifact = join(getRunDir("run-1"), "trace", "finding.json");
+      symlinkSync(victim, artifact);
+
+      assert.throws(
+        () => scratchpad_write("run-1", "trace", "finding.json", "attacker data"),
+        /regular, non-symlink file/,
+      );
+      assert.strictEqual(readFileSync(victim, "utf8"), "operator data");
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 
   it("read returns null for missing artifact", () => {

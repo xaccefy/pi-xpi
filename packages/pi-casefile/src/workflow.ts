@@ -41,8 +41,6 @@ type DispatchSpec = {
   crash: string;
   /** Skeptic dispatch snippet (follows "dispatch it BEFORE the exploit agent with "). */
   skeptic: string;
-  /** Confirmer dispatch snippet (follows "dispatch the confirmer: "). */
-  confirmer: string;
   /** Reporter dispatch snippet (follows "Dispatch the reporter subagent with "). */
   reporter: string;
 };
@@ -56,8 +54,6 @@ const PI_DISPATCH: DispatchSpec = {
     "**Subagent crash handling:** a crash (SIGABRT, OOM, timeout) is a RETRY, not a verdict. Launch one new workflowScript with the same specialist task, a new stable attempt key, and a stronger model. Crash again → record `blocked: <agent> crashed` in the pipeline-run case and continue; never silently drop the stage.",
   skeptic:
     "`subagent({ workflowScript: \"return runs.run('skeptic-<case>-1', { agent: 'skeptic', task: '...' })\", context: 'fresh', async: true })`",
-  confirmer:
-    "`subagent({ workflowScript: \"return runs.run('confirm-<case>-1', { agent: 'confirmer', task: 'Verify the PoC evidence for case <id> (poc_path=..., control_target=..., evidence_sha256=..., poc_sha256=...). Assume fabricated, prove real. Re-send the verify request yourself. Return the verdict.' })\", context: 'fresh', async: true })`",
   reporter:
     "`subagent({ workflowScript: \"return runs.run('report-<case>-1', { agent: 'reporter', task: 'Write the final report. case_id=<id>, context_path=<context path>, report_path=<report path>, program_name=<if known>.' })\", context: 'fresh', async: true })`",
 };
@@ -71,8 +67,6 @@ const OMP_DISPATCH: DispatchSpec = {
     "**Subagent crash handling:** a failed or hung task (SIGABRT, OOM, timeout) is a RETRY, not a verdict. Re-dispatch the same specialist task with a new attempt name and a stronger model. Crash again → record `blocked: <agent> crashed` in the pipeline-run case and continue; never silently drop the stage.",
   skeptic:
     "`task({ context: 'fresh', tasks: [{ name: 'skeptic-<case>-1', agent: 'skeptic', task: '...' }] })`",
-  confirmer:
-    "`task({ context: 'fresh', tasks: [{ name: 'confirm-<case>-1', agent: 'confirmer', task: 'Verify the PoC evidence for case <id> (poc_path=..., control_target=..., evidence_sha256=..., poc_sha256=...). Assume fabricated, prove real. Re-send the verify request yourself. Return the verdict.' }] })`",
   reporter:
     "`task({ context: 'fresh', tasks: [{ name: 'report-<case>-1', agent: 'reporter', task: 'Write the final report. case_id=<id>, context_path=<context path>, report_path=<report path>, program_name=<if known>.' }] })`",
 };
@@ -111,8 +105,9 @@ ${LIFECYCLE_DIAGRAM}
 |-------|-----------|-------------|
 | RECON | (none) | Map attack surface, fingerprint, search CVEs. Something interesting → HYPOTHESIS. |
 | HUNT | HYPOTHESIS | Document the lead (impact not required yet). Clear intended-behavior/artifact → KILLED; else INVESTIGATING. |
-| CHAIN | INVESTIGATING | Test the hypothesis, chain primitives, build PoC. Explore combinations (open redirect + SSRF, leak + endpoint, …). |
-| VALIDATE | CONFIRMED | Prove impact, adversarial review, root-cause trace. Survive the gates below or fall back to INVESTIGATING / KILLED. |
+| TRACE / SKEPTIC / VALIDATE | INVESTIGATING | Trace reachability, attempt disconfirmation, and produce the pending PoC evidence bundle. Failure stays INVESTIGATING or becomes KILLED. |
+| MAIN REVIEW | CONFIRMED | The main agent judges whether the machine differential actually establishes the vulnerability and impact, then commits through ConfirmFinding. |
+| CHAIN | CONFIRMED | Link confirmed findings and evaluate multi-step exploit paths; this stage does not confirm new cases. |
 | REPORT | REPORTED | CaseContext → reporter agent → report-readiness gate. |
 
 ### Preconditions Per State Transition (MANDATORY)
@@ -120,7 +115,7 @@ ${LIFECYCLE_DIAGRAM}
 | Advance To | Required Case Fields | On Disk |
 |-----------|---------------------|---------|
 | HYPOTHESIS → INVESTIGATING | evidence (observations), confidence | Notes on what was observed |
-| INVESTIGATING → **CONFIRMED** | evidence, poc, **impact** (content below), severity, **target**, **disconfirmation** (the confirmer's documented disprove attempt) | PromoteFinding phase 1: PoC runs 2× against target + 1× against a distinct \`control_target\` (same script, sha256-enforced); every run completes with output fully captured and writes nonce-bound \`evidence.json\` to \`$PI_POC_EVIDENCE_DIR\`; target runs are deterministic and the control evidence differs from the target's (machine-checked). Then dispatch the **confirmer** subagent and commit its verdict with **ConfirmFinding**: CONFIRMED requires the confirmer to have re-sent the verify request itself (\`re_executed: true\`), a \`target_only\` differential, and its own \`disconfirmation_attempt\` (becomes the case's disconfirmation). Exit codes and output markers are diagnostics, not gates. |
+| INVESTIGATING → **CONFIRMED** | evidence, poc, **impact** (content below), severity, **target**, **disconfirmation** (the main agent's documented disprove attempt) | PromoteFinding phase 1: PoC runs 2× against target + 1× against an operator-approved \`control_target\` (same script, sha256-enforced); every run completes at exit zero with output fully captured and writes nonce-bound \`evidence.json\` with a response-body predicate; the harness obtains conclusive target/control responses and requires \`target_only\`. Then the **main/coordinator agent itself** reviews and calls **ConfirmFinding**, which captures a fresh second harness replay before commit. Worker agents cannot submit phase 2. Zero exit is necessary run integrity, never vulnerability proof; output markers are diagnostic only. |
 | Any → KILLED | assumptions (why it died) | — |
 | CONFIRMED → REPORTED | CaseContext(id) succeeded (records report path) AND the reporter agent wrote the report file | Context bundle + report file |
 
@@ -183,15 +178,15 @@ An attempt: reproduce under different conditions (auth/config/network position);
 Strong example: "Read /api/users/123 as user B after confirming user A owns 123 → 403. Repeated with X-Override-User header (seen in admin traffic) → user A's data returned. Protection bypassed via the admin header."
 Weak: "Tried to disprove. Could not." — insufficient.
 
-**The CONFIRMED disconfirmation comes from the confirmer, not a script.** There is no \`disconfirmation_path\` gate: the confirmer subagent (fresh context, different model, dispatched between PromoteFinding and ConfirmFinding) must re-send the verify request itself and write its own failed disproof attempt, which becomes the case's \`disconfirmation\`. A case whose promotion reached CONFIRMED without the confirmer's disconfirmation_attempt is rejected by the ledger.
+**The CONFIRMED disconfirmation comes from the main agent, not a script or worker.** There is no \`disconfirmation_path\` gate: after PromoteFinding, the main/coordinator must write its own failed disproof attempt, which becomes the case's \`disconfirmation\`, and call ConfirmFinding to capture the fresh phase-2 replay. A worker/subagent cannot call ConfirmFinding, and a verdict without the main agent's \`disconfirmation_attempt\` is rejected.
 
 **Evidence chain closure (before PromoteFinding):** promotion is rejected unless the case carries an **artifact-backed** \`observation\` evidence item (EvidenceAdd role=observation with \`artifact_path\` — the initial signal, stored with its SHA-256) in addition to the auto-recorded reproduction item. Record observations as you go, not at promote time.
 
-**PromoteFinding (phase 1) — evidence bundle, not markers.** Call it with \`poc_path\`, \`control_path\` (the SAME bytes as the PoC — sha256-equality is enforced), a distinct \`control_target\`, and \`local: true\` when the bug needs network (host-network sandbox; bare host execution still needs operator \`PI_POC_ALLOW_LOCAL=1\`). The harness runs the PoC twice against the case target and once against \`control_target\`. Every run must complete with fully captured output and write nonce-bound \`evidence.json\` to \`$PI_POC_EVIDENCE_DIR\` (\`{"nonce" (echo $PI_POC_NONCE), "claim", "verify": {method, url, headers?, body?, expect: {status/body_contains/body_regex}}, "observations"}\`). The machine gate checks: completion + output completeness, nonce binding, determinism across the two target runs, and that the control evidence differs from the target's (not target-dependent → blocked). Exit codes and output markers are DIAGNOSTICS — a PoC that exits 0 but writes no (or misnonced) evidence is blocked.
+**PromoteFinding (phase 1) — evidence bundle, not markers.** Call it with \`poc_path\`, same-byte \`control_path\`, an operator-approved \`control_target\` from \`PI_POC_CONTROL_TARGETS\`, and \`local: true\` when the bug needs network. Every run must complete with fully captured output and write nonce-bound \`evidence.json\` whose \`expect\` includes \`body_contains\` or \`body_regex\`; status-only evidence is rejected. The harness pins DNS at connect time, keeps redirects on the bound host, sends the same request to target/control, and requires two conclusive responses with \`target_only\`. Private replay requires operator authorization. Blind/OOB classes fail closed until a source-separated oracle exists.
 
-**ConfirmFinding (phase 2) — the confirmer's verdict commits.** After PromoteFinding succeeds, dispatch the confirmer: ${d.confirmer} — then commit its verdict with \`ConfirmFinding(case_id, verdict)\`. CONFIRMED requires: the confirmer re-sent the verify request (\`re_executed: true\`), \`differential: "target_only"\`, and its own \`disconfirmation_attempt\`. NOT_CONFIRMED keeps the case investigating (attempt recorded) — no tie-breaker. **Never \`CaseUpdate(status: "confirmed")\` directly — it is rejected.**
+**ConfirmFinding (phase 2) — main-agent-only commit.** After PromoteFinding succeeds, do not dispatch confirmation. The main/coordinator agent must inspect the exact PoC/evidence, hunt trivial predicates/fabrication, attempt disconfirmation, and call \`ConfirmFinding(case_id, verdict)\` itself. A CONFIRMED call performs and stores a fresh harness-owned target/control replay; a caller-supplied re-execution checkbox is not accepted. CONFIRMED requires \`re_execution_note\`, \`differential: "target_only"\`, and the main agent's \`disconfirmation_attempt\`. Worker processes are rejected. **Never \`CaseUpdate(status: "confirmed")\` directly.**
 
-**PoC audit (anti-cheat, before PromoteFinding):** have an independent eye on the PoC script itself. For \`confidence: high\` findings the skeptic agent re-reads the PoC file (not just the source) hunting for: unconditional marker prints, trivially-true checks (accepting any 200, grepping for always-present strings), hardcoded expected values, and local mocks of the target. Record the audit result as an EvidenceAdd \`observation\` item (or \`refutation\` if it found a cheat → kill). The model that writes the check must not be the only one that reads it — the confirmer re-reads the script at confirm time. The deterministic backstops are code, not prompts: run completion + output capture, nonce binding, determinism, the evidence differential, the same-file control sha256, PoC byte-identity re-check at commit, and the confirmer's independent re-execution.
+**PoC audit (anti-cheat, before PromoteFinding):** have an independent eye on the PoC script itself. For \`confidence: high\` findings the skeptic agent re-reads the PoC file hunting unconditional success, trivial checks, constants, and local mocks. Record the audit as EvidenceAdd \`observation\` (or \`refutation\` if cheated). The main agent must re-read the exact script before ConfirmFinding; workers may challenge evidence but never decide promotion. Deterministic backstops are code: output completeness, nonce binding, response-body predicates, deterministic runs, operator-approved control, DNS-pinned conclusive replay, same-file sha256, and PoC byte-identity re-check at commit.
 
 ### 2. Design & Runtime Check — non-intentionality gate (mandatory)
 
@@ -236,14 +231,14 @@ Prove at least **one** real attacker-facing violation against a production-viabl
 
 Impact text answers: *who is hurt, what is lost, how the attacker reaches it from production.* Theoretical impact, a second unproven bug, or unreachable-from-attacker → stay INVESTIGATING (chain it) or KILL.
 
-**Severity is derived from PROVEN impact, not guessed** — set only after the PoC exits 0 and its output demonstrates the impact:
-- **critical** = RCE, account takeover, or direct fund theft (in PoC output)
+**Severity is derived from PROVEN impact, not guessed** — set only after the machine differential and the main-agent review demonstrate the impact; a zero exit or PoC output alone is insufficient:
+- **critical** = RCE, account takeover, or direct fund theft demonstrated in confirmed evidence
 - **high** = sensitive data read/write, privilege escalation, SSRF to internal services
 - **medium** = limited data exposure, XSS on sensitive page, IDOR on non-critical resources
 - **low** = info leak, open redirect, self-only impact with a victim path
 - **info** = best-practice gap, no demonstrated impact
 
-"Could lead to"/"may allow"/"theoretically" = NOT proven — drop to what the PoC output shows. Under-claiming is safe; over-claiming gets rejected at triage.
+"Could lead to"/"may allow"/"theoretically" = NOT proven — drop to what the confirmed harness evidence shows. Under-claiming is safe; over-claiming gets rejected at triage.
 
 ### 7. Adversarial Self-Review
 
@@ -340,7 +335,7 @@ Write the final report as a self-contained markdown file at the report path Case
 - **No finding is confirmed until its target is verified in scope** per the program's scope instruction. Out-of-scope findings are killed, not confirmed.
 - **No finding is validated without a reachability trace** showing REACHABLE.
 - **High-confidence findings: do your own adversarial disconfirmation.** No skeptic subagent in lite mode — actively try to disprove your own finding and document the attempt in \`disconfirmation\`. Failing to disprove is the expected outcome.
-- **Confirmed requires** evidence + poc + impact + severity + target + disconfirmation, via the two-phase gate (no shortcut): **PromoteFinding** with \`poc_path\`, same-script \`control_path\`, a distinct \`control_target\`, and \`local:true\` when the bug needs network. The harness runs the PoC 2× against the target + 1× against the control; every run must complete with fully captured output and write nonce-bound \`evidence.json\` (the machine gate: nonce binding, determinism, control differential — markers/exit codes are diagnostics). Then perform the **confirmer's job yourself**: re-send the \`verify\` request with \`http_request\`, confirm the effect reproduces in YOUR response and not on the control, write your own failed disproof attempt, and commit via **ConfirmFinding** (verdict requires \`re_executed: true\`, \`differential: "target_only"\`, \`disconfirmation_attempt\`). \`local:true\` uses a host-network sandbox; bare host execution needs operator \`PI_POC_ALLOW_LOCAL=1\`. No mocks. Never \`CaseUpdate(status: "confirmed")\` directly.
+- **Confirmed requires** evidence + poc + impact + severity + target + disconfirmation, via the two-phase gate: **PromoteFinding** with same-script target/control execution and an operator-approved \`control_target\`; then you, the main agent, inspect the bundle, attempt disconfirmation, and call **ConfirmFinding** yourself. That call captures a fresh second target/control replay before commit. Do not delegate phase 2. The machine gate requires zero-exit complete runs, nonce binding, body evidence, determinism, DNS-pinned conclusive \`target_only\` replay, and script identity; zero exit is never proof and markers are diagnostic only. \`local:true\` and private replay remain operator-gated. No mocks and no direct \`CaseUpdate(status: "confirmed")\`.
 - **Severity is derived from proven PoC impact, not theory.** Under-claiming is safe; over-claiming gets the finding rejected at triage.
 - **Evidence-first:** every claim must be traceable to observed/reproduced behavior, source code, or documented platform behavior.
 - **Design & runtime check (mandatory before CONFIRMED):** actively search the target's docs, git history, changelog, and runtime/framework docs for evidence the behavior is BY DESIGN or already FIXED IN THE RUNTIME. Found it → KILL (\`intended_behavior\` / \`framework_protection\`), unless the documented intent is itself the flaw with real attacker impact. Not found → document the search in \`disconfirmation\` as non-intentionality proof.

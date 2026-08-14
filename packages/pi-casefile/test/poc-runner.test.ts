@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -59,19 +59,30 @@ describe("poc-runner", () => {
     // opt-in, local:true must NOT spawn on the host: with Docker available it
     // degrades to a host-network SANDBOX; without Docker it fails closed with
     // the opt-in error.
+    const previousAllow = process.env.PI_POC_ALLOW_LOCAL;
+    const previousForce = process.env.PI_POC_FORCE_LOCAL;
     delete process.env.PI_POC_ALLOW_LOCAL;
+    delete process.env.PI_POC_FORCE_LOCAL;
     const shPoc = join(tempDir, "poc.sh");
     writeFileSync(shPoc, "#!/bin/sh\necho 'must not run on host'", "utf8");
 
-    const result = runPoc(shPoc, { local: true });
+    let result: ReturnType<typeof runPoc>;
+    try {
+      result = runPoc(shPoc, { local: true });
+    } finally {
+      if (previousAllow === undefined) delete process.env.PI_POC_ALLOW_LOCAL;
+      else process.env.PI_POC_ALLOW_LOCAL = previousAllow;
+      if (previousForce === undefined) delete process.env.PI_POC_FORCE_LOCAL;
+      else process.env.PI_POC_FORCE_LOCAL = previousForce;
+    }
 
-    if (result.sandbox) {
+    if (result.sandbox && !result.infraError) {
       // Docker path: the script ran inside the sandbox (isolation kept), never
       // on the host. The opt-in error must not appear.
       expect(result.completed).toBe(true);
       expect(result.output).not.toContain("PI_POC_ALLOW_LOCAL");
     } else {
-      // Docker-less path: fail closed — nothing may run on the host.
+      // Docker-less or Docker-unavailable path: fail closed — nothing ran on the host.
       expect(result.exitCode).not.toBe(0);
       expect(result.completed).toBe(false);
       expect(result.output).toContain("PI_POC_ALLOW_LOCAL");
@@ -90,6 +101,78 @@ describe("poc-runner", () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.output).toContain("control|http://example.test");
+  });
+
+  it("uses a fresh CSPRNG-shaped evidence nonce for every run", () => {
+    const shPoc = join(tempDir, "nonce-evidence.sh");
+    writeFileSync(
+      shPoc,
+      `#!/bin/sh
+printf '{"nonce":"%s","claim":"target signal","verify":{"method":"GET","url":"http://example.test/proof","expect":{"body_contains":["target signal"]}},"observations":[]}' "$PI_POC_NONCE" > "$PI_POC_EVIDENCE_DIR/evidence.json"`,
+      "utf8",
+    );
+
+    const first = runPoc(shPoc, { local: true });
+    const second = runPoc(shPoc, { local: true });
+    expect(first.nonce).toMatch(/^poc_[a-f0-9]{48}$/);
+    expect(second.nonce).toMatch(/^poc_[a-f0-9]{48}$/);
+    expect(first.nonce).not.toBe(second.nonce);
+    expect(first.evidence?.nonce).toBe(first.nonce);
+    expect(second.evidence?.nonce).toBe(second.nonce);
+  });
+
+  it("rejects oversized evidence.json before parsing or preserving it", () => {
+    const shPoc = join(tempDir, "oversized-evidence.sh");
+    writeFileSync(
+      shPoc,
+      '#!/bin/sh\nhead -c 300000 /dev/zero | tr "\\0" x > "$PI_POC_EVIDENCE_DIR/evidence.json"',
+      "utf8",
+    );
+
+    const result = runPoc(shPoc, { local: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.evidence).toBeUndefined();
+    expect(result.evidencePath).toBeUndefined();
+    expect(result.evidenceError).toContain("too large");
+  });
+
+  it("rejects a symlinked evidence.json", () => {
+    const shPoc = join(tempDir, "symlink-evidence.sh");
+    writeFileSync(
+      shPoc,
+      '#!/bin/sh\nln -s /etc/passwd "$PI_POC_EVIDENCE_DIR/evidence.json"',
+      "utf8",
+    );
+
+    const result = runPoc(shPoc, { local: true });
+    expect(result.exitCode).toBe(0);
+    expect(result.evidence).toBeUndefined();
+    expect(result.evidencePath).toBeUndefined();
+    expect(result.evidenceError).toContain("non-symlink");
+  });
+
+  it("rejects a symlinked durable PoC evidence store", () => {
+    const shPoc = join(tempDir, "valid-evidence.sh");
+    writeFileSync(
+      shPoc,
+      `#!/bin/sh
+printf '{"nonce":"%s","claim":"target signal","verify":{"method":"GET","url":"http://example.test/proof","expect":{"status":[200],"body_contains":["target signal"]}},"observations":[]}' "$PI_POC_NONCE" > "$PI_POC_EVIDENCE_DIR/evidence.json"`,
+      "utf8",
+    );
+    const outside = mkdtempSync(join(tmpdir(), "poc-evidence-outside-"));
+    try {
+      mkdirSync(join(tempDir, ".pi"), { mode: 0o700 });
+      symlinkSync(outside, join(tempDir, ".pi", "poc-evidence"), "dir");
+
+      const result = runPoc(shPoc, { local: true });
+      expect(result.exitCode).toBe(0);
+      expect(result.evidence).toBeUndefined();
+      expect(result.evidencePath).toBeUndefined();
+      expect(result.evidenceError).toContain("could not be preserved");
+      expect(readdirSync(outside)).toEqual([]);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   });
 
   it("sanitizes control characters from output", () => {
@@ -153,10 +236,11 @@ describe("poc-runner", () => {
   it("keeps a space-containing PoC path intact (local run, no shell)", () => {
     // Local runs spawn with NO shell so a space in the path stays one arg.
     const dir = mkdtempSync(join(tempDir, "with space-"));
-    const poc = join(dir, "poc.js");
-    writeFileSync(poc, 'process.stdout.write("ok from spaced path")', "utf8");
+    const poc = join(dir, "poc.sh");
+    writeFileSync(poc, "#!/bin/sh\necho 'ok from spaced path'", "utf8");
 
     const result = runPoc(poc, { local: true });
+    expect(result.sandbox).toBe(false);
     expect(result.exitCode).toBe(0);
     expect(result.output).toContain("ok from spaced path");
     expect(result.output).not.toContain("Cannot find module");

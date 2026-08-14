@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -14,6 +15,7 @@ import { tmpdir } from "node:os";
 import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 
 import { evidenceNonceMatches, type PoCEvidence, parsePoCEvidence } from "./evidence.ts";
+import { ensureSafeStateDirectory, writeSafeFileExclusive } from "./safe-state.ts";
 import { findWorkspaceRoot } from "./scratchpad.ts";
 
 export type PocRun = {
@@ -84,6 +86,7 @@ export type PocRunOptions = {
 
 /** Operator-only opt-in for host execution (never agent-supplied). */
 const LOCAL_EXEC_ENV = "PI_POC_ALLOW_LOCAL";
+const EVIDENCE_MAX_BYTES = 256 * 1024;
 
 export type PocLanguage = {
   /** Docker image used when running inside the sandbox. */
@@ -128,11 +131,11 @@ const OUTPUT_MAX_CHARS = 4000;
 const TIMEOUT_MS = 30_000;
 /** Completion sentinel echoed after the PoC command inside the sandbox shell. */
 function makeSentinel(): string {
-  return `__PI_POC_DONE_${Math.random().toString(36).slice(2, 12)}__`;
+  return `__PI_POC_DONE_${randomBytes(16).toString("hex")}__`;
 }
 /** Per-run random nonce the PoC must echo in evidence.json (binds evidence to its run). */
 function makeNonce(): string {
-  return `poc_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`;
+  return `poc_${randomBytes(24).toString("hex")}`;
 }
 /** First-use image downloads are slow — pull outside the run timeout. */
 const PULL_TIMEOUT_MS = 300_000;
@@ -311,16 +314,37 @@ function splitOutput(raw: string): { rawOutput: string; output: string; truncate
 function readEvidence(
   evidenceDir: string,
   nonce: string,
-): { evidence?: PoCEvidence; evidenceSha256?: string; evidenceError?: string } {
+): {
+  evidence?: PoCEvidence;
+  evidenceSha256?: string;
+  evidenceBytes?: Buffer;
+  evidenceError?: string;
+} {
   const p = join(evidenceDir, "evidence.json");
   if (!existsSync(p)) {
     return {
       evidenceError: `evidence.json missing in ${evidenceDir} — the PoC must write it to $PI_POC_EVIDENCE_DIR ({"nonce", "claim", "verify", "observations"})`,
     };
   }
+  const file = lstatSync(p);
+  if (file.isSymbolicLink() || !file.isFile()) {
+    return { evidenceError: "evidence.json must be a regular, non-symlink file" };
+  }
+  if (file.size > EVIDENCE_MAX_BYTES) {
+    return {
+      evidenceError: `evidence.json too large (${file.size} bytes; max ${EVIDENCE_MAX_BYTES})`,
+    };
+  }
+  let bytes: Buffer;
   let raw: unknown;
   try {
-    raw = JSON.parse(readFileSync(p, "utf8"));
+    bytes = readFileSync(p);
+    if (bytes.byteLength > EVIDENCE_MAX_BYTES) {
+      return {
+        evidenceError: `evidence.json too large (${bytes.byteLength} bytes; max ${EVIDENCE_MAX_BYTES})`,
+      };
+    }
+    raw = JSON.parse(bytes.toString("utf8"));
   } catch (e) {
     return { evidenceError: `evidence.json unparseable: ${(e as Error).message}` };
   }
@@ -334,7 +358,8 @@ function readEvidence(
   }
   return {
     evidence: parsed.evidence,
-    evidenceSha256: createHash("sha256").update(readFileSync(p)).digest("hex"),
+    evidenceSha256: createHash("sha256").update(bytes).digest("hex"),
+    evidenceBytes: bytes,
   };
 }
 
@@ -349,19 +374,45 @@ function runProvenance(env?: Record<string, string>): Pick<PocRun, "mode" | "tar
  * "artifact-backed" evidence item hashes a file that no longer exists.
  * Returns the preserved path, or undefined when the file is missing.
  */
-function preserveEvidence(evidenceDir: string, nonce: string): string | undefined {
-  const source = join(evidenceDir, "evidence.json");
-  if (!existsSync(source)) return undefined;
+function preserveEvidence(bytes: Buffer, nonce: string): string | undefined {
   try {
-    const durableDir = join(getProjectRoot(), ".pi", "poc-evidence");
-    mkdirSync(durableDir, { recursive: true });
+    const projectRoot = getProjectRoot();
+    const durableDir = ensureSafeStateDirectory(projectRoot, [".pi", "poc-evidence"]);
     const dest = join(durableDir, `${nonce}.evidence.json`);
-    copyFileSync(source, dest);
+    writeSafeFileExclusive(dest, bytes);
     return dest;
   } catch {
-    // Best-effort: a preserved copy is an audit-trail improvement, not a gate.
+    // Preservation is part of the gate: readAndPreserveEvidence surfaces this
+    // as evidenceError, so confirmation cannot depend on an ephemeral file.
     return undefined;
   }
+}
+
+function readAndPreserveEvidence(
+  evidenceDir: string,
+  nonce: string,
+): {
+  evidence?: PoCEvidence;
+  evidenceSha256?: string;
+  evidencePath?: string;
+  evidenceError?: string;
+} {
+  const read = readEvidence(evidenceDir, nonce);
+  if (!read.evidence || !read.evidenceSha256 || !read.evidenceBytes) {
+    return { evidenceError: read.evidenceError ?? "evidence.json validation failed" };
+  }
+  const evidencePath = preserveEvidence(read.evidenceBytes, nonce);
+  if (!evidencePath) {
+    return {
+      evidenceError:
+        "evidence.json was valid but could not be preserved in the durable evidence store",
+    };
+  }
+  return {
+    evidence: read.evidence,
+    evidenceSha256: read.evidenceSha256,
+    evidencePath,
+  };
 }
 
 function outputWasComplete(result: { error?: Error; signal: string | null }): boolean {
@@ -496,7 +547,7 @@ function runSandboxed(
   const workspaceDir = mkdtempSync(resolve(tmpdir(), "poc-runner-"));
   // Named container so a timed-out / killed client can still be cleaned up —
   // `--rm` alone leaks the container when the CLI dies before the child exits.
-  const containerName = `poc-runner-${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+  const containerName = `poc-runner-${process.pid}-${randomBytes(8).toString("hex")}`;
   // Evidence contract: harness-owned dir + per-run nonce. The PoC writes
   // evidence.json into $PI_POC_EVIDENCE_DIR (/workspace/evidence inside the
   // container); the nonce binds the file to this run.
@@ -554,8 +605,7 @@ function runSandboxed(
     const raw = (result.stdout ?? "") + (result.stderr ?? "") + spawnErr;
     const completed = raw.includes(sentinel);
     const { rawOutput, output, truncated } = splitOutput(sanitizeOutput(raw.replace(sentinel, "")));
-    const preserved = preserveEvidence(evidenceDir, nonce);
-    const evidence = readEvidence(evidenceDir, nonce);
+    const evidence = readAndPreserveEvidence(evidenceDir, nonce);
     return {
       path: pocPath,
       exitCode: spawnExitCode(result),
@@ -568,7 +618,6 @@ function runSandboxed(
       outputComplete: outputWasComplete(result),
       nonce,
       ...evidence,
-      evidencePath: evidence.evidence ? preserved : undefined,
       ...runProvenance(env),
     };
   } finally {
@@ -628,8 +677,7 @@ function runLocal(pocPath: string, language: PocLanguage, env?: Record<string, s
     const { rawOutput, output, truncated } = splitOutput(
       sanitizeOutput((result.stdout ?? "") + (result.stderr ?? "") + spawnErr),
     );
-    const preserved = preserveEvidence(evidenceDir, nonce);
-    const evidence = readEvidence(evidenceDir, nonce);
+    const evidence = readAndPreserveEvidence(evidenceDir, nonce);
     return {
       path: pocPath,
       exitCode: spawnExitCode(result),
@@ -642,7 +690,6 @@ function runLocal(pocPath: string, language: PocLanguage, env?: Record<string, s
       outputComplete: outputWasComplete(result),
       nonce,
       ...evidence,
-      evidencePath: evidence.evidence ? preserved : undefined,
       ...runProvenance(env),
     };
   } finally {

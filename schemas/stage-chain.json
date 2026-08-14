@@ -3,6 +3,7 @@
   "title": "Stage Chain",
   "description": "Exploit chain analysis output. Identifies multi-step attack chains from confirmed findings and assigns escalated severity.",
   "type": "object",
+  "additionalProperties": false,
   "required": ["chains", "summary"],
   "properties": {
     "chains": {

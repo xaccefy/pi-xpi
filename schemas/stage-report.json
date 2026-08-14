@@ -3,6 +3,7 @@
   "title": "Stage Report",
   "description": "Final pipeline report after all stages complete. Summarizes findings, chains, patches, and coverage.",
   "type": "object",
+  "additionalProperties": false,
   "required": ["target", "pipeline_status", "findings", "coverage", "summary"],
   "properties": {
     "target": {

@@ -61,7 +61,7 @@ CaseAdd(
 - Chain severity = **highest severity among its confirmed steps**. Two `high` findings = `high`, not `critical`.
 - Escalate ONE level above the highest step ONLY if the narrative proves strictly greater impact than any single step, citing the specific PoC output from each step.
 - "Could enable"/"might allow"/"theoretically" = NOT proven → keep the highest step severity.
-- Chains are analysis artifacts, not separately-PoCed vulns: they stay `hypothesis`, never promoted via `PromoteFinding`. Severity is justified by the step findings' proofs, recorded in `summary`.
+- Chains are analysis artifacts, not separately-PoCed vulns: they stay `hypothesis`, never promoted via `PromoteFinding`. Severity is justified by the confirmed step findings' recorded evidence and impact, captured in `summary`.
 
 Then link each step to the chain:
 ```

@@ -18,8 +18,15 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { KILL_REASON_VALUES } from "./ledger.ts";
+import {
+  assertSafeRegularFile,
+  assertSafeStateDirectory,
+  readSafeFile,
+  writeSafeFileAtomic,
+} from "./safe-state.ts";
 import { getRunDir, getScratchpadRoot, scratchpad_write } from "./scratchpad.ts";
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -45,6 +52,8 @@ export type SubmitResult = {
 };
 
 type StageSpec = {
+  /** Exact top-level field allowlist; mirrors additionalProperties:false. */
+  allowed: readonly string[];
   /** Fields that must be present and non-empty. */
   required: {
     name: string;
@@ -86,6 +95,18 @@ const VULN_CLASSES = [
 export const SPECS: Record<SubmitStage, StageSpec> = {
   // schemas/stage-finding.json
   hunt: {
+    allowed: [
+      "vuln_class",
+      "file",
+      "line",
+      "endpoint",
+      "sink",
+      "entry_point",
+      "confidence",
+      "evidence",
+      "attacker_model",
+      "subsystem",
+    ],
     required: [
       { name: "vuln_class", type: "string", enum: VULN_CLASSES },
       { name: "sink", type: "string" },
@@ -98,6 +119,15 @@ export const SPECS: Record<SubmitStage, StageSpec> = {
   },
   // schemas/stage-trace.json
   trace: {
+    allowed: [
+      "trace_result",
+      "entry_point",
+      "call_chain",
+      "defenses_checked",
+      "attacker_model",
+      "impact_if_reachable",
+      "unreachable_reason",
+    ],
     required: [
       { name: "trace_result", type: "string", enum: ["REACHABLE", "UNREACHABLE"] },
       { name: "entry_point", type: "string" },
@@ -112,6 +142,14 @@ export const SPECS: Record<SubmitStage, StageSpec> = {
   },
   // schemas/stage-skeptic.json
   skeptic: {
+    allowed: [
+      "finding_id",
+      "verdict",
+      "reasoning",
+      "evidence_reviewed",
+      "disconfirmation_attempt",
+      "disproval_reason",
+    ],
     required: [
       { name: "finding_id", type: "string" },
       { name: "verdict", type: "string", enum: ["CONFIRMED", "DISPROVEN"] },
@@ -131,15 +169,30 @@ export const SPECS: Record<SubmitStage, StageSpec> = {
   },
   // schemas/stage-validation.json
   validate: {
+    allowed: [
+      "finding_id",
+      "status",
+      "technique_used",
+      "detection_method",
+      "poc_path",
+      "run_log",
+      "evidence_extracted",
+      "kill_reason",
+      "refinement_attempts",
+    ],
     required: [
       { name: "finding_id", type: "string" },
-      { name: "status", type: "string", enum: ["confirmed", "killed", "reported"] },
+      {
+        name: "status",
+        type: "string",
+        enum: ["pending_confirmation", "killed", "reported"],
+      },
       { name: "technique_used", type: "string" },
       { name: "detection_method", type: "string" },
     ],
     conditional: [
       {
-        when: { field: "status", equals: "confirmed" },
+        when: { field: "status", equals: "pending_confirmation" },
         require: ["poc_path", "run_log", "evidence_extracted"],
       },
       { when: { field: "status", equals: "killed" }, require: ["kill_reason"] },
@@ -147,6 +200,7 @@ export const SPECS: Record<SubmitStage, StageSpec> = {
   },
   // schemas/stage-chain.json
   chain: {
+    allowed: ["chains", "summary", "tokens_input", "tokens_output"],
     required: [
       { name: "chains", type: "array" },
       { name: "summary", type: "string" },
@@ -154,6 +208,16 @@ export const SPECS: Record<SubmitStage, StageSpec> = {
   },
   // schemas/stage-report.json
   report: {
+    allowed: [
+      "target",
+      "pipeline_status",
+      "total_tokens",
+      "findings",
+      "chains",
+      "coverage",
+      "summary",
+      "patches_applied",
+    ],
     required: [
       { name: "target", type: "string" },
       { name: "pipeline_status", type: "string", enum: ["complete", "partial", "aborted"] },
@@ -212,7 +276,11 @@ function statePath(runId: string): string {
 function readState(runId: string): SubmitState {
   const p = statePath(runId);
   if (!existsSync(p)) return { repairs: {}, accepted_findings: [] };
-  const raw = JSON.parse(readFileSync(p, "utf8")) as Partial<SubmitState>;
+  assertSafeStateDirectory(projectRoot(), [".scratchpad", basename(dirname(p))]);
+  assertSafeRegularFile(p, "Pipeline state");
+  const raw = JSON.parse(
+    readSafeFile(p, "Pipeline state").toString("utf8"),
+  ) as Partial<SubmitState>;
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
     throw new Error(`Corrupt pipeline-submit state for ${runId}: root must be an object`);
   }
@@ -246,9 +314,8 @@ function readState(runId: string): SubmitState {
 
 function writeState(runId: string, state: SubmitState): void {
   const p = statePath(runId);
-  const tmp = `${p}.${process.pid}.${Date.now()}.tmp`;
-  writeFileSync(tmp, JSON.stringify(state, null, 2), "utf8");
-  renameSync(tmp, p);
+  assertSafeStateDirectory(projectRoot(), [".scratchpad", basename(dirname(p))]);
+  writeSafeFileAtomic(p, JSON.stringify(state, null, 2));
 }
 
 /** Project root containing the scratchpad (file-existence checks resolve here). */
@@ -411,6 +478,11 @@ function validateStage(stage: SubmitStage, obj: Record<string, unknown>): string
   const spec = SPECS[stage];
   const errors: string[] = [];
 
+  const allowedFields = new Set(spec.allowed);
+  for (const name of Object.keys(obj)) {
+    if (!allowedFields.has(name)) errors.push(`${name}: unknown top-level field`);
+  }
+
   for (const field of spec.required) {
     const v = obj[field.name];
     if (field.type === "string") {
@@ -495,37 +567,20 @@ function validateStage(stage: SubmitStage, obj: Record<string, unknown>): string
   if (stage === "skeptic") {
     requireStringArray(errors, "evidence_reviewed", obj.evidence_reviewed, 1);
     if (obj.verdict === "DISPROVEN" && isNonEmptyString(obj.disproval_reason)) {
-      const allowed = [
-        "unreachable",
-        "framework_protection",
-        "input_validation_blocks",
-        "requires_privilege_attacker_lacks",
-        "intended_behavior",
-        "overstated_impact",
-        "duplicate",
-        "test_artifact",
-        "out_of_scope",
-      ];
-      if (!allowed.includes(obj.disproval_reason)) errors.push("disproval_reason: invalid value");
+      if (!(KILL_REASON_VALUES as readonly string[]).includes(obj.disproval_reason)) {
+        errors.push("disproval_reason: invalid value");
+      }
     }
   }
 
   if (stage === "validate") {
     if (obj.status === "killed" && isNonEmptyString(obj.kill_reason)) {
-      const allowed = [
-        "unreachable",
-        "framework_protection",
-        "input_validation_blocks",
-        "requires_privilege_attacker_lacks",
-        "poc_failed_3x",
-        "no_real_impact",
-        "intended_behavior",
-        "duplicate",
-      ];
-      if (!allowed.includes(obj.kill_reason)) errors.push("kill_reason: invalid value");
+      if (!(KILL_REASON_VALUES as readonly string[]).includes(obj.kill_reason)) {
+        errors.push("kill_reason: invalid value");
+      }
     }
-    if (obj.status === "confirmed" && isNonEmptyString(obj.poc_path)) {
-      // A validate submission asserting "confirmed" must point at a PoC file
+    if (obj.status === "pending_confirmation" && isNonEmptyString(obj.poc_path)) {
+      // A phase-1 validation submission must point at a PoC file
       // that actually exists in the project — same file-existence filter hunt
       // findings get. Otherwise fabricated run logs pass the stage gate.
       const raw = obj.poc_path as string;
