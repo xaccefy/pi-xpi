@@ -19,6 +19,9 @@ dist/
 # Pipeline scratchpad (per-run artifacts)
 .scratchpad/
 
+# Benchmark: latest run is regenerated; baseline.json is kept as evidence
+bench/results/latest.json
+
 # OS files
 .DS_Store
 Thumbs.db

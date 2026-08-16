@@ -7,6 +7,7 @@ import {
   evaluateExpect,
   isPublicIpAddress as harnessIsPublicIpAddress,
   replayDifferential,
+  replayIntraTarget,
   replayVerify,
 } from "../src/harness-verify.ts";
 
@@ -289,5 +290,124 @@ describe("harness-verify: machine differential", () => {
       controlTargetAuthorizationError("control.test", "") ?? "",
       /no operator-approved/i,
     );
+  });
+});
+
+describe("harness-verify: intra-target differential", () => {
+  /** IDOR-style evidence: attack reads a victim object, baseline reads own. */
+  function idorEvidence(overrides: Partial<PoCEvidence["verify"]> = {}): PoCEvidence {
+    return {
+      nonce: "n",
+      claim: "cross-tenant object read",
+      verify: {
+        method: "GET",
+        url: "http://target.test/api/orders/1001",
+        headers: { authorization: "Bearer attacker" },
+        expect: { status: [200], body_contains: ["victim-ssn:111-22-3333"] },
+        mode: "intra_target",
+        ...overrides,
+      },
+      observations: ["victim ssn present"],
+      baseline: {
+        method: "GET",
+        url: "http://target.test/api/orders/2002",
+        headers: { authorization: "Bearer attacker" },
+      },
+    };
+  }
+
+  it("passes when the attack leaks and the same-host baseline does not", async () => {
+    const requested: string[] = [];
+    const fetchImpl = async (input: string | URL) => {
+      const url = new URL(String(input));
+      requested.push(url.toString());
+      return url.pathname.endsWith("/1001")
+        ? new Response("owner:victim victim-ssn:111-22-3333", { status: 200 })
+        : new Response("owner:attacker ssn:999-99-9999", { status: 200 });
+    };
+    const result = await replayIntraTarget(idorEvidence(), "target.test", {
+      allowPrivate: true,
+      fetchImpl,
+    });
+    assert.strictEqual(result.pass, true);
+    assert.strictEqual(result.differential, "target_only");
+    assert.strictEqual(result.target?.matched, true);
+    assert.strictEqual(result.control?.matched, false);
+    // Both requests hit the SAME target host.
+    assert.deepStrictEqual(requested, [
+      "http://target.test/api/orders/1001",
+      "http://target.test/api/orders/2002",
+    ]);
+  });
+
+  it("rejects the patched target (attack denied → no differential)", async () => {
+    const fetchImpl = async (input: string | URL) => {
+      const url = new URL(String(input));
+      return url.pathname.endsWith("/1001")
+        ? new Response("forbidden: not your order", { status: 403 })
+        : new Response("owner:attacker ssn:999-99-9999", { status: 200 });
+    };
+    const result = await replayIntraTarget(idorEvidence(), "target.test", {
+      allowPrivate: true,
+      fetchImpl,
+    });
+    assert.strictEqual(result.pass, false);
+    assert.strictEqual(result.differential, "neither");
+  });
+
+  it("rejects when the baseline ALSO leaks (differential 'both', not target-only)", async () => {
+    const fetchImpl = async () => new Response("owner:x victim-ssn:111-22-3333", { status: 200 });
+    const result = await replayIntraTarget(idorEvidence(), "target.test", {
+      allowPrivate: true,
+      fetchImpl,
+    });
+    assert.strictEqual(result.pass, false);
+    assert.strictEqual(result.differential, "both");
+  });
+
+  it("refuses an intra-target run whose attack and baseline are identical", async () => {
+    const ev = idorEvidence();
+    ev.baseline = {
+      method: ev.verify.method,
+      url: ev.verify.url,
+      headers: ev.verify.headers,
+      body: ev.verify.body,
+    };
+    const result = await replayIntraTarget(ev, "target.test", { allowPrivate: true });
+    assert.strictEqual(result.attempted, false);
+    assert.strictEqual(result.pass, false);
+    assert.match(result.note, /identical/);
+  });
+
+  it("requires a baseline request", async () => {
+    const ev = idorEvidence();
+    ev.baseline = undefined;
+    const result = await replayIntraTarget(ev, "target.test", { allowPrivate: true });
+    assert.strictEqual(result.attempted, false);
+    assert.match(result.note, /requires evidence\.baseline/);
+  });
+
+  it("binds the baseline to the case target so it cannot point at another host", async () => {
+    const ev = idorEvidence();
+    ev.baseline = { method: "GET", url: "http://elsewhere.test/api/orders/2002" };
+    const result = await replayIntraTarget(ev, "target.test", { allowPrivate: true });
+    assert.strictEqual(result.attempted, false);
+    assert.match(result.note, /baseline binding failed/i);
+  });
+
+  it("parse requires baseline when verify.mode is intra_target", () => {
+    const missing = parsePoCEvidence({
+      nonce: "n",
+      claim: "c",
+      verify: {
+        method: "GET",
+        url: "http://target.test/api/orders/1001",
+        expect: { body_contains: ["victim-ssn:111-22-3333"] },
+        mode: "intra_target",
+      },
+      observations: [],
+    });
+    assert.strictEqual(missing.ok, false);
+    if (!missing.ok) assert.match(missing.error, /intra_target requires baseline/i);
   });
 });

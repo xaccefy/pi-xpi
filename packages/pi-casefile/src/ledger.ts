@@ -31,7 +31,7 @@ import {
   parsePoCEvidence,
   validateMainAgentVerdict,
 } from "./evidence.ts";
-import { type HarnessVerifyResult, verifyUrlBindingError } from "./harness-verify.ts";
+import { type HarnessVerifyResult, sameRequest, verifyUrlBindingError } from "./harness-verify.ts";
 import {
   assertSafeRegularFile,
   ensureSafeStateDirectory,
@@ -328,10 +328,21 @@ export type PendingConfirmation = {
   pocPath: string;
   /** SHA-256 of the PoC script AT RUN TIME — re-hashed at confirm to catch edits. */
   pocSha256: string;
-  controlPath: string;
-  controlTarget: string;
+  /**
+   * Differential shape. Absent/"inter_host" (default) = same request to target
+   * vs a distinct patched control host, proven by a separate control run +
+   * `replayDifferential`. "intra_target" = attack vs a legitimate same-host
+   * `baseline` request inside each run's evidence, proven by `replayIntraTarget`
+   * — no control run or control target (access-control / business-logic classes).
+   */
+  mode?: "inter_host" | "intra_target";
+  /** inter_host only. */
+  controlPath?: string;
+  /** inter_host only. */
+  controlTarget?: string;
   targetRuns: [PocEvidenceRun, PocEvidenceRun];
-  controlRun: PocEvidenceRun;
+  /** inter_host only — the same PoC run against the control target. */
+  controlRun?: PocEvidenceRun;
   /** Harness's own replay of evidence.verify (public targets). Absent = legacy bundle. */
   harnessVerified?: HarnessVerifyResult;
   /** Harness-owned OOB listener log for the run (opt-in blind classes). */
@@ -2064,12 +2075,18 @@ function validateRunEvidence(run: PocEvidenceRun, label: string): void {
 }
 
 /** Determinism + differential on normalized evidence (nonce/observations stripped). */
-function assertEvidenceDifferential(bundle: PendingConfirmation): void {
+function assertEvidenceDifferential(bundle: PendingConfirmation, isIntra = false): void {
   const [r1, r2] = bundle.targetRuns;
   if (normalizeEvidence(r1.evidence) !== normalizeEvidence(r2.evidence)) {
     throw new Error(
       "Target runs produced inconsistent evidence — the exploit did not reproduce deterministically",
     );
+  }
+  // Intra-target target-dependence is proven by the harness attack-vs-baseline
+  // replay (same host), not by comparing a target run to a separate control run.
+  if (isIntra) return;
+  if (!bundle.controlRun) {
+    throw new Error("inter-host confirmation requires a control run");
   }
   if (normalizeEvidence(r1.evidence) === normalizeEvidence(bundle.controlRun.evidence)) {
     throw new Error(
@@ -2143,6 +2160,7 @@ function assertHarnessCanary(
 function assertMainAgentVerification(
   bundle: PendingConfirmation,
   verification: MainAgentVerification | undefined,
+  isIntra = false,
 ): asserts verification is MainAgentVerification {
   if (!verification) {
     throw new Error(
@@ -2179,8 +2197,16 @@ function assertMainAgentVerification(
   if (!targetUrl || verifyUrlBindingError(targetUrl, targetIdentity)) {
     throw new Error("MAIN-AGENT REPLAY FAILED: target transcript is not bound to the case target");
   }
-  if (!controlUrl || verifyUrlBindingError(controlUrl, bundle.controlTarget)) {
-    throw new Error("MAIN-AGENT REPLAY FAILED: control transcript is not bound to control_target");
+  // Intra-target: the "control" transcript is the legitimate baseline request,
+  // which is bound to the SAME case target. Inter-host: it is bound to the
+  // distinct control target.
+  const controlBindTarget = isIntra ? targetIdentity : bundle.controlTarget;
+  if (!controlUrl || !controlBindTarget || verifyUrlBindingError(controlUrl, controlBindTarget)) {
+    throw new Error(
+      isIntra
+        ? "MAIN-AGENT REPLAY FAILED: baseline transcript is not bound to the case target"
+        : "MAIN-AGENT REPLAY FAILED: control transcript is not bound to control_target",
+    );
   }
 }
 
@@ -2231,6 +2257,75 @@ export function assertPromotable(id: string): CaseRecord {
 }
 
 /**
+ * Phase 1 (intra-target): validate a same-host attack-vs-baseline bundle. The
+ * differential is proven by the harness replay (attack matched, baseline did
+ * not, both against the case target), not by a separate control run — the
+ * discriminating variable is the request's identity or a parameter, not the host.
+ */
+function validateIntraTargetBundle(
+  current: CaseRecord,
+  id: string,
+  bundle: PendingConfirmation,
+): CaseRecord {
+  if (bundle.targetRuns.length !== 2) {
+    throw new Error("Intra-target confirmation requires two target runs");
+  }
+  if (bundle.controlRun || bundle.controlTarget) {
+    throw new Error(
+      "Intra-target confirmation must not carry a control run or control target — the baseline is a same-host request inside the evidence",
+    );
+  }
+  const targetRunTarget = bundle.targetRuns[0]?.target;
+  if (!targetRunTarget || bundle.targetRuns.some((r) => r.target !== targetRunTarget)) {
+    throw new Error("Intra-target confirmation requires both runs against the same case target");
+  }
+  let pocHash: string | undefined;
+  try {
+    pocHash = createHash("sha256").update(readFileSync(bundle.pocPath)).digest("hex");
+  } catch {
+    pocHash = undefined;
+  }
+  if (!pocHash || (bundle.pocSha256 && bundle.pocSha256 !== pocHash)) {
+    throw new Error("pocSha256 does not match the PoC file on disk");
+  }
+  for (const run of bundle.targetRuns) {
+    validateRunEvidence(run, `${run.mode} run`);
+    const ev = run.evidence;
+    if (ev.verify.mode !== "intra_target") {
+      throw new Error(
+        "INTRA-TARGET FAILED: each run's evidence.verify.mode must be 'intra_target'",
+      );
+    }
+    if (!ev.baseline) {
+      throw new Error(
+        "INTRA-TARGET FAILED: evidence.baseline (a legitimate same-host request) is required",
+      );
+    }
+    const attackBinding = verifyUrlBindingError(ev.verify.url, targetRunTarget);
+    if (attackBinding) throw new Error(`ATTACK BINDING FAILED: ${attackBinding}`);
+    const baselineBinding = verifyUrlBindingError(ev.baseline.url, targetRunTarget);
+    if (baselineBinding) throw new Error(`BASELINE BINDING FAILED: ${baselineBinding}`);
+    if (ev.baseline && sameRequest(ev.verify, ev.baseline)) {
+      throw new Error(
+        "INTRA-TARGET FAILED: attack and baseline requests are identical — vary identity or a parameter",
+      );
+    }
+  }
+  if (bundle.caseId !== id) throw new Error("Pending confirmation caseId mismatch");
+  assertEvidenceDifferential(bundle, true);
+  // Machine floor: attack matched, baseline did not, both against the case target.
+  assertMachineConfirmation(bundle);
+  assertHarnessCanary(
+    bundle.harnessVerified,
+    bundle.targetRuns[0].evidence.verify.canary !== undefined,
+    "PHASE-1 CANARY FAILED",
+  );
+  const next = buildRecord({ pendingConfirmation: bundle }, current);
+  validateCase(next);
+  return next;
+}
+
+/**
  * Phase 1: record the harness-observed evidence bundle on the case. The whole
  * contract is validated here — same-file control, nonce binding, run
  * completion, determinism across the two target runs, and the target/control
@@ -2248,6 +2343,11 @@ export function storePendingConfirmation(id: string, bundle: PendingConfirmation
       );
     }
     if (bundle.caseId !== id) throw new Error("Pending confirmation caseId mismatch");
+    if (bundle.mode === "intra_target") {
+      const next = validateIntraTargetBundle(current, id, bundle);
+      upsertCase(db, next);
+      return next;
+    }
     if (bundle.targetRuns.length !== 2 || !bundle.controlRun) {
       throw new Error("Pending confirmation requires two target runs and one control run");
     }
@@ -2423,10 +2523,14 @@ export function applyConfirmationResult(
 
     // CONFIRMED — re-validate the whole bundle (defense in depth; the case may
     // have been touched between phase 1 and the verdict).
-    for (const run of [...bundle.targetRuns, bundle.controlRun]) {
+    const isIntra = bundle.mode === "intra_target";
+    const allRuns = isIntra
+      ? [...bundle.targetRuns]
+      : [...bundle.targetRuns, ...(bundle.controlRun ? [bundle.controlRun] : [])];
+    for (const run of allRuns) {
       validateRunEvidence(run, `${run.mode} run`);
     }
-    assertEvidenceDifferential(bundle);
+    assertEvidenceDifferential(bundle, isIntra);
     assertMachineConfirmation(bundle);
     assertHarnessCanary(bundle.harnessVerified, canaryRequested, "PHASE-1 CANARY FAILED");
     let pocHash: string | undefined;
@@ -2450,7 +2554,7 @@ export function applyConfirmationResult(
           `(bundle target: ${targetRun.target}, case target: ${current.target ?? "(none)"}).`,
       );
     }
-    if (current.target === bundle.controlTarget) {
+    if (!isIntra && current.target === bundle.controlTarget) {
       throw new Error(
         "Case target now equals the control target — the claimed impact is not target-dependent; " +
           "re-run PromoteFinding with a distinct control_target.",
@@ -2469,7 +2573,7 @@ export function applyConfirmationResult(
     // Phase 1 proves the evidence floor. Phase 2 must freshly replay that same
     // request inside the main agent's ConfirmFinding call; a caller-provided
     // boolean is not accepted as proof of re-execution.
-    assertMainAgentVerification(bundle, phase2Verification);
+    assertMainAgentVerification(bundle, phase2Verification, isIntra);
 
     const reproductionItem: EvidenceItem = {
       id: `ev_${stableShortId(`${id}\nreproduction\n${targetRun.ranAt}`)}`,
@@ -2480,7 +2584,7 @@ export function applyConfirmationResult(
       // exists, so the item stays artifact-backed and re-verifiable.
       artifactPath: targetRun.evidencePath ? basename(targetRun.evidencePath) : "evidence.json",
       sha256: targetRun.evidenceSha256,
-      summary: `PoC evidence accepted (2 target runs + control; ${recorded.proofStrength}) — main agent semantic confirmation${verdict.model ? ` (${verdict.model})` : ""}`,
+      summary: `PoC evidence accepted (2 target runs + ${isIntra ? "same-host baseline" : "control"}; ${recorded.proofStrength}) — main agent semantic confirmation${verdict.model ? ` (${verdict.model})` : ""}`,
       createdAt: targetRun.ranAt,
     };
 
@@ -2506,17 +2610,30 @@ export function applyConfirmationResult(
         mode: "poc",
         target: targetRun.target,
       },
-      controlVerified: {
-        path: bundle.controlPath,
-        exitCode: bundle.controlRun.exitCode,
-        ranAt: bundle.controlRun.ranAt,
-        output: bundle.controlRun.output,
-        sandbox: bundle.controlRun.sandbox,
-        completed: true,
-        outputComplete: true,
-        mode: "control",
-        target: bundle.controlRun.target,
-      },
+      controlVerified:
+        isIntra || !bundle.controlRun
+          ? {
+              path: bundle.pocPath,
+              exitCode: targetRun.exitCode,
+              ranAt: targetRun.ranAt,
+              output: `intra-target baseline (same host): ${bundle.harnessVerified?.control?.note ?? "baseline did not satisfy the attack predicate"}`,
+              sandbox: targetRun.sandbox,
+              completed: true,
+              outputComplete: true,
+              mode: "baseline",
+              target: targetRun.target,
+            }
+          : {
+              path: bundle.controlPath ?? bundle.pocPath,
+              exitCode: bundle.controlRun.exitCode,
+              ranAt: bundle.controlRun.ranAt,
+              output: bundle.controlRun.output,
+              sandbox: bundle.controlRun.sandbox,
+              completed: true,
+              outputComplete: true,
+              mode: "control",
+              target: bundle.controlRun.target,
+            },
       disconfirmation: verdict.disconfirmation_attempt,
       confirmerVerdict: recorded,
       pendingConfirmation: undefined,

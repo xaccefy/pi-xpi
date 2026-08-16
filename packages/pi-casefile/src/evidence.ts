@@ -45,6 +45,14 @@ export type PoCEvidence = {
     expect: VerifyExpect;
     /** Optional stronger causality dimension, independent of the authored predicate. */
     canary?: VerifyCanary;
+    /**
+     * Differential shape. "inter_host" (default) = same request to target vs a
+     * distinct patched control host (body-carried proof). "intra_target" = attack
+     * request vs a legitimate same-host `baseline` request (access-control /
+     * business-logic classes, where the discriminating variable is identity or a
+     * parameter, not the host) — requires `baseline`.
+     */
+    mode?: "inter_host" | "intra_target";
   };
   /** What the script itself saw — corroboration only, never proof. */
   observations: string[];
@@ -252,6 +260,19 @@ export function parsePoCEvidence(
         error: `evidence.json verify.canary requires exactly one ${POC_CANARY_PLACEHOLDER} placeholder across url, body, or header values (got ${count})`,
       };
     }
+  }
+  if (verify.mode !== undefined && verify.mode !== "inter_host" && verify.mode !== "intra_target") {
+    return {
+      ok: false,
+      error: 'evidence.json verify.mode must be "inter_host" or "intra_target"',
+    };
+  }
+  if (verify.mode === "intra_target" && !isRecord(raw.baseline)) {
+    return {
+      ok: false,
+      error:
+        "evidence.json verify.mode intra_target requires baseline — a legitimate same-host request whose response must NOT satisfy the attack predicate",
+    };
   }
   const expect = verify.expect;
   if (!isRecord(expect))

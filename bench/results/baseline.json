@@ -1,0 +1,116 @@
+{
+  "total": 12,
+  "sound": 6,
+  "score": 0.5,
+  "intraTargetSupported": false,
+  "results": [
+    {
+      "id": "reflected-xss",
+      "title": "Reflected XSS (canary reflection)",
+      "method": "canary",
+      "confirmedVulnerable": true,
+      "rejectedPatched": true,
+      "sound": true,
+      "note": "sound: confirmed vulnerable, rejected patched"
+    },
+    {
+      "id": "path-traversal",
+      "title": "Path traversal → arbitrary file read",
+      "method": "inter_host",
+      "confirmedVulnerable": true,
+      "rejectedPatched": true,
+      "sound": true,
+      "note": "sound: confirmed vulnerable, rejected patched"
+    },
+    {
+      "id": "sqli-union-exfil",
+      "title": "SQL injection (UNION exfiltration)",
+      "method": "inter_host",
+      "confirmedVulnerable": true,
+      "rejectedPatched": true,
+      "sound": true,
+      "note": "sound: confirmed vulnerable, rejected patched"
+    },
+    {
+      "id": "info-disclosure-debug",
+      "title": "Debug endpoint leaks secrets",
+      "method": "inter_host",
+      "confirmedVulnerable": true,
+      "rejectedPatched": true,
+      "sound": true,
+      "note": "sound: confirmed vulnerable, rejected patched"
+    },
+    {
+      "id": "xxe-file-read",
+      "title": "XXE → local file read",
+      "method": "inter_host",
+      "confirmedVulnerable": true,
+      "rejectedPatched": true,
+      "sound": true,
+      "note": "sound: confirmed vulnerable, rejected patched"
+    },
+    {
+      "id": "ssti-secret-leak",
+      "title": "SSTI leaks application secret",
+      "method": "inter_host",
+      "confirmedVulnerable": true,
+      "rejectedPatched": true,
+      "sound": true,
+      "note": "sound: confirmed vulnerable, rejected patched"
+    },
+    {
+      "id": "idor-bola",
+      "title": "IDOR / BOLA (cross-tenant object read)",
+      "method": "intra_target",
+      "confirmedVulnerable": false,
+      "rejectedPatched": true,
+      "sound": false,
+      "note": "no intra-target differential in this harness"
+    },
+    {
+      "id": "broken-auth-bypass",
+      "title": "Missing authorization on admin endpoint",
+      "method": "intra_target",
+      "confirmedVulnerable": false,
+      "rejectedPatched": true,
+      "sound": false,
+      "note": "no intra-target differential in this harness"
+    },
+    {
+      "id": "mass-assignment-privesc",
+      "title": "Mass assignment → privilege escalation",
+      "method": "intra_target",
+      "confirmedVulnerable": false,
+      "rejectedPatched": true,
+      "sound": false,
+      "note": "no intra-target differential in this harness"
+    },
+    {
+      "id": "jwt-alg-none",
+      "title": "JWT alg=none authentication bypass",
+      "method": "intra_target",
+      "confirmedVulnerable": false,
+      "rejectedPatched": true,
+      "sound": false,
+      "note": "no intra-target differential in this harness"
+    },
+    {
+      "id": "price-tampering-logic",
+      "title": "Business logic: client-controlled price",
+      "method": "intra_target",
+      "confirmedVulnerable": false,
+      "rejectedPatched": true,
+      "sound": false,
+      "note": "no intra-target differential in this harness"
+    },
+    {
+      "id": "path-authz-bypass",
+      "title": "Path-normalization authorization bypass",
+      "method": "intra_target",
+      "confirmedVulnerable": false,
+      "rejectedPatched": true,
+      "sound": false,
+      "note": "no intra-target differential in this harness"
+    }
+  ]
+}

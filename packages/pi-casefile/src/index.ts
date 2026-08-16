@@ -19,7 +19,12 @@ import {
   SEVERITY_MATCH_VALUES,
   validateMainAgentVerdict,
 } from "./evidence.ts";
-import { controlTargetAuthorizationError, replayDifferential } from "./harness-verify.ts";
+import {
+  controlTargetAuthorizationError,
+  type HarnessVerifyResult,
+  replayDifferential,
+  replayIntraTarget,
+} from "./harness-verify.ts";
 import {
   addCaseResult,
   addEvidenceItemResult,
@@ -198,11 +203,20 @@ const PromoteSchema = Type.Object(
           "Optional absolute path to the SAME script as poc_path (sha256-equality is ENFORCED). Defaults to poc_path. The harness runs it with PI_POC_MODE=control and PI_POC_TARGET=control_target.",
       }),
     ),
-    control_target: Type.String({
-      minLength: 1,
-      description:
-        "REQUIRED: a distinct baseline target that lacks the vulnerability and is operator-approved through PI_POC_CONTROL_TARGETS (patched replica, second account, baseline service).",
-    }),
+    mode: Type.Optional(
+      Type.String({
+        enum: ["inter_host", "intra_target"],
+        description:
+          "Differential shape. 'inter_host' (default) proves target-dependence with a distinct patched control host — for body-carried proof (file read, injection exfil, info leak, reflection). 'intra_target' proves it with a legitimate same-host baseline request declared in the evidence — for access-control / business-logic classes (IDOR, auth bypass, privilege escalation, logic flaws) where the discriminating variable is identity or a parameter, not the host. In intra_target the evidence must set verify.mode='intra_target' and include a baseline; control_target/control_path are not used.",
+      }),
+    ),
+    control_target: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description:
+          "REQUIRED for mode='inter_host': a distinct baseline target that lacks the vulnerability and is operator-approved through PI_POC_CONTROL_TARGETS (patched replica, second account, baseline service). Not used for mode='intra_target'.",
+      }),
+    ),
     local: Type.Optional(
       Type.Boolean({
         description:
@@ -1181,22 +1195,30 @@ export default function casefileExtension(pi: ExtensionAPI) {
         const pocPath = (params.poc_path as string | undefined)?.trim() ?? "";
         const controlPath = (params.control_path as string | undefined)?.trim() || pocPath;
         const controlTarget = (params.control_target as string | undefined)?.trim() ?? "";
+        const mode: "inter_host" | "intra_target" =
+          (params.mode as string | undefined) === "intra_target" ? "intra_target" : "inter_host";
+        const isIntra = mode === "intra_target";
         if (!pocPath) {
           return fail("poc_path is REQUIRED: absolute path to the PoC script run by the harness.", {
             missingPocPath: true,
           });
         }
-        if (!controlTarget) {
-          return fail(
-            "control_target is REQUIRED: a distinct baseline target that lacks the vulnerability.",
-            { missingControlTarget: true },
-          );
-        }
-        if (controlTarget === current.target) {
-          return fail(
-            "control_target must differ from the case target; a control run against the vulnerable target proves nothing.",
-            { controlTargetEqualsCaseTarget: true },
-          );
+        // Control-target preconditions apply only to the inter-host differential.
+        // Intra-target proves target-dependence with a same-host baseline request
+        // carried in the evidence, so it needs no control target or control script.
+        if (!isIntra) {
+          if (!controlTarget) {
+            return fail(
+              "control_target is REQUIRED for inter-host mode: a distinct baseline target that lacks the vulnerability. For access-control/logic bugs use mode='intra_target' with an evidence baseline instead.",
+              { missingControlTarget: true },
+            );
+          }
+          if (controlTarget === current.target) {
+            return fail(
+              "control_target must differ from the case target; a control run against the vulnerable target proves nothing.",
+              { controlTargetEqualsCaseTarget: true },
+            );
+          }
         }
         if (params.local === true && process.env.PI_POC_ALLOW_NETWORK !== "1") {
           return fail(
@@ -1204,33 +1226,43 @@ export default function casefileExtension(pi: ExtensionAPI) {
             { networkNotAuthorized: true },
           );
         }
-        const controlAuthorization = controlTargetAuthorizationError(controlTarget);
-        if (controlAuthorization) {
-          return fail(
-            `CONTROL AUTHORIZATION FAILED: ${controlAuthorization}. ` +
-              "The operator must set PI_POC_CONTROL_TARGETS to the exact approved control host/origin before this control can anchor confirmation.",
-            { controlNotAuthorized: true },
-          );
+        if (!isIntra) {
+          const controlAuthorization = controlTargetAuthorizationError(controlTarget);
+          if (controlAuthorization) {
+            return fail(
+              `CONTROL AUTHORIZATION FAILED: ${controlAuthorization}. ` +
+                "The operator must set PI_POC_CONTROL_TARGETS to the exact approved control host/origin before this control can anchor confirmation.",
+              { controlNotAuthorized: true },
+            );
+          }
         }
 
-        // Same-file contract (anti-cheat): control must be the SAME bytes as the
-        // PoC, differing only via the harness-set env. Check BEFORE any run.
+        // Anti-cheat: hash the PoC (always) and, for inter-host, require the
+        // control script to be the SAME bytes (differing only via harness env).
         let pocHash: string | undefined;
-        let controlHash: string | undefined;
         try {
           pocHash = createHash("sha256").update(readFileSync(pocPath)).digest("hex");
-          controlHash = createHash("sha256").update(readFileSync(controlPath)).digest("hex");
         } catch (e) {
-          return fail(
-            `Cannot read PoC/control scripts for the same-file check: ${(e as Error).message}`,
-            { sameFileCheckFailed: true },
-          );
+          return fail(`Cannot read PoC script: ${(e as Error).message}`, {
+            sameFileCheckFailed: true,
+          });
         }
-        if (pocHash !== controlHash) {
-          return fail(
-            "CONTROL CHECK FAILED: control_path must be the SAME script as poc_path (sha256 mismatch). Case remains investigating.",
-            { controlHashMismatch: true },
-          );
+        if (!isIntra) {
+          let controlHash: string | undefined;
+          try {
+            controlHash = createHash("sha256").update(readFileSync(controlPath)).digest("hex");
+          } catch (e) {
+            return fail(
+              `Cannot read control script for the same-file check: ${(e as Error).message}`,
+              { sameFileCheckFailed: true },
+            );
+          }
+          if (pocHash !== controlHash) {
+            return fail(
+              "CONTROL CHECK FAILED: control_path must be the SAME script as poc_path (sha256 mismatch). Case remains investigating.",
+              { controlHashMismatch: true },
+            );
+          }
         }
 
         // ── OOB callback (Tier 1, opt-in for blind classes) ──
@@ -1251,12 +1283,11 @@ export default function casefileExtension(pi: ExtensionAPI) {
         });
 
         const caseTarget = current.target ?? "";
-        // Determinism: TWO target runs + one control run. Exit 0 is run
-        // integrity only; nonce-bound body evidence and the harness-owned
-        // target/control replay form the machine gate.
+        // Determinism: TWO target runs. Exit 0 is run integrity only; nonce-bound
+        // body evidence plus the harness-owned differential replay (inter-host
+        // control, or intra-target same-host baseline) form the machine gate.
         const run1 = runPoc(pocPath, runOptions("poc", caseTarget));
         const run2 = runPoc(pocPath, runOptions("poc", caseTarget));
-        const controlRun = runPoc(controlPath, runOptions("control", controlTarget));
 
         const evidenceRun = (
           r: PocRun,
@@ -1304,28 +1335,55 @@ export default function casefileExtension(pi: ExtensionAPI) {
           evidenceRun(run1, "poc", caseTarget),
           evidenceRun(run2, "poc", caseTarget),
         ];
-        const control = evidenceRun(controlRun, "control", controlTarget);
 
-        // Tier 2 (docs/poc-trust-model.md): the harness executes the SAME
-        // request template against target and operator-approved control, applying
-        // the target's predicates to both. DNS is pinned at connect time.
-        const harnessVerified = await replayDifferential(
-          targetRuns[0].evidence,
-          caseTarget,
-          controlTarget,
-          { allowPrivate: process.env.PI_POC_ALLOW_PRIVATE_REPLAY === "1" },
-        );
-
+        const allowPrivateReplay = process.env.PI_POC_ALLOW_PRIVATE_REPLAY === "1";
+        let harnessVerified: HarnessVerifyResult;
+        let controlRun: PocEvidenceRun | undefined;
+        if (isIntra) {
+          // Intra-target: prove target-dependence with the evidence's same-host
+          // baseline request — no separate control run. The harness sends attack +
+          // baseline to the case target and requires the proof on attack only.
+          const ev0 = targetRuns[0].evidence;
+          if (ev0.verify.mode !== "intra_target") {
+            return fail(
+              "INTRA-TARGET FAILED: the PoC's evidence.json must set verify.mode='intra_target' when promoting in intra-target mode.",
+              { intraModeMismatch: true },
+            );
+          }
+          if (!ev0.baseline) {
+            return fail(
+              "INTRA-TARGET FAILED: evidence.json must include a baseline — a legitimate same-host request whose response must NOT satisfy the attack predicate.",
+              { intraBaselineMissing: true },
+            );
+          }
+          harnessVerified = await replayIntraTarget(ev0, caseTarget, {
+            allowPrivate: allowPrivateReplay,
+          });
+        } else {
+          // Inter-host (Tier 2): the harness executes the SAME request template
+          // against target and operator-approved control, applying the target's
+          // predicates to both. DNS is pinned at connect time.
+          controlRun = evidenceRun(
+            runPoc(controlPath, runOptions("control", controlTarget)),
+            "control",
+            controlTarget,
+          );
+          harnessVerified = await replayDifferential(
+            targetRuns[0].evidence,
+            caseTarget,
+            controlTarget,
+            { allowPrivate: allowPrivateReplay },
+          );
+        }
         const bundle: PendingConfirmation = {
           caseId,
           ranAt: new Date().toISOString(),
           pocPath,
           pocSha256: pocHash,
-          controlPath,
-          controlTarget,
+          mode,
           targetRuns,
-          controlRun: control,
           harnessVerified,
+          ...(isIntra ? {} : { controlPath, controlTarget, controlRun }),
         };
 
         let record: CaseRecord;
@@ -1343,11 +1401,11 @@ export default function casefileExtension(pi: ExtensionAPI) {
               type: "text",
               text:
                 `Phase 1 complete — evidence bundle recorded on ${caseId} (expires in 1h).\n` +
-                `Target runs: 2, Control run: 1 — all with validated nonce-bound evidence.json.\n` +
+                `Mode: ${mode}. ${isIntra ? "Target runs: 2, same-host baseline differential" : "Target runs: 2, Control run: 1"} — all with validated nonce-bound evidence.json.\n` +
                 `Evidence sha256: ${targetRuns[0].evidenceSha256}\n` +
                 `PoC script sha256 (at run time): ${pocHash}\n` +
                 `Harness verify replay: ${harnessVerified.attempted ? (harnessVerified.pass ? `PASS (status ${harnessVerified.status})` : `FAILED — ${harnessVerified.note}`) : harnessVerified.note}\n` +
-                `\nMAIN-AGENT REVIEW REQUIRED (do not delegate): inspect case ${caseId}, PoC ${pocPath}, control ${controlTarget}, evidence ${targetRuns[0].evidenceSha256}, and PoC hash ${pocHash}. Hunt for a trivial predicate or fabricated differential and perform a concrete disconfirmation attempt, then call ConfirmFinding yourself. A CONFIRMED call performs and stores a fresh harness-owned target/control replay; NOT_CONFIRMED keeps the case investigating.`,
+                `\nMAIN-AGENT REVIEW REQUIRED (do not delegate): inspect case ${caseId}, PoC ${pocPath}, ${isIntra ? "same-host baseline" : `control ${controlTarget}`}, evidence ${targetRuns[0].evidenceSha256}, and PoC hash ${pocHash}. Hunt for a trivial predicate or fabricated differential and perform a concrete disconfirmation attempt, then call ConfirmFinding yourself. A CONFIRMED call performs and stores a fresh harness-owned ${isIntra ? "attack/baseline" : "target/control"} replay; NOT_CONFIRMED keeps the case investigating.`,
             },
           ],
           details: {
@@ -1355,9 +1413,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
             bundle: {
               caseId,
               ranAt: bundle.ranAt,
+              mode,
               pocPath,
-              controlPath,
-              controlTarget,
+              controlPath: isIntra ? undefined : controlPath,
+              controlTarget: isIntra ? undefined : controlTarget,
               pocSha256: pocHash,
               evidenceSha256: targetRuns[0].evidenceSha256,
               harnessVerified,
@@ -1426,16 +1485,29 @@ export default function casefileExtension(pi: ExtensionAPI) {
           if (!bundle) {
             throw new Error("No pending confirmation on this case — run PromoteFinding first");
           }
-          const controlAuthorizationError = controlTargetAuthorizationError(bundle.controlTarget);
-          if (controlAuthorizationError) {
-            throw new Error(`CONTROL AUTHORIZATION FAILED: ${controlAuthorizationError}`);
+          const allowPrivate = process.env.PI_POC_ALLOW_PRIVATE_REPLAY === "1";
+          const caseTargetForReplay = current.target ?? bundle.targetRuns[0].target;
+          let replay: HarnessVerifyResult;
+          if (bundle.mode === "intra_target") {
+            // Same-host attack-vs-baseline replay; no control target to authorize.
+            replay = await replayIntraTarget(bundle.targetRuns[0].evidence, caseTargetForReplay, {
+              allowPrivate,
+            });
+          } else {
+            if (!bundle.controlTarget) {
+              throw new Error("inter-host confirmation requires a control target");
+            }
+            const controlAuthorizationError = controlTargetAuthorizationError(bundle.controlTarget);
+            if (controlAuthorizationError) {
+              throw new Error(`CONTROL AUTHORIZATION FAILED: ${controlAuthorizationError}`);
+            }
+            replay = await replayDifferential(
+              bundle.targetRuns[0].evidence,
+              caseTargetForReplay,
+              bundle.controlTarget,
+              { allowPrivate },
+            );
           }
-          const replay = await replayDifferential(
-            bundle.targetRuns[0].evidence,
-            current.target ?? bundle.targetRuns[0].target,
-            bundle.controlTarget,
-            { allowPrivate: process.env.PI_POC_ALLOW_PRIVATE_REPLAY === "1" },
-          );
           phase2Verification = {
             at: new Date().toISOString(),
             result: replay,

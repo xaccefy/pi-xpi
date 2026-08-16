@@ -204,7 +204,7 @@ function pendingBundle(
     bundleRanAt?: string;
     pocSha256?: string;
   } = {},
-): PendingConfirmation {
+): PendingConfirmation & { controlRun: PocEvidenceRun } {
   const target = getCaseById(id)?.target ?? "target";
   const pocPath = opts.pocPath ?? pocScriptPath("poc.sh");
   const controlPath = opts.controlPath ?? pocPath; // same file by default
@@ -2435,5 +2435,167 @@ describe("casefile sqlite ledger", () => {
     writeCaseContext(fresh.id);
     const afterCtx = readCasefile().find((c) => c.id === fresh.id)!;
     assert.strictEqual(afterCtx.reportedAt, undefined, "reportedAt NOT stamped by CaseContext");
+  });
+});
+
+describe("intra-target confirmation (same-host attack-vs-baseline differential)", () => {
+  /** IDOR-style evidence: attack reads a victim object, baseline reads own. */
+  function makeIntraEvidence(
+    nonce: string,
+    target = "target.test",
+    opts: { baseline?: "own" | "identical" | "none" } = {},
+  ): PoCEvidence {
+    const origin = `http://${target}`;
+    const verify: PoCEvidence["verify"] = {
+      method: "GET",
+      url: `${origin}/api/orders/1001`,
+      headers: { authorization: "Bearer attacker" },
+      expect: { status: [200], body_contains: ["victim-ssn:111-22-3333"] },
+      mode: "intra_target",
+    };
+    const baseline =
+      opts.baseline === "none"
+        ? undefined
+        : opts.baseline === "identical"
+          ? { method: "GET", url: verify.url, headers: verify.headers }
+          : { method: "GET", url: `${origin}/api/orders/2002`, headers: verify.headers };
+    return {
+      nonce,
+      claim: "IDOR: cross-tenant order read",
+      verify,
+      observations: ["victim ssn present on attack response"],
+      ...(baseline ? { baseline } : {}),
+    };
+  }
+
+  function intraBundle(
+    id: string,
+    opts: { baseline?: "own" | "identical" | "none"; harnessVerified?: HarnessVerifyResult } = {},
+  ): PendingConfirmation {
+    const target = getCaseById(id)?.target ?? "target.test";
+    const e1 = makeIntraEvidence("intra-nonce-1", target, opts);
+    const e2 = makeIntraEvidence("intra-nonce-2", target, opts);
+    const targetRuns: [PocEvidenceRun, PocEvidenceRun] = [
+      evidenceRun("poc", target, "intra-nonce-1", e1),
+      evidenceRun("poc", target, "intra-nonce-2", e2),
+    ];
+    const durableDir = join(tempDir, ".pi", "poc-evidence");
+    mkdirSync(durableDir, { recursive: true });
+    for (const run of targetRuns) {
+      const p = join(durableDir, `${run.nonce}.evidence.json`);
+      writeFileSync(p, JSON.stringify(run.evidence), "utf8");
+      run.evidencePath = p;
+    }
+    const pocPath = pocScriptPath("poc.sh");
+    return {
+      caseId: id,
+      ranAt: new Date().toISOString(),
+      pocPath,
+      pocSha256: sha256hex(readFileSync(pocPath, "utf8")),
+      mode: "intra_target",
+      targetRuns,
+      harnessVerified: opts.harnessVerified ?? {
+        attempted: true,
+        pass: true,
+        status: 200,
+        differential: "target_only",
+        target: {
+          attempted: true,
+          matched: true,
+          status: 200,
+          url: e1.verify.url,
+          note: "attack matched",
+        },
+        control: {
+          attempted: true,
+          matched: false,
+          status: 200,
+          url: e1.baseline?.url ?? e1.verify.url,
+          note: "baseline did not match",
+        },
+        note: "intra-target differential target_only",
+      },
+    };
+  }
+
+  function intraCase() {
+    return addCase({
+      title: "IDOR order read",
+      status: "investigating",
+      evidence: "attacker token returned victim order",
+      confidence: "high",
+      impact: "cross-tenant PII read",
+      severity: "high",
+      poc: "/tmp/poc.sh",
+      target: "target.test",
+    });
+  }
+
+  it("stores and confirms an intra-target bundle with a same-host baseline", () => {
+    const rec = intraCase();
+    const stored = storePendingConfirmation(rec.id, intraBundle(rec.id));
+    assert.ok(stored.pendingConfirmation, "bundle recorded");
+    assert.strictEqual(stored.pendingConfirmation?.mode, "intra_target");
+    const result = applyConfirmationResult(
+      rec.id,
+      makeVerdict(),
+      freshMainAgentVerification(rec.id),
+    );
+    assert.strictEqual(result.record.status, "confirmed");
+    assert.ok(
+      result.record.evidenceItems.some((e) => e.role === "reproduction"),
+      "reproduction evidence recorded",
+    );
+  });
+
+  it("rejects an intra-target bundle that smuggles in a control run", () => {
+    const rec = intraCase();
+    const bundle = intraBundle(rec.id);
+    bundle.controlRun = evidenceRun(
+      "control",
+      "control.test",
+      "c-nonce",
+      makeIntraEvidence("c-nonce"),
+    );
+    bundle.controlTarget = "control.test";
+    assert.throws(() => storePendingConfirmation(rec.id, bundle), /must not carry a control run/i);
+  });
+
+  it("rejects intra-target evidence without a baseline request", () => {
+    const rec = intraCase();
+    assert.throws(
+      () => storePendingConfirmation(rec.id, intraBundle(rec.id, { baseline: "none" })),
+      /baseline/i,
+    );
+  });
+
+  it("rejects intra-target evidence whose attack and baseline are identical", () => {
+    const rec = intraCase();
+    assert.throws(
+      () => storePendingConfirmation(rec.id, intraBundle(rec.id, { baseline: "identical" })),
+      /identical/i,
+    );
+  });
+
+  it("rejects an intra-target bundle whose harness differential is not target_only", () => {
+    const rec = intraCase();
+    const bundle = intraBundle(rec.id, {
+      harnessVerified: {
+        attempted: true,
+        pass: false,
+        status: 200,
+        differential: "both",
+        target: { attempted: true, matched: true, status: 200, url: "x", note: "attack matched" },
+        control: {
+          attempted: true,
+          matched: true,
+          status: 200,
+          url: "y",
+          note: "baseline ALSO matched",
+        },
+        note: "intra-target differential both",
+      },
+    });
+    assert.throws(() => storePendingConfirmation(rec.id, bundle), /HARNESS DIFFERENTIAL FAILED/);
   });
 });

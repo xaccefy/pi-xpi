@@ -543,6 +543,29 @@ async function replayRequest(
   return { attempted: true, url: observedUrl(), note: "unreachable redirect state" };
 }
 
+/**
+ * Two requests are "the same" when method, URL, header set, and body all match.
+ * An intra-target differential whose attack and baseline are identical proves
+ * nothing — the discriminating variable must actually differ.
+ */
+export function sameRequest(
+  a: { method: string; url: string; headers?: Record<string, string>; body?: string },
+  b: { method: string; url: string; headers?: Record<string, string>; body?: string },
+): boolean {
+  const norm = (h?: Record<string, string>) =>
+    JSON.stringify(
+      Object.entries(h ?? {})
+        .map(([k, v]) => [k.toLowerCase(), v] as const)
+        .sort(([x], [y]) => (x < y ? -1 : x > y ? 1 : 0)),
+    );
+  return (
+    a.method.toUpperCase() === b.method.toUpperCase() &&
+    a.url === b.url &&
+    (a.body ?? "") === (b.body ?? "") &&
+    norm(a.headers) === norm(b.headers)
+  );
+}
+
 function injectCanary(
   verify: PoCEvidence["verify"],
   token: string | undefined,
@@ -613,6 +636,49 @@ export async function replayVerify(
 }
 
 /**
+ * Combine the two observations into the differential verdict. Shared by the
+ * inter-host (target vs control host) and intra-target (attack vs same-host
+ * baseline) replays — only the note labels differ.
+ */
+function judgeDifferential(
+  target: HarnessResponseObservation,
+  control: HarnessResponseObservation,
+  token: string | undefined,
+  label: { kind: string; a: string; b: string },
+): HarnessVerifyResult {
+  const attempted = target.attempted && control.attempted;
+  const conclusive = target.matched !== undefined && control.matched !== undefined;
+  const differential = conclusive
+    ? target.matched === true
+      ? control.matched === true
+        ? "both"
+        : "target_only"
+      : control.matched === true
+        ? "control_only"
+        : "neither"
+    : undefined;
+  const canary = canaryResult(token, target, control);
+  const pass =
+    attempted &&
+    conclusive &&
+    differential === "target_only" &&
+    (canary === undefined || canary.pass === true);
+  return {
+    attempted,
+    pass,
+    status: target.status,
+    target,
+    control,
+    differential,
+    canary,
+    proofStrength: canary?.pass ? "canary_differential" : "predicate_differential",
+    note:
+      `harness ${label.kind} ${differential ?? "inconclusive"}: ${label.a} (${target.note}); ` +
+      `${label.b} (${control.note})${canary ? `; ${canary.note}` : ""}`,
+  };
+}
+
+/**
  * Execute one harness-owned request template against both the case target and
  * a distinct control origin. The PoC cannot weaken the control request: the
  * harness preserves method, path, query, headers, body, and target predicates,
@@ -658,36 +724,75 @@ export async function replayDifferential(
     token,
     opts,
   );
-  const attempted = target.attempted && control.attempted;
-  const conclusive = target.matched !== undefined && control.matched !== undefined;
-  const targetMatched = target.matched === true;
-  const controlMatched = control.matched === true;
-  const differential = conclusive
-    ? targetMatched
-      ? controlMatched
-        ? "both"
-        : "target_only"
-      : controlMatched
-        ? "control_only"
-        : "neither"
+  return judgeDifferential(target, control, token, {
+    kind: "differential",
+    a: "target",
+    b: "control",
+  });
+}
+
+/**
+ * Same-host differential (Tier 2, intra-target). For access-control and
+ * business-logic classes the discriminating variable is the attacker's
+ * identity or a request parameter, NOT the host — so the sound baseline is a
+ * legitimate request to the SAME target, not the same request to another host.
+ * The harness sends the attack request and the model-declared `evidence.baseline`
+ * request to the case target, applies the attack's `verify.expect` predicates to
+ * BOTH responses, and passes only when the proof appears on the attack response
+ * and is absent from the baseline (`target_only`, where "target" = attack and
+ * "control" = baseline). The baseline is bound to the case target so it cannot
+ * be redirected to a weaker origin, and it must differ from the attack request.
+ */
+export async function replayIntraTarget(
+  evidence: PoCEvidence,
+  caseTarget: string,
+  opts?: ReplayOptions,
+): Promise<HarnessVerifyResult> {
+  const baseline = evidence.baseline;
+  if (!baseline) {
+    return {
+      attempted: false,
+      pass: false,
+      note: "intra-target differential requires evidence.baseline (a legitimate same-host request)",
+    };
+  }
+  const attackBinding = verifyUrlBindingError(evidence.verify.url, caseTarget);
+  if (attackBinding) {
+    return { attempted: false, pass: false, note: `attack binding failed: ${attackBinding}` };
+  }
+  const baselineBinding = verifyUrlBindingError(baseline.url, caseTarget);
+  if (baselineBinding) {
+    return { attempted: false, pass: false, note: `baseline binding failed: ${baselineBinding}` };
+  }
+  if (sameRequest(evidence.verify, baseline)) {
+    return {
+      attempted: false,
+      pass: false,
+      note: "attack and baseline requests are identical — an intra-target differential must vary identity or a parameter",
+    };
+  }
+
+  const token = evidence.verify.canary
+    ? `poc_canary_${randomBytes(24).toString("hex")}`
     : undefined;
-  const canary = canaryResult(token, target, control);
-  const pass =
-    attempted &&
-    conclusive &&
-    differential === "target_only" &&
-    (canary === undefined || canary.pass === true);
-  return {
-    attempted,
-    pass,
-    status: target.status,
-    target,
-    control,
-    differential,
-    canary,
-    proofStrength: canary?.pass ? "canary_differential" : "predicate_differential",
-    note:
-      `harness differential ${differential ?? "inconclusive"}: target (${target.note}); ` +
-      `control (${control.note})${canary ? `; ${canary.note}` : ""}`,
-  };
+  const attackVerify = injectCanary(evidence.verify, token);
+  const attack = await replayRequest(attackVerify, attackVerify.expect, token, opts);
+  // The baseline carries the attack's predicates: the proof must be ABSENT here.
+  const baselineVerify = injectCanary(
+    {
+      ...evidence.verify,
+      method: baseline.method,
+      url: baseline.url,
+      headers: baseline.headers,
+      body: baseline.body,
+    },
+    token,
+  );
+  const base = await replayRequest(baselineVerify, attackVerify.expect, token, opts);
+
+  return judgeDifferential(attack, base, token, {
+    kind: "intra-target",
+    a: "attack",
+    b: "baseline",
+  });
 }

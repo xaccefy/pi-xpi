@@ -17,6 +17,11 @@ When this workflow is active, only four roles run as subagents: **auditor**, **t
 
 The examples below show the Pi form first; the OMP `task` call carries the same `agent` name and `task` text as `{ name, agent, task }` entries. Only the delegated stages launch through these tools.
 
+**Dispatch discipline (this pipeline is sequential-dependent — only HUNT truly fans out):** keep dispatch to TWO batched points and do not scatter one async call per finding.
+1. **HUNT** — one call, ≤3 batched auditors (related classes grouped by surface/family).
+2. **TRACE+SKEPTIC** — one call carrying a trace task per prioritized finding plus a skeptic task for each `confidence: high` finding. Batch the whole round; never one dispatch per finding.
+Then **barrier and submit in one pass**: let the batched call return ALL results, then `PipelineSubmit` each output back-to-back before choosing the next stage — don't interleave fresh dispatches with a prior batch's delivery. A crash/timeout/invalid result for one item is a RETRY for that item next batch, never a verdict. RECON, VALIDATE/PoC, ConfirmFinding, CHAIN, and REPORT stay inline with you. This is verifier-in-the-loop: every boundary is a `PipelineSubmit` gate.
+
 - HUNT rounds, TRACE, SKEPTIC, and CHAIN launch through the dispatch tool.
 - VALIDATE, ConfirmFinding, PATCH, REPORT, and all final decisions stay with the main coordinator — never hand those phases to workers in swarm mode.
 - You own: casefile state, scratchpad checkpoints, schema validation at stage boundaries, coverage aggregation, advance/kill/retry decisions.
@@ -231,7 +236,11 @@ Write the smallest reliable PoC that demonstrates the **maximum reachable impact
 
 **Two-phase promotion (REQUIRED for EVERY promotion — zero exit is necessary run integrity, never proof; markers are diagnostic only):**
 
-*Phase 1 — PromoteFinding.* Pass `poc_path`, an operator-approved `control_target` from `PI_POC_CONTROL_TARGETS`, optional same-byte `control_path` only when overriding the default `poc_path`, and `local: true` when needed. Every run must complete with captured output and nonce-bound `evidence.json` containing a response-body predicate; status-only evidence is rejected. The harness pins DNS, locks redirects to the bound host, applies one request to target/control, and requires two conclusive responses with `target_only`. Crashed, truncated, evidence-less, or transport-inconclusive runs block promotion.
+*Phase 1 — PromoteFinding.* Choose the differential `mode` for the class:
+- `mode: "inter_host"` (default) — body-carried proof identical on any host (file read, injection exfil, info leak, reflection). Pass an operator-approved `control_target` from `PI_POC_CONTROL_TARGETS` (+ optional same-byte `control_path`). The harness applies one request to target/control and requires `target_only`.
+- `mode: "intra_target"` — access-control / business-logic classes (IDOR/BOLA, auth bypass, privilege escalation, mass assignment, logic/price tampering) where the discriminating variable is IDENTITY or a PARAMETER, not the host. The evidence must declare `verify.mode: "intra_target"` and a same-host `baseline` (the attacker's own object, a properly-authorized request, or the omitted field); the harness sends attack + baseline to the case target and requires the proof on the attack response only. No `control_target`.
+
+Common to both: pass `poc_path` and `local: true` when needed. Every run must complete with captured output and nonce-bound `evidence.json` containing a response-body predicate; status-only evidence is rejected. The harness pins DNS and locks redirects to the bound host. Crashed, truncated, evidence-less, or transport-inconclusive runs block promotion.
 
 *Phase 2 — ConfirmFinding (main agent only).* Do not dispatch confirmation. The main/coordinator reads the exact PoC and preserved evidence, hunts trivial predicates or fabrication, performs a concrete disconfirmation attempt, and calls `ConfirmFinding` itself. A CONFIRMED call performs and stores a fresh harness-owned target/control replay; there is no caller-supplied re-execution checkbox. CONFIRMED requires `re_execution_note`, `differential: "target_only"`, and the main agent's `disconfirmation_attempt`. Worker processes are rejected. Never `CaseUpdate(status: "confirmed")` directly.
 
