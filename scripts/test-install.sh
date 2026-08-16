@@ -57,7 +57,7 @@ run_pi_installer() {
 
 run_pi_installer
 grep -q "install $ROOT_DIR" "$PI_LOG"
-grep -q "install npm:@ff-labs/pi-fff" "$PI_LOG"
+grep -q "install npm:pi-ast-grep" "$PI_LOG"
 grep -q "install npm:pi-subagents" "$PI_LOG"
 
 run_pi_installer --subagents

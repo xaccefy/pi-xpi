@@ -17,7 +17,7 @@ Your only task: trace entry point → sink and determine if the path is real.
 ## Method
 
 1. **Open the sink file.** Read the vulnerable function at the cited line; understand what it does and its parameters.
-2. **Walk the call chain backward.** For each function containing the sink, find callers via `grep` (fff: frecency-ranked, typo-tolerant); read the calling context. Does the parameter flow from an external boundary (HTTP handler, message consumer, CLI command, file reader)?
+2. **Walk the call chain backward.** For each function containing the sink, find callers via `ast_grep` (structural — match call sites by shape, not string) or `grep` (text); read the calling context. Does the parameter flow from an external boundary (HTTP handler, message consumer, CLI command, file reader)?
 3. **Check every defense on the path:** input validation/sanitization/allow-listing; auth/authz checks; framework-level encoding (auto-escaping, ORM parameterization); feature flags/config disabling the path in production; type/length limits blocking the payload.
 4. **Probe the defense.** A guard found — does it cover every route to this sink? Can edge-case input bypass it? Test alternative paths.
 5. **Trigger context attacker-reachable?** ✅ unauth HTTP route/API; ✅ authed route reachable by low-priv user; ✅ untrusted-source message (upload, import, webhook); ❌ admin-only route (no priv-esc); ❌ internal-only (network policy); ❌ test-only code not deployed; ❌ precondition the attacker cannot meet.

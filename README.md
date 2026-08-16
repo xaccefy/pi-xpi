@@ -18,7 +18,7 @@ XPI turns the Pi agent into a security researcher: a case ledger with enforced g
 - **Machine-owned PoC gates** — zero exit is necessary but never proof: direct-response findings require nonce-bound body evidence plus a DNS-pinned, conclusive `target_only` replay against an operator-approved control; reflection-capable requests can add a harness-generated target-only canary; only the main agent may make the semantic decision and commit phase 2
 - **Exploit chains** — `ChainSuggest` surfaces combinations the model missed
 - **Coverage matrix** — machine-checkable "we tested everything" claims
-- **Code search** — fff-powered grep/find, frecency-ranked
+- **Code search** — structural AST search (ast-grep) for sinks and call chains, plus built-in grep/find for text
 
 ## Install
 
@@ -26,7 +26,7 @@ Works on **Pi Agent** and its fork **OMP** (`@oh-my-pi/pi-coding-agent`). One ma
 
 ```bash
 ./install.sh            # auto-detects pi or omp in PATH
-./install.sh --pi       # force Pi  (installs pi-subagents + optional fff search)
+./install.sh --pi       # force Pi  (installs pi-subagents + optional ast-grep structural search)
 ./install.sh --pi --no-subagents  # minimal Pi install; use /xp lite because swarm dispatch is unavailable
 ./install.sh --omp      # force OMP (copies agents/*.md to ~/.omp/agent/agents)
 ```

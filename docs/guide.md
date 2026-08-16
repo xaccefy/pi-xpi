@@ -21,7 +21,6 @@ XPI runs on **Pi Agent** (`@earendil-works/pi-coding-agent`) and its fork **OMP*
 | `PI_XP_MODE` | casefile | `on` / `swarm` / `lite` / `off` — force casefile cyber-workflow injection (`on` is the default enabled mode: swarm; `lite` disables subagent dispatch) |
 | `PI_CASEFILE_PATH` | casefile | Override SQLite ledger path |
 | `PI_WEBSEARCH_PORT` | webxp | open-websearch daemon port (default `3210`) |
-| `PI_FFF_MODE` | fff | `override` replaces pi's built-in grep/find with fff (set in your shell profile; Pi only — OMP ships its own search) |
 
 ```bash
 export PREVIEW_IS_API_KEY="rk_yourkeyhere"
@@ -49,7 +48,7 @@ export PREVIEW_IS_API_KEY="rk_yourkeyhere"
 | `/casefile` | Case dashboard |
 | `/xp` | Toggle casefile **XP mode** (bare `/xp` toggles the bounded swarm pipeline; `lite` = single-agent workflow; **default OFF**) |
 | `todo` / `/todos` | Multi-step task lists |
-| `ffgrep` / `fffind` | Frecency-ranked file + content search; in `override` mode transparently upgrades pi's built-in `grep`/`find`. Installed by `install.sh`. |
+| `ast_grep` | Structural (AST) code search via [ast-grep](https://ast-grep.github.io) — `run` (pattern match) + `scan` (rule check) modes; enumerate sinks and walk call chains by code shape, not text. Installed by `install.sh` (needs the `ast-grep` binary on PATH). Text search stays on pi's built-in `grep`/`find`. |
 
 ## Quick start
 
@@ -73,13 +72,13 @@ The pipeline has two mechanisms that keep findings honest:
 
 See `skills/cyberwf/SKILL.md` for the full stage machine and API.
 
-## Code search (fff)
+## Code search (ast-grep)
 
-XPI uses [fff](https://github.com/dmtrKovalenko/fff) (`@ff-labs/pi-fff`) for file and content search — a frecency-ranked, typo-tolerant engine that runs as a native Pi extension, no separate MCP process.
+XPI uses [ast-grep](https://ast-grep.github.io) (`pi-ast-grep`) for **structural** code search — it parses source to a syntax tree and matches by code shape, so a query like "every `eval($X)` call" or "SQL built from string concatenation" hits real call sites, not comments and strings. This is the layer a security audit actually needs: precise sink enumeration and call-chain walking, with far fewer false positives and misses than text grep.
 
-`install.sh` installs it; add `export PI_FFF_MODE=override` to your shell profile (install.sh reminds you — an executed script can't export for you). Override mode transparently replaces pi's built-in `grep`/`find`/`multi_grep` with fff's implementations. The agent's existing `grep`/`find` calls get faster and smarter with no prompt or skill changes — `ffgrep` auto-detects regex vs fuzzy, `fffind` matches whole repo-relative paths and ranks by frecency.
+`install.sh` installs the `pi-ast-grep` extension plus the `ast-grep` binary it wraps (`npm i -g @ast-grep/cli`, or `cargo install ast-grep`). No env var or override mode — it registers a distinct `ast_grep` tool with `run` (ad-hoc pattern) and `scan` (rule-based) modes across TypeScript, JavaScript, Python, Rust, Go, and more. It is read-only (no rewrite).
 
-For a target repo, the auditor and tracer agents lean on `grep`/`find`/`read` to locate sinks, entry points, and call chains. fff keeps those searches accurate across large codebases without a heavy index step.
+Structural search does **not** replace lexical search. Text patterns (error strings, config, saved HTTP responses, minified bundles, non-code files) still go through pi's built-in `grep`/`find`. Rule of thumb for the auditor/tracer/skeptic agents: **`ast_grep` for code shape, `grep`/`find` for raw text.** Neither uses `bash` — never shell out to `rg`/`grep`/`ast-grep` for code search.
 
 ## Structure
 

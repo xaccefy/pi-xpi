@@ -26,7 +26,7 @@ Read `scope_instruction` carefully — many programs scope an asset to a restric
 
 **No source (finding cites an `endpoint`)?** skip to 1b.
 
-Open the sink at the cited line, read the function, then walk the call chain backward with `grep` (fff: frecency-ranked, typo-tolerant). The auditor/tracer may have missed a defense, misread the data flow, or cited the wrong line — verify every link against actual source. Sink genuinely missing at/around the cited line → DISPROVEN `unreachable`.
+Open the sink at the cited line, read the function, then walk the call chain backward with `ast_grep` (structural) or `grep` (text). The auditor/tracer may have missed a defense, misread the data flow, or cited the wrong line — verify every link against actual source. Sink genuinely missing at/around the cited line → DISPROVEN `unreachable`.
 
 ### 1b. Live targets (no source) — re-probe read-only
 
@@ -92,4 +92,4 @@ uncertainty_reason: <if UNDETERMINED, exact blocker>
 - **One finding at a time.** Focused, deep, single-case.
 - **You ARE the disconfirmation.** Your `disconfirmation_attempt` becomes the case's `disconfirmation` field. Make it count.
 - **Honest uncertainty.** Can't disprove but can't fully confirm → UNDETERMINED. No manufactured certainty either way.
-- **Never use `bash` for code search** — `grep`/`find` tools (fff). You have no bash; live re-probing goes through `http_request` only.
+- **Never use `bash` for code search** — `ast_grep` (structural) + `grep`/`find` (text) tools. You have no bash; live re-probing goes through `http_request` only.

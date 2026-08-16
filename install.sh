@@ -6,7 +6,7 @@
 #   ./install.sh --pi       # force the Pi host (needs `pi` in PATH)
 #   ./install.sh --pi --no-subagents  # skip pi-subagents; use /xp lite on Pi
 #
-# Pi:  pi install <dir> + pi-subagents + optional @ff-labs/pi-fff
+# Pi:  pi install <dir> + pi-subagents + optional pi-ast-grep (structural search)
 # OMP: omp install <dir>  (extensions + skills via the Agent Plugins manifest);
 #      specialist agents are copied to ~/.omp/agent/agents so the `task` tool can
 #      spawn auditor/tracer/skeptic/chain by name for /xp or /xp swarm.
@@ -107,7 +107,7 @@ if [[ "$HOST" == "omp" ]]; then
   echo "  export PREVIEW_IS_API_KEY=\"rk_yourkeyhere\"  # https://preview.is"
   echo
   echo "XPI installed on OMP. Use /xp for the bounded swarm pipeline, or /xp lite for single-agent mode."
-  echo "OMP ships its own grep/find — XPI's fff upgrade is Pi-only."
+  echo "OMP ships its own grep/find — XPI's ast-grep structural search is Pi-only."
   exit 0
 fi
 
@@ -121,12 +121,14 @@ else
   echo "Skipping pi-subagents install (--no-subagents requested)"
 fi
 
-# Optional search upgrade. Pi's built-in grep/find remain usable if this fails.
-"$PI_BIN" install "npm:@ff-labs/pi-fff" || echo "Optional @ff-labs/pi-fff install skipped"
+# Optional structural-search upgrade (ast-grep). Pi's built-in grep/find remain
+# for text search if this fails. The pi-ast-grep extension wraps the ast-grep
+# CLI, so the binary must be on PATH first.
+npm install -g @ast-grep/cli >/dev/null 2>&1 || echo "ast-grep CLI install skipped (install @ast-grep/cli or cargo install ast-grep manually)"
+"$PI_BIN" install "npm:pi-ast-grep" || echo "Optional npm:pi-ast-grep install skipped"
 
 echo
 echo "Optional environment variables:"
-echo "  export PI_FFF_MODE=override"
 echo '  export PREVIEW_IS_API_KEY="rk_yourkeyhere"  # https://preview.is'
 echo
 echo "XPI installed. Use /xp for the bounded swarm pipeline, or /xp lite for single-agent mode."

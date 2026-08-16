@@ -37,7 +37,7 @@ Document what you find — it feeds the attack strategy.
 ### Step 2: Map the surface
 
 **Tool selection — critical:**
-- **Code search** → the `grep`/`find` **tools** (fff: frecency-ranked, typo-tolerant). NEVER `bash("rg ...")`/`bash("grep ...")` for code search.
+- **Code search** → the `ast_grep` **tool** (structural/AST) to enumerate sinks and match call shapes precisely; the `grep`/`find` **tools** for raw text (strings, config, non-code). NEVER `bash("rg ...")`/`bash("grep ...")`/`bash("ast-grep ...")` for code search.
 - **Live probing** → `bash` for CLI tools only (`curl`, `httpx`, `ffuf`, `nmap`).
 - **File reading** → the `read` tool, not `bash("cat ...")`.
 
@@ -100,4 +100,4 @@ VERDICT: INCOMPLETE  # COVERED only with zero UNCHECKED; NOT_FOUND only when CHE
 - Stay inside the assigned class or class family. Nothing outside it.
 - No PoC writing — that's the main agent's validation job. Report findings; validation comes later.
 - Doubt about exploitability → confidence=low, documented why; the tracer validates reachability.
-- **Never use `bash` for code search** — `grep`/`find` tools (fff). Reserve `bash` for CLI tools and scripts.
+- **Never use `bash` for code search** — `ast_grep` (structural) + `grep`/`find` (text) tools. Reserve `bash` for CLI tools and scripts.
