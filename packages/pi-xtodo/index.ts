@@ -43,6 +43,9 @@ interface Task {
 interface TaskState {
   tasks: Task[];
   nextId: number;
+  /** ISO timestamp of the last successful persist — settle tie-break when
+   * memory and disk nextId match but contents diverge. */
+  savedAt?: string;
 }
 
 interface TaskDetails {
@@ -137,11 +140,10 @@ function saveState(id: string, state: TaskState): void {
   try {
     const dir = xtodoDir();
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    // Atomic write (tmp + rename): a crash mid-write must not leave a torn
-    // file that restoreState rejects and the whole list is dropped as corrupt.
     const target = persistPath(id);
     const tmp = `${target}.${process.pid}.${Date.now()}.tmp`;
-    writeFileSync(tmp, JSON.stringify(state), "utf8");
+    const toPersist = { ...state, savedAt: new Date().toISOString() };
+    writeFileSync(tmp, JSON.stringify(toPersist), "utf8");
     renameSync(tmp, target);
   } catch {
     /* best-effort persistence */
@@ -770,8 +772,22 @@ export default function registerTodo(pi: ExtensionAPI) {
     const replayed = replayFromBranch(ctx);
     const mem = sessions.get(sessionId) ?? freshState();
     const disk = restoreState(sessionId) ?? freshState();
-    const local = mem.nextId >= disk.nextId ? mem : disk;
-    const next = local.nextId > 1 ? local : replayed.nextId > 1 ? replayed : local;
+    // Freshest local source wins: nextId first (monotonic), then the last
+    // persist timestamp (equal nextId with diverged contents), then task
+    // count. Branch replay is the fallback only when no local source has
+    // tasks — compaction can drop NEWER tool results, so the branch's last
+    // surviving snapshot may be stale.
+    const pickLocal = (a: TaskState, b: TaskState): TaskState => {
+      if (a.nextId !== b.nextId) return a.nextId > b.nextId ? a : b;
+      const aMs = Date.parse(a.savedAt ?? "");
+      const bMs = Date.parse(b.savedAt ?? "");
+      const aTime = Number.isFinite(aMs) ? aMs : 0;
+      const bTime = Number.isFinite(bMs) ? bMs : 0;
+      if (aTime !== bTime) return aTime > bTime ? a : b;
+      return a.tasks.length >= b.tasks.length ? a : b;
+    };
+    const local = pickLocal(mem, disk);
+    const next = local.nextId > 1 || local.tasks.length > 0 ? local : replayed;
     setSessionState(sessionId, next);
     refreshWidget(ctx, sessionId);
   };

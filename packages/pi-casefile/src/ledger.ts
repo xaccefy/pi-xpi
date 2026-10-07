@@ -23,15 +23,16 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import type { MainAgentVerdict, PoCEvidence } from "./evidence.ts";
+import type { HarnessVerifyResult } from "./harness-verify.ts";
 import {
-  evidenceNonceMatches,
-  type MainAgentVerdict,
-  normalizeEvidence,
-  type PoCEvidence,
-  parsePoCEvidence,
-  validateMainAgentVerdict,
-} from "./evidence.ts";
-import { type HarnessVerifyResult, sameRequest, verifyUrlBindingError } from "./harness-verify.ts";
+  closeDb as closeSharedDb,
+  getDb as getSharedDb,
+  hasDbInstance as hasSharedDb,
+  setDbInstance,
+  setDbOpener,
+  setValidateReportFile,
+} from "./ledger-internal.ts";
 import {
   assertSafeRegularFile,
   ensureSafeStateDirectory,
@@ -46,7 +47,42 @@ import {
   scratchpad_resume,
   scratchpad_runs,
 } from "./scratchpad.ts";
+
+// Two-phase PoC confirmation gate — extracted module, re-exported so callers
+// (extension index, tests) keep importing from ledger.
+export {
+  applyConfirmationResult,
+  assertPromotable,
+  PENDING_CONFIRM_TTL_MS,
+  storePendingConfirmation,
+} from "./confirmation.ts";
+
 import { DatabaseSync } from "./sqlite-compat/index.ts";
+
+// Register the shared opener so sibling modules (chains/objectives/confirmation)
+// can lazy-open the ledger through ledger-internal without importing ledger.
+setDbOpener(() => openAndRegisterDb());
+
+// Chain suggestion + primitives engine — extracted module, re-exported.
+export {
+  addPrimitiveResult,
+  type ChainSuggestion,
+  deletePrimitiveResult,
+  getPrimitiveById,
+  linkPrimitiveResult,
+  listPrimitives,
+  unlinkPrimitiveResult,
+} from "./chains.ts";
+export {
+  addObjectiveResult,
+  deleteObjectiveResult,
+  getObjectiveById,
+  linkObjectiveCase,
+  listObjectives,
+  suggestChains,
+  unlinkObjectiveCase,
+  updateObjectiveStatusResult,
+} from "./objectives.ts";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -71,19 +107,15 @@ export type CasePriority = (typeof PRIORITY_VALUES)[number];
 
 /** Cap on hashed evidence artifacts (10 MiB) — keeps readFileSync bounded. */
 const EVIDENCE_ARTIFACT_MAX_BYTES = 10 * 1024 * 1024;
-/** PoC evidence has a tighter runner-side cap and must remain equally bounded on re-read. */
-const POC_EVIDENCE_MAX_BYTES = 256 * 1024;
 /** Avoid racing an active or just-finished PoC whose bundle is not committed yet. */
 export const POC_EVIDENCE_GC_GRACE_MS = 24 * 60 * 60 * 1000;
-/** Immutable module-start role; child shells cannot upgrade this process by unsetting an env var. */
-const PROCESS_STARTED_AS_SUBAGENT = process.env.PI_SUBAGENT_CHILD === "1";
 
 function pathIsWithin(root: string, candidate: string): boolean {
   const rel = relative(root, candidate);
   return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
 }
 
-function readWorkspaceArtifact(inputPath: string): { path: string; bytes: Buffer } {
+export function readWorkspaceArtifact(inputPath: string): { path: string; bytes: Buffer } {
   const workspace = realpathSync(detectWorkspaceRoot());
   const requested = resolve(workspace, inputPath);
   if (!existsSync(requested)) {
@@ -154,6 +186,75 @@ export type EvidenceItem = {
  */
 export const COVERAGE_SCOPE_VALUES = ["wide", "local"] as const;
 export type CoverageScope = (typeof COVERAGE_SCOPE_VALUES)[number];
+
+/** Attack primitives: material found during testing that other cases can build on. */
+export const PRIMITIVE_KIND_VALUES = [
+  "credential",
+  "session",
+  "token",
+  "account",
+  "endpoint",
+  "param",
+  "payload",
+] as const;
+export type PrimitiveKind = (typeof PRIMITIVE_KIND_VALUES)[number];
+
+export type PrimitiveRecord = {
+  id: string;
+  kind: PrimitiveKind;
+  label: string;
+  /** Reference to the value (env var, file, hash) — NOT the live secret itself. */
+  valueRef?: string;
+  /** What the primitive grants or enables ("admin API access", "victim session"). */
+  capabilities?: string;
+  notes?: string;
+  /** Cases this primitive was produced by or used against. */
+  caseIds: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+/** Kill-chain phases for engagement objectives (web-focused OPPLAN-lite). */
+export const OBJECTIVE_PHASE_VALUES = [
+  "recon",
+  "initial-access",
+  "post-exploit",
+  "exfiltration",
+] as const;
+export type ObjectivePhase = (typeof OBJECTIVE_PHASE_VALUES)[number];
+
+export const OBJECTIVE_STATUS_VALUES = [
+  "pending",
+  "in-progress",
+  "completed",
+  "blocked",
+  "cancelled",
+] as const;
+export type ObjectiveStatus = (typeof OBJECTIVE_STATUS_VALUES)[number];
+
+/** Allowed status transitions; anything else is rejected (state machine). */
+export const OBJECTIVE_TRANSITIONS: Record<ObjectiveStatus, ObjectiveStatus[]> = {
+  pending: ["in-progress", "cancelled"],
+  "in-progress": ["completed", "blocked", "cancelled"],
+  completed: [],
+  blocked: ["in-progress", "cancelled"],
+  cancelled: [],
+};
+
+export type ObjectiveRecord = {
+  id: string;
+  title: string;
+  phase: ObjectivePhase;
+  status: ObjectiveStatus;
+  /** Objective IDs that must complete before this one can start. */
+  dependsOn: string[];
+  /** What proves this objective achieved ("admin session obtained"). */
+  acceptance?: string;
+  blockedReason?: string;
+  caseIds: string[];
+  createdAt: string;
+  updatedAt: string;
+};
 
 /**
  * One tested (asset × attack-class) cell. The note's existence marks the cell
@@ -345,11 +446,28 @@ export type PendingConfirmation = {
   controlRun?: PocEvidenceRun;
   /** Harness's own replay of evidence.verify (public targets). Absent = legacy bundle. */
   harnessVerified?: HarnessVerifyResult;
+  /** OOB-only bundles: per-run oracle tokens so phase-2 can re-poll freshly.
+   * Stored raw deliberately: the oracle is operator-owned and bearer-gated,
+   * so a ledger reader without oracle write access cannot fabricate hits. */
+  oobTokens?: { targetToken: string; controlToken: string };
   /** Harness-owned OOB listener log for the run (opt-in blind classes). */
   callbackVerified?: OobVerification;
 };
 
-/** Fresh machine transcript produced inside the main agent's ConfirmFinding call. */
+/**
+ * Fresh machine transcript produced inside the main agent's ConfirmFinding call.
+ *
+ * BOUNDARY NOTE: the ledger enforces the STRUCTURAL floor on this object —
+ * valid timestamp newer than phase 1 and ≤5 minutes old, target/control
+ * binding, conclusive `target_only` differential, canary transcript when
+ * requested (see assertMainAgentVerification). What it cannot enforce at this
+ * API boundary is WHO executed the replay: in production the only caller is
+ * the PromoteFinding/ConfirmFinding tool layer in index.ts, which runs the
+ * replay itself before calling applyConfirmationResult. A second integration
+ * calling applyConfirmationResult directly owns the provenance of the
+ * transcript it passes. Cross-process identity limits are documented in
+ * docs/confirmation-design.md §7 (honest limits).
+ */
 export type MainAgentVerification = {
   at: string;
   result: HarnessVerifyResult;
@@ -367,9 +485,6 @@ export type MainAgentVerdictRecord = MainAgentVerdict & {
 
 /** @deprecated Compatibility alias for the legacy database/API field name. */
 export type ConfirmerVerdictRecord = MainAgentVerdictRecord;
-
-/** Pending confirmation expires after 1h — re-run PromoteFinding for a fresh bundle. */
-export const PENDING_CONFIRM_TTL_MS = 60 * 60 * 1000;
 
 export type CaseInput = {
   title: string;
@@ -396,7 +511,7 @@ export type CaseInput = {
   disconfirmation?: string;
 };
 
-type NormalizedCaseInput = Partial<CaseInput> & {
+export type NormalizedCaseInput = Partial<CaseInput> & {
   pocVerified?: CaseRecord["pocVerified"];
   disconfirmationVerified?: CaseRecord["disconfirmationVerified"];
   controlVerified?: CaseRecord["controlVerified"];
@@ -594,6 +709,7 @@ export function setCasefilePath(path: string | undefined): void {
       // Best-effort close.
     }
   }
+  closeSharedDb();
   ledgerPathOverride = path;
   dbInstance = undefined; // Force reconnection on next getDb
 }
@@ -601,8 +717,15 @@ export function setCasefilePath(path: string | undefined): void {
 // ── SQLite Schema Init ────────────────────────────────────────────────
 
 function getDb(): DatabaseSync {
-  if (dbInstance) return dbInstance;
-
+  // The opener registration below makes this the single lazy-open path for
+  // every casefile module (chains/objectives/confirmation resolve through
+  // ledger-internal's getDb, which calls back into openAndRegisterDb).
+  if (!hasSharedDb()) {
+    openAndRegisterDb();
+  }
+  return getSharedDb();
+}
+function openAndRegisterDb(): DatabaseSync {
   const dbPath = getCasefilePath();
   const dbDir = dirname(dbPath);
   const workspace = detectWorkspaceRoot();
@@ -727,6 +850,58 @@ function getDb(): DatabaseSync {
   `);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_evidence_items_case ON evidence_items(case_id)`);
 
+  // Attack primitives: material found during testing (credentials, tokens,
+  // sessions, endpoints) that other cases can build on. Values are stored as
+  // REFERENCES, never live secrets.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS primitives (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      label TEXT NOT NULL,
+      value_ref TEXT,
+      capabilities TEXT,
+      notes TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS primitive_links (
+      primitive_id TEXT NOT NULL,
+      case_id TEXT NOT NULL,
+      PRIMARY KEY (primitive_id, case_id),
+      FOREIGN KEY (primitive_id) REFERENCES primitives(id) ON DELETE CASCADE,
+      FOREIGN KEY (case_id) REFERENCES cases(id) ON DELETE CASCADE
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_primitive_links_case ON primitive_links(case_id)`);
+
+  // Engagement objectives: kill-chain OPPLAN-lite. Objectives carry phase,
+  // status state machine, and dependencies; cases attach as evidence of work.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS objectives (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      phase TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      depends_on_json TEXT NOT NULL DEFAULT '[]',
+      acceptance TEXT,
+      blocked_reason TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS objective_cases (
+      objective_id TEXT NOT NULL,
+      case_id TEXT NOT NULL,
+      PRIMARY KEY (objective_id, case_id),
+      FOREIGN KEY (objective_id) REFERENCES objectives(id) ON DELETE CASCADE,
+      FOREIGN KEY (case_id) REFERENCES cases(id) ON DELETE CASCADE
+    )
+  `);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_objective_cases_case ON objective_cases(case_id)`);
+
   // Coverage matrix: tested (asset × attack-class) cells with wide/local scope.
   db.exec(`
     CREATE TABLE IF NOT EXISTS coverage_items (
@@ -756,6 +931,7 @@ function getDb(): DatabaseSync {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_cases_priority ON cases(priority)`);
 
   dbInstance = db;
+  setDbInstance(db);
   // Best-effort housekeeping: failures and ambiguous state fail closed and do
   // not prevent the ledger from opening.
   gcOrphanedPocEvidenceForDb(db);
@@ -1057,6 +1233,10 @@ export function validateReportFile(
 
 /** Section headings the final report must contain. */
 const REPORT_REQUIRED_SECTIONS = ["summary", "impact", "remediation"];
+
+// Inject the report content gate into the shared validateCase (ledger-internal)
+// so the reported-state check works across the module split.
+setValidateReportFile(validateReportFile);
 
 /**
  * Kill-reason vocabulary — a kill must name one of these (or carry refutation
@@ -2017,874 +2197,6 @@ export function updateCaseResult(id: string, update: CaseUpdate): CaseUpdateResu
     upsertCase(db, next);
     return { record: next, changed: true };
   });
-}
-
-function validateRunEvidence(run: PocEvidenceRun, label: string): void {
-  if (!run.completed) {
-    throw new Error(`${label} did not complete; a crash is not evidence`);
-  }
-  if (!run.outputComplete) {
-    throw new Error(`${label} output capture was incomplete; evidence checks are unsafe`);
-  }
-  if (run.exitCode !== 0) {
-    throw new Error(
-      `${label} exited with ${run.exitCode}; exit 0 is required for a complete run but is never sufficient proof`,
-    );
-  }
-  if (!run.evidence || !run.evidenceSha256) {
-    throw new Error(
-      `${label} has no evidence.json — the PoC must write evidence to $PI_POC_EVIDENCE_DIR`,
-    );
-  }
-  if (!evidenceNonceMatches(run.evidence, run.nonce)) {
-    throw new Error(`${label} evidence nonce mismatch — evidence not bound to this run`);
-  }
-  const parsed = parsePoCEvidence(run.evidence);
-  if (!parsed.ok) {
-    throw new Error(`${label} evidence contract invalid: ${parsed.error}`);
-  }
-  if (!run.evidencePath) {
-    throw new Error(`${label} has no durable evidencePath; ephemeral evidence cannot confirm`);
-  }
-  const artifact = readWorkspaceArtifact(run.evidencePath);
-  if (artifact.bytes.byteLength > POC_EVIDENCE_MAX_BYTES) {
-    throw new Error(
-      `${label} durable evidence exceeds ${POC_EVIDENCE_MAX_BYTES} bytes; evidence cannot be revalidated safely`,
-    );
-  }
-  const durableHash = createHash("sha256").update(artifact.bytes).digest("hex");
-  if (durableHash !== run.evidenceSha256) {
-    throw new Error(`${label} durable evidence hash does not match evidenceSha256`);
-  }
-  let durableRaw: unknown;
-  try {
-    durableRaw = JSON.parse(artifact.bytes.toString("utf8"));
-  } catch (error) {
-    throw new Error(`${label} durable evidence is not valid JSON: ${(error as Error).message}`);
-  }
-  const durable = parsePoCEvidence(durableRaw);
-  if (!durable.ok) {
-    throw new Error(`${label} durable evidence contract invalid: ${durable.error}`);
-  }
-  if (
-    normalizeEvidence(durable.evidence) !== normalizeEvidence(run.evidence) ||
-    JSON.stringify(durable.evidence.observations) !== JSON.stringify(run.evidence.observations)
-  ) {
-    throw new Error(`${label} durable evidence bytes do not match the stored evidence object`);
-  }
-}
-
-/** Determinism + differential on normalized evidence (nonce/observations stripped). */
-function assertEvidenceDifferential(bundle: PendingConfirmation, isIntra = false): void {
-  const [r1, r2] = bundle.targetRuns;
-  if (normalizeEvidence(r1.evidence) !== normalizeEvidence(r2.evidence)) {
-    throw new Error(
-      "Target runs produced inconsistent evidence — the exploit did not reproduce deterministically",
-    );
-  }
-  // Intra-target target-dependence is proven by the harness attack-vs-baseline
-  // replay (same host), not by comparing a target run to a separate control run.
-  if (isIntra) return;
-  if (!bundle.controlRun) {
-    throw new Error("inter-host confirmation requires a control run");
-  }
-  if (normalizeEvidence(r1.evidence) === normalizeEvidence(bundle.controlRun.evidence)) {
-    throw new Error(
-      "Control run produced identical evidence to the target — the claimed impact is not target-dependent",
-    );
-  }
-}
-
-function assertMachineConfirmation(bundle: PendingConfirmation): void {
-  const oob = bundle.callbackVerified;
-  if (oob?.attempted) {
-    if (oob.targetHits === 0) {
-      throw new Error(
-        `OOB VERIFY FAILED: no interaction with the target-run callback token. ${oob.note}`,
-      );
-    }
-    if (oob.controlHits > 0) {
-      throw new Error(
-        `OOB VERIFY FAILED: the control-run callback token received ${oob.controlHits} interaction(s) — the callback is not target-dependent. ${oob.note}`,
-      );
-    }
-    if (oob.sourceSeparated !== true) {
-      throw new Error(
-        "OOB VERIFY FAILED: callback source separation was not established. " +
-          "A loopback listener reachable by the PoC is diagnostic telemetry, not proof that the target caused the interaction.",
-      );
-    }
-    return;
-  }
-
-  assertHarnessTargetOnly(
-    bundle.harnessVerified,
-    "HARNESS DIFFERENTIAL FAILED",
-    "no machine-owned target/control replay was recorded",
-  );
-}
-
-function assertHarnessTargetOnly(
-  harness: HarnessVerifyResult | undefined,
-  label: string,
-  missingNote: string,
-): asserts harness is HarnessVerifyResult {
-  if (
-    !harness?.attempted ||
-    harness.pass !== true ||
-    harness.differential !== "target_only" ||
-    harness.target?.matched !== true ||
-    harness.control?.matched !== false
-  ) {
-    throw new Error(`${label}: ${harness?.note ?? missingNote}`);
-  }
-}
-
-function assertHarnessCanary(
-  harness: HarnessVerifyResult | undefined,
-  required: boolean,
-  label: string,
-): void {
-  if (!required) return;
-  if (
-    harness?.canary?.attempted !== true ||
-    harness.canary.pass !== true ||
-    harness.canary.targetObserved !== true ||
-    harness.canary.controlObserved !== false ||
-    harness.proofStrength !== "canary_differential"
-  ) {
-    throw new Error(`${label}: ${harness?.canary?.note ?? "required canary transcript missing"}`);
-  }
-}
-
-function assertMainAgentVerification(
-  bundle: PendingConfirmation,
-  verification: MainAgentVerification | undefined,
-  isIntra = false,
-): asserts verification is MainAgentVerification {
-  if (!verification) {
-    throw new Error(
-      "MAIN-AGENT REPLAY REQUIRED: ConfirmFinding must produce a fresh harness-owned target/control transcript",
-    );
-  }
-  const at = Date.parse(verification.at);
-  const bundleAt = Date.parse(bundle.ranAt);
-  const now = Date.now();
-  if (
-    !Number.isFinite(at) ||
-    !Number.isFinite(bundleAt) ||
-    at < bundleAt ||
-    at > now + 30_000 ||
-    now - at > 5 * 60 * 1000
-  ) {
-    throw new Error(
-      "MAIN-AGENT REPLAY FAILED: transcript timestamp must be valid, newer than phase 1, and no more than 5 minutes old",
-    );
-  }
-  assertHarnessTargetOnly(
-    verification.result,
-    "MAIN-AGENT REPLAY FAILED",
-    "no fresh phase-2 target/control replay was recorded",
-  );
-  assertHarnessCanary(
-    verification.result,
-    bundle.targetRuns[0].evidence.verify.canary !== undefined,
-    "MAIN-AGENT CANARY FAILED",
-  );
-  const targetUrl = verification.result.target?.url;
-  const controlUrl = verification.result.control?.url;
-  const targetIdentity = bundle.targetRuns[0].target;
-  if (!targetUrl || verifyUrlBindingError(targetUrl, targetIdentity)) {
-    throw new Error("MAIN-AGENT REPLAY FAILED: target transcript is not bound to the case target");
-  }
-  // Intra-target: the "control" transcript is the legitimate baseline request,
-  // which is bound to the SAME case target. Inter-host: it is bound to the
-  // distinct control target.
-  const controlBindTarget = isIntra ? targetIdentity : bundle.controlTarget;
-  if (!controlUrl || !controlBindTarget || verifyUrlBindingError(controlUrl, controlBindTarget)) {
-    throw new Error(
-      isIntra
-        ? "MAIN-AGENT REPLAY FAILED: baseline transcript is not bound to the case target"
-        : "MAIN-AGENT REPLAY FAILED: control transcript is not bound to control_target",
-    );
-  }
-}
-
-/**
- * Gate for phase 1 of promotion: case must exist, be investigating, and have
- * poc/evidence/impact/severity/target. The disconfirmation is provided by the
- * main agent at confirm time, so it is NOT a precondition here. Returns the
- * record when promotable, throws otherwise. Exported so PromoteFinding can
- * validate BEFORE paying for (potentially slow) sandboxed PoC runs.
- */
-export function assertPromotable(id: string): CaseRecord {
-  const current = getCaseById(id);
-  if (!current) {
-    throw new Error(`Case not found: ${id}`);
-  }
-  if (current.status !== "investigating") {
-    throw new Error(`PromoteFinding requires an investigating case (current: ${current.status})`);
-  }
-  if (!current.poc) {
-    throw new Error("CONFIRMED requires poc; set poc on the case first");
-  }
-  if (!current.evidence) {
-    throw new Error("CONFIRMED requires evidence; set evidence on the case first");
-  }
-  if (!current.impact) {
-    throw new Error("CONFIRMED requires impact; set impact on the case first");
-  }
-  if (!current.severity) {
-    throw new Error("CONFIRMED requires severity; set severity on the case first");
-  }
-  if (!current.target) {
-    throw new Error(
-      "CONFIRMED requires target (what host/repo/scope this affects); set target on the case first",
-    );
-  }
-  // Evidence-chain closure: the observation item must be ARTIFACT-BACKED. A
-  // summary-only observation is agent prose about itself — promotion requires
-  // a real file with its SHA-256 as the initial signal. (The reproduction item
-  // is always artifact-backed: the gate writes it from the evidence hash.)
-  if (!current.evidenceItems.some((e) => e.role === "observation" && e.sha256)) {
-    throw new Error(
-      "Evidence chain incomplete: CONFIRMED requires an artifact-backed observation evidence item " +
-        "(EvidenceAdd role=observation with artifact_path — the initial signal, stored as basename + SHA-256) " +
-        "in addition to the auto-recorded reproduction item. Add the artifact-backed observation item and retry promotion.",
-    );
-  }
-  return current;
-}
-
-/**
- * Phase 1 (intra-target): validate a same-host attack-vs-baseline bundle. The
- * differential is proven by the harness replay (attack matched, baseline did
- * not, both against the case target), not by a separate control run — the
- * discriminating variable is the request's identity or a parameter, not the host.
- */
-function validateIntraTargetBundle(
-  current: CaseRecord,
-  id: string,
-  bundle: PendingConfirmation,
-): CaseRecord {
-  if (bundle.targetRuns.length !== 2) {
-    throw new Error("Intra-target confirmation requires two target runs");
-  }
-  if (bundle.controlRun || bundle.controlTarget) {
-    throw new Error(
-      "Intra-target confirmation must not carry a control run or control target — the baseline is a same-host request inside the evidence",
-    );
-  }
-  const targetRunTarget = bundle.targetRuns[0]?.target;
-  if (!targetRunTarget || bundle.targetRuns.some((r) => r.target !== targetRunTarget)) {
-    throw new Error("Intra-target confirmation requires both runs against the same case target");
-  }
-  let pocHash: string | undefined;
-  try {
-    pocHash = createHash("sha256").update(readFileSync(bundle.pocPath)).digest("hex");
-  } catch {
-    pocHash = undefined;
-  }
-  if (!pocHash || (bundle.pocSha256 && bundle.pocSha256 !== pocHash)) {
-    throw new Error("pocSha256 does not match the PoC file on disk");
-  }
-  for (const run of bundle.targetRuns) {
-    validateRunEvidence(run, `${run.mode} run`);
-    const ev = run.evidence;
-    if (ev.verify.mode !== "intra_target") {
-      throw new Error(
-        "INTRA-TARGET FAILED: each run's evidence.verify.mode must be 'intra_target'",
-      );
-    }
-    if (!ev.baseline) {
-      throw new Error(
-        "INTRA-TARGET FAILED: evidence.baseline (a legitimate same-host request) is required",
-      );
-    }
-    const attackBinding = verifyUrlBindingError(ev.verify.url, targetRunTarget);
-    if (attackBinding) throw new Error(`ATTACK BINDING FAILED: ${attackBinding}`);
-    const baselineBinding = verifyUrlBindingError(ev.baseline.url, targetRunTarget);
-    if (baselineBinding) throw new Error(`BASELINE BINDING FAILED: ${baselineBinding}`);
-    if (ev.baseline && sameRequest(ev.verify, ev.baseline)) {
-      throw new Error(
-        "INTRA-TARGET FAILED: attack and baseline requests are identical — vary identity or a parameter",
-      );
-    }
-  }
-  if (bundle.caseId !== id) throw new Error("Pending confirmation caseId mismatch");
-  assertEvidenceDifferential(bundle, true);
-  // Machine floor: attack matched, baseline did not, both against the case target.
-  assertMachineConfirmation(bundle);
-  assertHarnessCanary(
-    bundle.harnessVerified,
-    bundle.targetRuns[0].evidence.verify.canary !== undefined,
-    "PHASE-1 CANARY FAILED",
-  );
-  const next = buildRecord({ pendingConfirmation: bundle }, current);
-  validateCase(next);
-  return next;
-}
-
-/**
- * Phase 1: record the harness-observed evidence bundle on the case. The whole
- * contract is validated here — same-file control, nonce binding, run
- * completion, determinism across the two target runs, and the target/control
- * differential — so a bundle that cannot promote is rejected before the
- * main agent performs phase-2 review.
- */
-export function storePendingConfirmation(id: string, bundle: PendingConfirmation): CaseRecord {
-  const db = getDb();
-  return withImmediateTransaction(db, () => {
-    const current = getCaseById(id);
-    if (!current) throw new Error(`Case not found: ${id}`);
-    if (current.status !== "investigating") {
-      throw new Error(
-        `Pending confirmation requires an investigating case (current: ${current.status})`,
-      );
-    }
-    if (bundle.caseId !== id) throw new Error("Pending confirmation caseId mismatch");
-    if (bundle.mode === "intra_target") {
-      const next = validateIntraTargetBundle(current, id, bundle);
-      upsertCase(db, next);
-      return next;
-    }
-    if (bundle.targetRuns.length !== 2 || !bundle.controlRun) {
-      throw new Error("Pending confirmation requires two target runs and one control run");
-    }
-    if (!bundle.pocPath || !bundle.controlPath || !bundle.controlTarget) {
-      throw new Error("Pending confirmation requires pocPath, controlPath, and controlTarget");
-    }
-    // Control-target binding (machine-verified here, not just in the tool
-    // layer): the control run must actually have targeted the declared
-    // control_target, that target must differ from the target runs' target,
-    // and the control target must differ from the case's target — otherwise
-    // "the control demonstrated nothing on the vulnerable target" passes.
-    const targetRunTarget = bundle.targetRuns[0]?.target;
-    if (!targetRunTarget || bundle.targetRuns.some((r) => r.target !== targetRunTarget)) {
-      throw new Error(
-        "Pending confirmation requires both target runs against the same case target",
-      );
-    }
-    if (!bundle.controlRun.target || bundle.controlRun.target !== bundle.controlTarget) {
-      throw new Error(
-        "CONTROL BINDING FAILED: controlRun.target must equal control_target — a control run " +
-          "against a different host than the one declared proves nothing.",
-      );
-    }
-    if (bundle.controlRun.target === targetRunTarget) {
-      throw new Error(
-        "CONTROL BINDING FAILED: the control run targeted the same host as the target runs — " +
-          "the claimed impact is not target-dependent.",
-      );
-    }
-    if (bundle.controlTarget === current.target) {
-      throw new Error(
-        "CONTROL BINDING FAILED: control_target must differ from the case target; a control run " +
-          "against the vulnerable target proves nothing.",
-      );
-    }
-    // Same-file contract re-checked at store time (the tool already checked).
-    let pocHash: string | undefined;
-    let controlHash: string | undefined;
-    try {
-      pocHash = createHash("sha256").update(readFileSync(bundle.pocPath)).digest("hex");
-      controlHash = createHash("sha256").update(readFileSync(bundle.controlPath)).digest("hex");
-    } catch {
-      pocHash = undefined;
-      controlHash = undefined;
-    }
-    if (!pocHash || !controlHash || pocHash !== controlHash) {
-      throw new Error(
-        "CONTROL CHECK FAILED: control_path must be the SAME script as poc_path " +
-          "(sha256 mismatch). A separately written control file proves nothing.",
-      );
-    }
-    if (bundle.pocSha256 && bundle.pocSha256 !== pocHash) {
-      throw new Error("pocSha256 does not match the PoC file on disk");
-    }
-    for (const run of [...bundle.targetRuns, bundle.controlRun]) {
-      validateRunEvidence(run, `${run.mode} run`);
-    }
-    assertEvidenceDifferential(bundle);
-    if (!bundle.callbackVerified?.attempted) {
-      for (const run of bundle.targetRuns) {
-        const bindingError = verifyUrlBindingError(run.evidence.verify.url, targetRunTarget);
-        if (bindingError) throw new Error(`TARGET BINDING FAILED: ${bindingError}`);
-      }
-      const controlBindingError = verifyUrlBindingError(
-        bundle.controlRun.evidence.verify.url,
-        bundle.controlTarget,
-      );
-      if (controlBindingError) {
-        throw new Error(`CONTROL BINDING FAILED: ${controlBindingError}`);
-      }
-    }
-    // A clean exit and model-authored evidence are necessary inputs, never the
-    // proof. Promotion requires a harness-observed target/control differential
-    // or a harness-owned OOB interaction differential.
-    assertMachineConfirmation(bundle);
-
-    const next = buildRecord({ pendingConfirmation: bundle }, current);
-    validateCase(next);
-    upsertCase(db, next);
-    return next;
-  });
-}
-
-/**
- * Phase 2: commit (or refuse) the promotion on the main agent's verdict.
- *
- * CONFIRMED requires the full bundle to still hold (completion, nonce,
- * determinism, differential), the PoC script to be unchanged since the runs
- * (pocSha256 — otherwise the main agent reviewed different bytes), and a
- * verdict accompanied by a fresh harness-owned target-only replay, a concrete
- * review note, and a disconfirmation attempt. NOT_CONFIRMED records the
- * verdict and keeps the case investigating — no tie-breaker.
- */
-export function applyConfirmationResult(
-  id: string,
-  verdictInput: MainAgentVerdict,
-  phase2Verification?: MainAgentVerification,
-  authority: { startedAsSubagent: boolean } = {
-    startedAsSubagent: PROCESS_STARTED_AS_SUBAGENT || process.env.PI_SUBAGENT_CHILD === "1",
-  },
-): CaseUpdateResult {
-  if (authority.startedAsSubagent) {
-    throw new Error(
-      "ConfirmFinding is reserved for the main/coordinator agent; worker processes cannot commit confirmation",
-    );
-  }
-  const db = getDb();
-  return withImmediateTransaction(db, () => {
-    const current = getCaseById(id);
-    if (!current) throw new Error(`Case not found: ${id}`);
-    if (current.status !== "investigating") {
-      throw new Error(`ConfirmFinding requires an investigating case (current: ${current.status})`);
-    }
-    const bundle = current.pendingConfirmation;
-    if (!bundle) {
-      throw new Error("No pending confirmation on this case — run PromoteFinding first");
-    }
-    // Fail closed on an unparseable ranAt: Date.parse(garbage) is NaN, and
-    // NaN > TTL is false — a malformed timestamp must NOT make the bundle
-    // immortal. Treat it as expired (re-run PromoteFinding for a fresh one).
-    const ranAtMs = Date.parse(bundle.ranAt);
-    if (!Number.isFinite(ranAtMs) || Date.now() - ranAtMs > PENDING_CONFIRM_TTL_MS) {
-      throw new Error(
-        "Pending confirmation expired or has an invalid timestamp (1h TTL) — re-run PromoteFinding for a fresh bundle",
-      );
-    }
-    const parsed = validateMainAgentVerdict(verdictInput);
-    if (!parsed.ok) throw new Error(`Invalid main-agent confirmation verdict: ${parsed.error}`);
-    const verdict = parsed.verdict;
-    const canaryRequested = bundle.targetRuns[0].evidence.verify.canary !== undefined;
-    if (verdict.verdict === "CONFIRMED") {
-      if (canaryRequested && verdict.canary_assessment !== "verified") {
-        throw new Error(
-          "CONFIRMED canary mismatch: evidence requested a harness canary, so canary_assessment must be verified",
-        );
-      }
-      if (!canaryRequested && verdict.canary_assessment !== "not_applicable") {
-        throw new Error(
-          "CONFIRMED canary mismatch: this evidence has no canary template; record canary_assessment=not_applicable and explain why",
-        );
-      }
-    }
-    const recorded: MainAgentVerdictRecord = {
-      ...verdict,
-      at: new Date().toISOString(),
-      reviewer: "main_agent",
-      phase2Verification: verdict.verdict === "CONFIRMED" ? phase2Verification : undefined,
-      proofStrength:
-        verdict.verdict === "CONFIRMED"
-          ? canaryRequested
-            ? "canary_differential"
-            : "predicate_differential"
-          : undefined,
-    };
-
-    if (verdict.verdict === "NOT_CONFIRMED") {
-      const note = `main agent NOT_CONFIRMED${verdict.model ? ` (${verdict.model})` : ""}: ${verdict.reasoning}`;
-      const next = buildRecord(
-        {
-          confirmerVerdict: recorded,
-          pendingConfirmation: undefined,
-          assumptions: [...(current.assumptions ?? []), note],
-        },
-        current,
-      );
-      // buildRecord's nullish fallback preserves the old value; consume the
-      // rejected attempt explicitly so a retry must produce fresh evidence.
-      next.pendingConfirmation = undefined;
-      validateCase(next);
-      upsertCase(db, next);
-      return { record: next, changed: true };
-    }
-
-    // CONFIRMED — re-validate the whole bundle (defense in depth; the case may
-    // have been touched between phase 1 and the verdict).
-    const isIntra = bundle.mode === "intra_target";
-    const allRuns = isIntra
-      ? [...bundle.targetRuns]
-      : [...bundle.targetRuns, ...(bundle.controlRun ? [bundle.controlRun] : [])];
-    for (const run of allRuns) {
-      validateRunEvidence(run, `${run.mode} run`);
-    }
-    assertEvidenceDifferential(bundle, isIntra);
-    assertMachineConfirmation(bundle);
-    assertHarnessCanary(bundle.harnessVerified, canaryRequested, "PHASE-1 CANARY FAILED");
-    let pocHash: string | undefined;
-    try {
-      pocHash = createHash("sha256").update(readFileSync(bundle.pocPath)).digest("hex");
-    } catch {
-      pocHash = undefined;
-    }
-    if (!pocHash || pocHash !== bundle.pocSha256) {
-      throw new Error(
-        "PoC script changed since the runs — re-run PromoteFinding (the main agent must review the exact bytes that ran)",
-      );
-    }
-    // The case target must still be the host the PoC ran against, and still
-    // differ from the control target. The evidence proves nothing about a
-    // target the case adopted after the runs.
-    const targetRun = bundle.targetRuns[0];
-    if (!current.target || current.target !== targetRun.target) {
-      throw new Error(
-        "Case target changed since the PoC runs — re-run PromoteFinding against the current target " +
-          `(bundle target: ${targetRun.target}, case target: ${current.target ?? "(none)"}).`,
-      );
-    }
-    if (!isIntra && current.target === bundle.controlTarget) {
-      throw new Error(
-        "Case target now equals the control target — the claimed impact is not target-dependent; " +
-          "re-run PromoteFinding with a distinct control_target.",
-      );
-    }
-
-    // The observation must predate the repro (provenance guard).
-    const observation = current.evidenceItems.find((e) => e.role === "observation" && e.sha256);
-    if (observation && observation.createdAt > bundle.targetRuns[0].ranAt) {
-      throw new Error(
-        "Evidence chain invalid: the observation item was recorded after the PoC ran " +
-          `(${observation.createdAt} > ${bundle.targetRuns[0].ranAt}). The observation must predate the repro.`,
-      );
-    }
-
-    // Phase 1 proves the evidence floor. Phase 2 must freshly replay that same
-    // request inside the main agent's ConfirmFinding call; a caller-provided
-    // boolean is not accepted as proof of re-execution.
-    assertMainAgentVerification(bundle, phase2Verification, isIntra);
-
-    const reproductionItem: EvidenceItem = {
-      id: `ev_${stableShortId(`${id}\nreproduction\n${targetRun.ranAt}`)}`,
-      caseId: id,
-      role: "reproduction",
-      // The runner preserves each run's evidence.json in a durable dir
-      // (.pi/poc-evidence/) — the artifact the hash was computed over still
-      // exists, so the item stays artifact-backed and re-verifiable.
-      artifactPath: targetRun.evidencePath ? basename(targetRun.evidencePath) : "evidence.json",
-      sha256: targetRun.evidenceSha256,
-      summary: `PoC evidence accepted (2 target runs + ${isIntra ? "same-host baseline" : "control"}; ${recorded.proofStrength}) — main agent semantic confirmation${verdict.model ? ` (${verdict.model})` : ""}`,
-      createdAt: targetRun.ranAt,
-    };
-
-    const newEvidence =
-      (current.evidence ? `${current.evidence}\n\n` : "") +
-      `### PoC Execution Capture (${targetRun.ranAt})\n` +
-      `- **Evidence sha256:** ${targetRun.evidenceSha256}\n` +
-      `- **Target:** ${targetRun.target}\n` +
-      `- **Machine evidence:** ${recorded.proofStrength} (a differential is not by itself proof of exploitation)\n` +
-      `- **Main-agent reviewer:** ${verdict.model ?? "unknown model"} — semantic confirmation\n` +
-      `#### Target Run Output\n\`\`\`\n${targetRun.output ?? ""}\n\`\`\``;
-
-    const update: NormalizedCaseInput = {
-      status: "confirmed",
-      pocVerified: {
-        path: bundle.pocPath,
-        exitCode: targetRun.exitCode,
-        ranAt: targetRun.ranAt,
-        output: targetRun.output,
-        sandbox: targetRun.sandbox,
-        completed: true,
-        outputComplete: true,
-        mode: "poc",
-        target: targetRun.target,
-      },
-      controlVerified:
-        isIntra || !bundle.controlRun
-          ? {
-              path: bundle.pocPath,
-              exitCode: targetRun.exitCode,
-              ranAt: targetRun.ranAt,
-              output: `intra-target baseline (same host): ${bundle.harnessVerified?.control?.note ?? "baseline did not satisfy the attack predicate"}`,
-              sandbox: targetRun.sandbox,
-              completed: true,
-              outputComplete: true,
-              mode: "baseline",
-              target: targetRun.target,
-            }
-          : {
-              path: bundle.controlPath ?? bundle.pocPath,
-              exitCode: bundle.controlRun.exitCode,
-              ranAt: bundle.controlRun.ranAt,
-              output: bundle.controlRun.output,
-              sandbox: bundle.controlRun.sandbox,
-              completed: true,
-              outputComplete: true,
-              mode: "control",
-              target: bundle.controlRun.target,
-            },
-      disconfirmation: verdict.disconfirmation_attempt,
-      confirmerVerdict: recorded,
-      pendingConfirmation: undefined,
-      evidence: newEvidence,
-    };
-
-    const next = buildRecord(update, current);
-    next.pendingConfirmation = undefined; // buildRecord's ?? existing keeps it; clear explicitly
-    validateCase(next);
-    insertEvidenceItem(db, reproductionItem);
-    upsertCase(db, next);
-    next.evidenceItems = [...(next.evidenceItems ?? []), reproductionItem];
-    return { record: next, changed: true };
-  });
-}
-
-// ── Chain suggestions ───────────────────────────────────────────────
-
-/** Automated exploit-chain patterns (ported shape from CyberStrike chain.ts). */
-const CHAIN_PATTERN_VALUES = [
-  "credential_endpoint",
-  "info_disclosure_ssrf",
-  "redirect_oauth",
-  "idor_data_leak",
-  "xss_csrf",
-  "ssti_rce",
-  "race_condition_business",
-] as const;
-export type ChainPattern = (typeof CHAIN_PATTERN_VALUES)[number];
-
-export type ChainSuggestion = {
-  pattern: ChainPattern;
-  sourceId: string;
-  targetId?: string;
-  sourceTitle: string;
-  targetTitle?: string;
-  rationale: string;
-  confidence: number;
-  /** Suggested CaseLink kind when the agent links the pair. */
-  suggestedKind?: CaseLinkKind;
-};
-
-// Word-boundary anchored so "admin" does not match "administration" and
-// "update" does not match "updated" — substring matching over-mines pairs.
-const CHAIN_CLASS_RE = {
-  credential: /\b(credential|password|api[ -]?key|token|secret|leak|dump|exposure)\b/i,
-  authEndpoint: /\b(auth|login|sso|signup|account|admin|endpoint|api)\b/i,
-  redirect: /\b(open redirect|redirect)\b/i,
-  oauth: /\b(oauth|callback|redirect_uri|sso|saml|openid|authorize)\b/i,
-  xss: /\b(xss|cross-?site.?script)\b/i,
-  stateChange:
-    /\b(POST|PUT|DELETE|PATCH|create|update|delete|transfer|payment|invite|admin|state.?chang)\b/i,
-  idor: /\b(idor|bola|object reference|broken access)\b/i,
-  userData:
-    /\b(user|users|profile|account|accounts|email|phone|address|personal|private|settings|data)\b/i,
-  ssti: /\b(ssti|template injection|template render)\b/i,
-  race: /\b(race|toctou|concurrent)\b/i,
-  payment: /\b(payment|transfer|order|checkout|cart|purchase|balance|credit|withdraw|deposit)\b/i,
-  infoDisclosure: /\b(info disclosure|information disclosure|leak|exposure|debug)\b/i,
-  ssrf: /\b(ssrf|server-?side request)\b/i,
-} satisfies Record<string, RegExp>;
-
-/** Multi-label second-level suffixes — *.co.uk must not false-pair via last-2 labels. */
-const SECOND_LEVEL_SUFFIXES = new Set([
-  "co",
-  "com",
-  "org",
-  "net",
-  "gov",
-  "ac",
-  "edu",
-  "mil",
-  "ltd",
-  "me",
-  "tv",
-  "info",
-  "biz",
-]);
-
-function eTLDPlus1(host: string): string {
-  const parts = host.split(".");
-  if (parts.length >= 3 && SECOND_LEVEL_SUFFIXES.has(parts[parts.length - 2] ?? "")) {
-    return parts.slice(-3).join(".");
-  }
-  return parts.slice(-2).join(".");
-}
-
-/**
- * Ruled-out phrasings that must not contribute to chain matching. Sentence
- * granularity keeps the positive signals intact: "no CSRF token on /transfer"
- * (a reason XSS→state-change chains) is NOT dropped — only explicit
- * "this class is not a finding" sentences are.
- */
-const CHAIN_NEGATION_RE =
-  /\b(not vulnerable|not susceptible|not exploitable|not present|not found|not affected|ruled out|no vulnerability|no vuln|no evidence of|absence of|false positive|not a finding|no issue found|dismissed|non-?vulnerable|not reachable)\b/i;
-
-function chainText(c: CaseRecord): string {
-  const raw = [c.title, c.bugClass ?? "", c.evidence ?? ""].join(" ");
-  return raw
-    .split(/[.;\n]+/)
-    .filter((s) => !CHAIN_NEGATION_RE.test(s))
-    .join(" ");
-}
-
-function hasChainClass(c: CaseRecord, re: RegExp): boolean {
-  return re.test(chainText(c));
-}
-
-/** Reduce a target string to a bare hostname (strip scheme, port, path). */
-function normalizeTargetHost(target: string): string {
-  let h = target
-    .toLowerCase()
-    .trim()
-    .replace(/^[a-z][a-z0-9+.-]*:\/\//, "");
-  h = h.split("?")[0].split("/")[0].split(":")[0];
-  return h.trim();
-}
-
-/** Same asset or related (same eTLD+1) — chains only pair cases on one target. */
-function sameAssetOrRelated(a: CaseRecord, b: CaseRecord): boolean {
-  const ta = normalizeTargetHost(a.target ?? "");
-  const tb = normalizeTargetHost(b.target ?? "");
-  if (!ta || !tb) return false;
-  if (ta === tb) return true;
-  // Subdomain relation requires a label boundary: "api.example.com" vs
-  // "example.com" pair, but "myshop.io" vs "shop.io" do NOT — a bare
-  // substring check pairs unrelated targets whose names merely overlap.
-  if (ta.endsWith(`.${tb}`) || tb.endsWith(`.${ta}`)) return true;
-  return eTLDPlus1(ta) === eTLDPlus1(tb);
-}
-
-export function suggestChains(caseId?: string): ChainSuggestion[] {
-  // Pair over ALL non-terminal cases; the caseId filter narrows the RESULTS
-  // to suggestions involving that case (filtering the inputs first would drop
-  // unlinked partner cases and kill cross-case pairing).
-  const cases = readCasefile().filter((c) => c.status !== "killed" && c.status !== "reported");
-  // Already-linked pairs are existing knowledge, not a missed combination —
-  // suggesting them again is noise. One query for every link row.
-  const linkedPairs = new Set<string>();
-  const linkRows = getDb().prepare("SELECT source_id, target_id FROM case_links").all() as {
-    source_id: string;
-    target_id: string;
-  }[];
-  for (const row of linkRows) linkedPairs.add([row.source_id, row.target_id].sort().join("+"));
-  const suggestions: ChainSuggestion[] = [];
-  const seen = new Set<string>();
-  const confirmed = (c: CaseRecord) => c.status === "confirmed";
-  const confidenceFor = (a: CaseRecord, b?: CaseRecord) => {
-    const both = confirmed(a) && (!b || confirmed(b));
-    const one = confirmed(a) || (b ? confirmed(b) : false);
-    const anyHypothesis = a.status === "hypothesis" || (b ? b.status === "hypothesis" : false);
-    if (both) return 90;
-    if (anyHypothesis) return 40; // unproven primitives chain weakly
-    return one ? 75 : 60;
-  };
-  const add = (
-    pattern: ChainPattern,
-    a: CaseRecord,
-    b: CaseRecord | undefined,
-    rationale: string,
-    kind?: CaseLinkKind,
-  ) => {
-    if (b && linkedPairs.has([a.id, b.id].sort().join("+"))) return; // already known
-    const key = b ? `${pattern}:${[a.id, b.id].sort().join("+")}` : `${pattern}:${a.id}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    suggestions.push({
-      pattern,
-      sourceId: a.id,
-      targetId: b?.id,
-      sourceTitle: a.title,
-      targetTitle: b?.title,
-      rationale,
-      confidence: confidenceFor(a, b),
-      suggestedKind: kind,
-    });
-  };
-
-  // Pair rules as data: (classifier A, classifier B, rationale, link kind).
-  // One loop replaces seven copy-pasted pair loops.
-  const PAIR_RULES: Array<{
-    pattern: Exclude<ChainPattern, "ssti_rce">;
-    a: RegExp;
-    b: RegExp;
-    rationale: (a: CaseRecord, b: CaseRecord) => string;
-    kind?: CaseLinkKind;
-  }> = [
-    {
-      pattern: "credential_endpoint",
-      a: CHAIN_CLASS_RE.credential,
-      b: CHAIN_CLASS_RE.authEndpoint,
-      kind: "depends-on",
-      rationale: (a, b) =>
-        `Use leaked credential "${a.title}" to authenticate against "${b.title}" → account takeover`,
-    },
-    {
-      pattern: "redirect_oauth",
-      a: CHAIN_CLASS_RE.redirect,
-      b: CHAIN_CLASS_RE.oauth,
-      rationale: (a, b) =>
-        `Chain open redirect "${a.title}" into OAuth flow "${b.title}" to steal access tokens`,
-    },
-    {
-      pattern: "xss_csrf",
-      a: CHAIN_CLASS_RE.xss,
-      b: CHAIN_CLASS_RE.stateChange,
-      rationale: (a, b) =>
-        `Use XSS "${a.title}" to drive state-changing "${b.title}" (CSRF bypass / victim-action)`,
-    },
-    {
-      pattern: "idor_data_leak",
-      a: CHAIN_CLASS_RE.idor,
-      b: CHAIN_CLASS_RE.userData,
-      rationale: (a, b) => `Use IDOR "${a.title}" to enumerate user data via "${b.title}"`,
-    },
-    {
-      pattern: "race_condition_business",
-      a: CHAIN_CLASS_RE.race,
-      b: CHAIN_CLASS_RE.payment,
-      rationale: (a, b) =>
-        `Use race condition "${a.title}" on financial endpoint "${b.title}" (double-spend / bypass)`,
-    },
-    {
-      pattern: "info_disclosure_ssrf",
-      a: CHAIN_CLASS_RE.infoDisclosure,
-      b: CHAIN_CLASS_RE.ssrf,
-      rationale: (a, b) =>
-        `Use internal URL/config from "${a.title}" as SSRF target via "${b.title}"`,
-    },
-  ];
-
-  for (const rule of PAIR_RULES) {
-    const aCases = cases.filter((c) => rule.a.test(chainText(c)));
-    const bCases = cases.filter((c) => rule.b.test(chainText(c)));
-    for (const a of aCases) {
-      for (const b of bCases) {
-        if (a.id === b.id || !sameAssetOrRelated(a, b)) continue;
-        add(rule.pattern, a, b, rule.rationale(a, b), rule.kind);
-      }
-    }
-  }
-
-  // SSTI → RCE (single-case escalation)
-  for (const s of cases.filter((c) => hasChainClass(c, CHAIN_CLASS_RE.ssti))) {
-    add("ssti_rce", s, undefined, `Escalate SSTI "${s.title}" to RCE via template-engine gadgets`);
-  }
-
-  const scoped = caseId
-    ? suggestions.filter((s) => s.sourceId === caseId || s.targetId === caseId)
-    : suggestions;
-  return scoped.sort((a, b) => b.confidence - a.confidence);
 }
 
 // ── Link operations ──────────────────────────────────────────────────

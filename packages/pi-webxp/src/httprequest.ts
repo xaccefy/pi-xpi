@@ -18,8 +18,10 @@ import {
 } from "./network-safety.ts";
 
 const DEFAULT_TIMEOUT_MS = 30000;
-const DEFAULT_MAX_BODY = 262144;
-const MAX_BODY_HARD = 2_000_000;
+// Response capture caps shared with rawhttp.ts (same package, same concept:
+// max bytes held in memory per response).
+export const DEFAULT_MAX_BODY = 262_144;
+export const MAX_BODY_HARD = 2_000_000;
 const MAX_REDIRECTS = 10;
 
 const METHOD_LIST = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"];
@@ -133,14 +135,57 @@ function origin(url: URL): string {
   return `${url.protocol}//${url.host}`;
 }
 
+// ── Named sessions (multi-identity testing) ──────────────────────────
+
+const DEFAULT_SESSION = "default";
+const MAX_SESSION_NAME_CHARS = 64;
+const MAX_SESSIONS = 32;
+const SESSION_NAME_RE = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * Validate and normalize a session name. Named jars let the agent hold
+ * several authenticated identities at once (attacker vs victim for IDOR /
+ * privilege-escalation differentials) without one login destroying the
+ * other's state.
+ */
+function normalizeSessionName(name: unknown): string {
+  if (name === undefined || name === null || name === "") return DEFAULT_SESSION;
+  if (typeof name !== "string") throw new Error("session must be a string");
+  const trimmed = name.trim();
+  if (!trimmed) return DEFAULT_SESSION;
+  if (trimmed.length > MAX_SESSION_NAME_CHARS) {
+    throw new Error(`session name too long (max ${MAX_SESSION_NAME_CHARS} characters)`);
+  }
+  if (!SESSION_NAME_RE.test(trimmed)) {
+    throw new Error(
+      `invalid session name "${trimmed}": use letters, digits, dot, underscore, or dash`,
+    );
+  }
+  return trimmed;
+}
+
 export default function httpRequestExtension(pi: ExtensionAPI) {
-  const jar = new CookieJar();
+  // One jar per named identity. The default jar keeps the historical single-
+  // session behavior exactly: process-lifetime, cleared on session_shutdown.
+  const jars = new Map<string, CookieJar>();
+
+  function jarFor(name: string): CookieJar {
+    let jar = jars.get(name);
+    if (!jar) {
+      if (jars.size >= MAX_SESSIONS) {
+        throw new Error(`too many named sessions (max ${MAX_SESSIONS})`);
+      }
+      jar = new CookieJar();
+      jars.set(name, jar);
+    }
+    return jar;
+  }
 
   pi.registerTool({
     name: "http_request",
     label: "HTTP Request",
     description:
-      "Send a raw HTTP request with a persistent cookie jar, custom headers, and body control. Use for authenticated web-app testing (login → probe), API vulnerability probing, and verifying HTTP behavior. Unlike web_fetch (stateless, read-only), http_request persists cookies across calls within a session, supports all methods, and surfaces raw responses.",
+      "Send a raw HTTP request with a persistent cookie jar, custom headers, and body control. Use for authenticated web-app testing (login → probe), API vulnerability probing, and verifying HTTP behavior. Unlike web_fetch (stateless, read-only), http_request persists cookies across calls within a session, supports all methods, and surfaces raw responses. Runtime note: on Bun + HTTPS, DNS is validated pre-flight only — a rebinding resolver could still reach a private address at connect time (Node pins at connect time; see network-safety.ts).",
     promptSnippet: "Send HTTP requests with cookies, headers, and body control",
     promptGuidelines: [
       "Use http_request for authenticated web-app testing: POST to login, then GET protected resources — the cookie jar persists across calls automatically.",
@@ -149,12 +194,19 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
       "Private/internal hosts (127.0.0.1, 10.x, 192.168.x, fc00::/7) are blocked by default. Set allowPrivateHosts=true for internal pentest targets.",
       "Use verifyTls=false for self-signed cert targets (e.g., internal staging apps). TLS verification is enabled by default.",
       "Set-Cookie is stored with RFC cookie scope. Explicit Cookie applies only to the first request; redirects use jar cookies for the new URL.",
+      "Use session:'attacker' and session:'victim' to hold two authenticated identities at once — replay a victim object URL under the attacker session to prove IDOR/access-control bugs without losing either login.",
       "Pass an Authorization header (e.g. headers: { Authorization: 'Basic <base64>' }) for Basic auth — the http_request tool does not store credentials itself, keeping auth explicit and visible in the transcript.",
       "Prefer http_request over web_fetch when you need custom methods, auth headers, cookie-dependent auth flows, or raw response headers. Use web_fetch for read-only page content when you don't need session state.",
     ],
     parameters: Type.Object(
       {
         url: Type.String({ description: "Target URL (http:// or https://)" }),
+        session: Type.Optional(
+          Type.String({
+            description:
+              "Named cookie-jar session, e.g. 'attacker' or 'victim'. Jars persist independently per name within this agent session; omit for the default jar.",
+          }),
+        ),
         method: Type.Optional(HttpMethod),
         headers: Type.Optional(
           Type.Record(Type.String(), Type.String(), {
@@ -210,6 +262,8 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
 
     async execute(_id, params, signal, _onUpdate, _ctx) {
       const parsed = new URL(params.url as string);
+      const sessionName = normalizeSessionName(params.session);
+      const jar = jarFor(sessionName);
       const allowPrivateHosts = params.allowPrivateHosts === true;
       const verifyTls = params.verifyTls !== false;
       assertPublicHttpUrl(parsed, allowPrivateHosts);
@@ -235,13 +289,21 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
         setHeader(baseHeaders, "Content-Type", params.contentType);
 
       let body: string | undefined;
+      let droppedBodyNote: string | undefined;
       if (params.json !== undefined) {
-        body = JSON.stringify(params.json);
-        if (!hasHeader(baseHeaders, "content-type"))
-          setHeader(baseHeaders, "Content-Type", "application/json");
+        if (method === "GET" || method === "HEAD") {
+          droppedBodyNote = `json ignored: ${method} requests cannot carry a body (JSON payload dropped)`;
+        } else {
+          body = JSON.stringify(params.json);
+          if (!hasHeader(baseHeaders, "content-type"))
+            setHeader(baseHeaders, "Content-Type", "application/json");
+        }
       } else if (params.body !== undefined && method !== "GET" && method !== "HEAD") {
         body = params.body as string;
+      } else if (params.body !== undefined) {
+        droppedBodyNote = `body ignored: ${method} requests cannot carry one`;
       }
+      if (droppedBodyNote) baseHeaders["X-PI-Note"] = droppedBodyNote;
 
       const dispatcher = createSafeDispatcher({ allowPrivateHosts, verifyTls });
       try {
@@ -359,7 +421,7 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
             timingMs,
             cookiesOnHost,
             cookiesInResponse,
-            session: "default",
+            session: sessionName,
           },
         };
       } catch (err) {
@@ -413,6 +475,7 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", () => {
-    jar.removeAllCookiesSync();
+    for (const jar of jars.values()) jar.removeAllCookiesSync();
+    jars.clear();
   });
 }

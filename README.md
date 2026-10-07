@@ -15,8 +15,9 @@
 XPI turns the Pi agent into a security researcher: a case ledger with enforced gates, real exploit-technique grounding, web lookup, fast code search, and a pipeline that keeps findings honest.
 
 - **Casefile** — hypothesis → investigating → confirmed → reported, with gates at every step
-- **Machine-owned PoC gates** — zero exit is necessary but never proof: direct-response findings require nonce-bound body evidence plus a DNS-pinned, conclusive `target_only` replay against an operator-approved control; reflection-capable requests can add a harness-generated target-only canary; only the main agent may make the semantic decision and commit phase 2
-- **Exploit chains** — `ChainSuggest` surfaces combinations the model missed
+- **Attack transport** — byte-exact `raw_request` (smuggling/desync probes), last-byte-sync `race_send` (batch-release race exploitation; judge sync by the reported spread), multi-identity sessions, local JWT attack forging
+- **Machine-owned PoC gates** — zero exit is necessary but never proof: direct-response findings require nonce-bound body evidence plus a DNS-pinned, conclusive `target_only` replay against an operator-approved control; reflection-capable requests can add a harness-generated target-only canary; blind/OOB classes confirm through an operator-run oracle with per-run tokens and source-separation attestation; only the main agent may make the semantic decision and commit phase 2
+- **Exploit chains** — `ChainSuggest` surfaces combinations the model missed; `Primitive` tracks credentials/tokens/sessions as reusable ammunition; `Objective` keeps the kill chain moving
 - **Coverage matrix** — machine-checkable "we tested everything" claims
 - **Code search** — structural AST search (ast-grep) for sinks and call chains, plus built-in grep/find for text
 

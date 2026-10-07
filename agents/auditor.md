@@ -76,6 +76,8 @@ subsystem: user-management
 
 Then `CaseAdd(title: "<short>", status: hypothesis, endpoint, bugClass, target, evidence, disproveIf)`. **`disproveIf` is REQUIRED** — name the falsification conditions (what would disprove this lead, e.g. `["the input is parameterized before the query", "the ORM escapes this call site"]`). **Do NOT set severity** — you haven't proven exploitability. Set `confidence` (how likely the lead is real); severity is assigned by the main agent after a PoC passes the gate.
 
+**If the finding leaks reusable material (credential, token, session, endpoint, payload), also `Primitive({action:"add", kind:"<credential|token|session|endpoint|payload>", label:"<short>", value_ref:"<env|file|hash>", capabilities:"<what it grants>", case_ids:["<new-case-id>"]})`** — store a REFERENCE, never the live secret. Link the producing case; `ChainSuggest` will later pair it with auth surfaces for chaining (e.g., leaked cred → login, SSRF → internal, JWT → admin). This is how XBOW's LFI+upload and sqli→dump chains are won.
+
 ### Step 6: Coverage log
 
 Emit a per-entry-point coverage log — the coordinator uses it to re-queue your class:

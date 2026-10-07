@@ -14,17 +14,29 @@ The pipeline-run case ID comes from the coordinator. Read it for target scope + 
 
 ### Identify chains
 
-Look for findings where one finding enables or escalates another:
+Look for findings where one finding enables or escalates another (auto ChainSuggest covers the XBOW 104 taxonomy — your job is to validate and Narrate):
 
-| Pattern | Example |
-|---------|---------|
-| **Info leak → auth bypass** | Leaked internal path/API key enables access to restricted endpoint |
-| **Info leak → IDOR** | Leaked user ID enables IDOR against that user |
-| **XSS → CSRF bypass** | XSS + missing CSRF token = full account takeover |
-| **Path traversal → RCE** | File read becomes file write through log injection |
-| **SSRF → internal service** | SSRF to internal admin endpoint |
-| **SQLi → auth bypass** | Extract credentials then authenticate as another user |
-| **IDOR → privilege escalation** | Access another user's data then use their privileges |
+| Pattern | Example | XBOW tags |
+|---------|---------|-----------|
+| **Info leak → auth bypass** | Leaked internal path/API key enables access to restricted endpoint | `credential` + `authEndpoint` |
+| **Info leak → IDOR** | Leaked user ID enables IDOR against that user | `idor` + `userData` |
+| **XSS → CSRF bypass** | XSS + missing CSRF token = full account takeover | `xss` + `stateChange` |
+| **Path traversal → RCE** | File read becomes file write through log injection | `lfi` + `fileUpload` → `commandInjection` |
+| **SSRF → internal service** | SSRF to internal admin endpoint | `ssrf` + `commandInjection` |
+| **SQLi → auth bypass / credential dump** | Extract credentials then authenticate as another user; also SQLi → file-upload pivot | `sqli` + `credential` / `sqli` + `fileUpload` |
+| **IDOR → privilege escalation** | Access another user's data then use their privileges | `idor` + `businessLogic` |
+| **SSRF → internal pivot** | SSRF to internal metadata / admin RCE | `ssrf` + `commandInjection` |
+| **LFI + upload → RCE** | Poison log / inclusion via uploaded shell | `lfi` + `fileUpload` |
+| **JWT → privilege escalation** | `alg:none` / `kid` injection → admin | `jwt` + `businessLogic` |
+| **GraphQL → SQLi / IDOR** | GraphQL introspection drives SQLi/IDOR | `graphql` + `sqli`/`idor` |
+| **Deserialization → RCE** | Pickle/YAML gadget chain | `deserialization` (single) |
+| **XXE → file read** | XXE reads `/flag` / cloud creds | `xxe` (single) |
+| **Business-logic → privilege** | Price tampering / mass assignment → admin | `businessLogic` + `authEndpoint` |
+| **Upload → RCE** | Webshell upload → code exec | `fileUpload` + `commandInjection` |
+| **Crypto → auth bypass** | Weak hash / JWT brute force → login bypass | `crypto` + `authEndpoint` |
+| **Primitive reuse** | Leaked `token`/`session` from one case used against another's auth surface | `primitive_use` (any `credential`/`token`/`session` primitive) |
+
+Also check `Primitive` objects — a `Primitive` (credential/token/session) produced by one case and usable against another's `authEndpoint` is a chain even without title regex overlap. `ChainSuggest` already mines these; you verify reachability.
 
 Check if any finding combines with known unpatched CVEs in the target: `exploit_search(query="<target tech> known CVE exploit")`.
 

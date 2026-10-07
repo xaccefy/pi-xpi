@@ -235,6 +235,132 @@ describe("pi-webxp: http_request", () => {
     assert.equal(protectedDetails.status, 200);
     assert.ok(protectedDetails.cookiesOnHost.includes("session=abc123"));
   });
+  // ── named sessions (multi-identity) ─────────────────────
+
+  it("keeps named session jars isolated from each other and from the default jar", async () => {
+    const tool = api.tools.find((t) => t.name === "http_request")!;
+
+    // Login as attacker (named jar) — sets session cookie in 'attacker' only.
+    await tool.execute(
+      "s1",
+      { url: "https://example.com/login", method: "POST", session: "attacker" },
+      null,
+      () => {},
+      {},
+    );
+
+    // Default jar must NOT have the attacker cookie.
+    const defaultResult = await tool.execute(
+      "s2",
+      { url: "https://example.com/protected" },
+      null,
+      () => {},
+      {},
+    );
+    assert.equal((defaultResult as any).details.session, "default");
+    assert.ok(
+      !((defaultResult as any).details.cookiesOnHost as string).includes("session=abc123"),
+      "default jar must not see attacker cookies",
+    );
+
+    // Victim jar must NOT have the attacker cookie either.
+    const victimResult = await tool.execute(
+      "s3",
+      { url: "https://example.com/protected", session: "victim" },
+      null,
+      () => {},
+      {},
+    );
+    assert.equal((victimResult as any).details.session, "victim");
+    assert.ok(
+      !((victimResult as any).details.cookiesOnHost as string).includes("session=abc123"),
+      "victim jar must not see attacker cookies",
+    );
+
+    // Attacker jar still holds its own cookie.
+    const attackerResult = await tool.execute(
+      "s4",
+      { url: "https://example.com/protected", session: "attacker" },
+      null,
+      () => {},
+      {},
+    );
+    assert.ok(
+      ((attackerResult as any).details.cookiesOnHost as string).includes("session=abc123"),
+      "attacker jar must persist its own cookie",
+    );
+  });
+
+  it("clears ALL named session jars on session_shutdown", async () => {
+    const tool = api.tools.find((t) => t.name === "http_request")!;
+
+    // Seed default jar
+    await tool.execute(
+      "c0",
+      { url: "https://example.com/login", method: "POST" },
+      null,
+      () => {},
+      {},
+    );
+    // Seed two named jars
+    await tool.execute(
+      "c1",
+      { url: "https://example.com/login", method: "POST", session: "attacker" },
+      null,
+      () => {},
+      {},
+    );
+    await tool.execute(
+      "c1b",
+      { url: "https://example.com/login", method: "POST", session: "victim" },
+      null,
+      () => {},
+      {},
+    );
+    await (api as any).emit("session_shutdown");
+
+    for (const sess of [undefined, "attacker", "victim"] as const) {
+      const result = await tool.execute(
+        "c2",
+        { url: "https://example.com/protected", ...(sess ? { session: sess } : {}) },
+        null,
+        () => {},
+        {},
+      );
+      assert.ok(
+        !((result as any).details.cookiesOnHost as string).includes("session="),
+        `jar ${sess ?? "default"} cleared on session_shutdown`,
+      );
+    }
+  });
+
+  it("rejects invalid session names and falls back to default for empty ones", async () => {
+    const tool = api.tools.find((t) => t.name === "http_request")!;
+
+    for (const bad of ["bad name", "a/b", "x".repeat(65)]) {
+      await assert.rejects(
+        tool.execute(
+          "b1",
+          { url: "https://example.com/protected", session: bad },
+          null,
+          () => {},
+          {},
+        ),
+        /invalid session name|too long/,
+      );
+    }
+
+    // Empty/whitespace names fall back to the default jar.
+    const r = await tool.execute(
+      "b2",
+      { url: "https://example.com/login", method: "POST", session: "   " },
+      null,
+      () => {},
+      {},
+    );
+    assert.equal((r as any).details.session, "default");
+  });
+
   it("clears the cookie jar on session_shutdown", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
 

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setHarnessFetchForTest } from "../src/harness-verify.ts";
 import { getCaseById, setCasefilePath } from "../src/ledger.ts";
+import { setOobOracleFetchForTest } from "../src/oob-oracle.ts";
 import { setScratchpadRoot } from "../src/scratchpad.ts";
 import {
   STATIC_CYBER_WORKFLOW,
@@ -207,7 +208,15 @@ afterEach(async () => {
   delete process.env.PI_POC_ALLOW_PRIVATE_REPLAY;
   delete process.env.PI_POC_CONTROL_TARGETS;
   delete process.env.PI_SUBAGENT_CHILD;
+  delete process.env.PI_OOB_ORACLE_URL;
+  delete process.env.PI_OOB_ORACLE_TOKEN;
+  delete process.env.PI_OOB_SOURCE_SEPARATED;
+  delete process.env.PI_OOB_SELF_IPS;
+  delete process.env.PI_OOB_POLL_MS;
+  delete process.env.PI_OOB_INTERVAL_MS;
+  delete process.env.PI_OOB_SETTLE_MS;
   setHarnessFetchForTest(undefined);
+  setOobOracleFetchForTest(undefined);
   globalThis.fetch = nativeFetch;
   await rm(tempDir, { recursive: true, force: true });
 });
@@ -231,7 +240,9 @@ describe("casefile extension", () => {
       "CoverageAdd",
       "CoverageReport",
       "EvidenceAdd",
+      "Objective",
       "PipelineSubmit",
+      "Primitive",
       "PromoteFinding",
       "ScratchpadCheckpoint",
       "ScratchpadClear",
@@ -378,7 +389,7 @@ describe("casefile extension", () => {
     expect(contextText).toContain("Linked Cases");
   });
 
-  test("PromoteFinding oob:true fails closed until callback source separation exists", async () => {
+  test("PromoteFinding oob:true fails closed without an operator-configured oracle", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
     const added = await addCase(pi, {
@@ -398,98 +409,356 @@ describe("casefile extension", () => {
       control_target: "https://control.example",
       oob: true,
     });
-    expect(phase1.content[0].text).toContain("source-separated");
-    expect(phase1.details.record.pendingConfirmation).toBeUndefined();
-  });
-
-  test("PromoteFinding rejects a poc-mode-only self-call without OOB source separation", async () => {
-    const pi = createFakePi();
-    casefileExtension(pi as any);
-    // PoC that calls the callback ONLY in poc mode — the target-run token must
-    // be hit; the control-run token must stay silent (mode-specific tokens).
-    const oobScript = join(tempDir, "oob.sh");
-    writeFileSync(
-      oobScript,
-      [
-        "#!/bin/sh",
-        'E="$PI_POC_EVIDENCE_DIR"',
-        'mkdir -p "$E"',
-        'if [ "$PI_POC_MODE" = "control" ]; then',
-        '  printf \'{"nonce":"%s","claim":"control lacks the vuln","verify":{"method":"GET","url":"http://localhost/read","expect":{"status":[403]}},"observations":[]}\' "$PI_POC_NONCE" > "$E/evidence.json"',
-        "  exit 0",
-        "fi",
-        'curl -s "$PI_POC_CALLBACK_URL" >/dev/null',
-        'printf \'{"nonce":"%s","claim":"blind SSRF fires","verify":{"method":"GET","url":"http://localhost/read","expect":{"status":[200]}},"observations":["callback sent"]}\' "$PI_POC_NONCE" > "$E/evidence.json"',
-        "exit 0",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    const added = await addCase(pi, {
-      title: "Blind SSRF",
-      status: "investigating",
-      evidence: "URL parameter fetched server-side",
-      confidence: "high",
-      severity: "high",
-      poc: "trigger callback to harness listener",
-      impact: "internal fetch",
-      target: "oob-app",
-    });
-    const phase1 = await executeTool(pi, "PromoteFinding", {
-      id: added.details.record.id,
-      poc_path: oobScript,
-      control_path: oobScript,
-      control_target: "https://control.example",
-      local: true,
-      oob: true,
-    });
     expect(phase1.isError).toBe(true);
-    expect(phase1.content[0].text).toContain("source-separated");
+    expect(phase1.content[0].text).toContain("PI_OOB_ORACLE_URL");
     expect(phase1.details.record.pendingConfirmation).toBeUndefined();
   });
 
-  test("PromoteFinding oob:true rejects a PoC that calls its own callback in both modes", async () => {
+  test("PromoteFinding oob:true records an honest oracle differential (target token only)", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
-    const oobScript = join(tempDir, "oob-cheat.sh");
-    writeFileSync(
-      oobScript,
-      [
-        "#!/bin/sh",
-        'E="$PI_POC_EVIDENCE_DIR"',
-        'mkdir -p "$E"',
-        'if [ "$PI_POC_MODE" = "control" ]; then',
-        '  curl -s "$PI_POC_CALLBACK_URL" >/dev/null',
-        '  printf \'{"nonce":"%s","claim":"control lacks the vuln","verify":{"method":"GET","url":"http://localhost/read","expect":{"status":[403]}},"observations":[]}\' "$PI_POC_NONCE" > "$E/evidence.json"',
-        "  exit 0",
-        "fi",
-        'curl -s "$PI_POC_CALLBACK_URL" >/dev/null',
-        'printf \'{"nonce":"%s","claim":"callback fired","verify":{"method":"GET","url":"http://localhost/read","expect":{"status":[200]}},"observations":[]}\' "$PI_POC_NONCE" > "$E/evidence.json"',
-        "exit 0",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    const added = await addCase(pi, {
-      title: "Cheating callback",
-      status: "investigating",
-      evidence: "suspected SSRF",
-      confidence: "high",
-      severity: "high",
-      poc: "curl callback unconditionally",
-      impact: "internal fetch",
-      target: "oob-app",
+    // Mock operator oracle: first-provisioned token = target run; the TARGET
+    // (and only the target) causes one interaction with it.
+    const provisioned: string[] = [];
+    setOobOracleFetchForTest(async (url: string, init?: RequestInit) => {
+      const u = new URL(url);
+      if (u.pathname === "/provision") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { token: string };
+        provisioned.push(body.token);
+        return new Response(JSON.stringify({ domain: `${body.token}.oob.test` }), { status: 200 });
+      }
+      if (u.pathname === "/interactions") {
+        const token = u.searchParams.get("token") ?? "";
+        const hits = token === provisioned[0] && !token.includes(provisioned[1] ?? "") ? 1 : 0;
+        const interactions = hits
+          ? [{ protocol: "dns", src_ip: "203.0.113.7", ts: new Date().toISOString(), raw: "" }]
+          : [];
+        return new Response(JSON.stringify({ interactions }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
     });
-    const phase1 = await executeTool(pi, "PromoteFinding", {
-      id: added.details.record.id,
-      poc_path: oobScript,
-      control_path: oobScript,
-      control_target: "https://control.example",
-      local: true,
-      oob: true,
+    process.env.PI_OOB_ORACLE_URL = "http://oob.test";
+    process.env.PI_OOB_SOURCE_SEPARATED = "1";
+    process.env.PI_OOB_POLL_MS = "600";
+    process.env.PI_OOB_INTERVAL_MS = "100";
+    process.env.PI_OOB_SETTLE_MS = "250";
+    try {
+      const added = await addCase(pi, {
+        title: "Blind SSRF honest",
+        status: "investigating",
+        evidence: "URL param fetched server-side",
+        confidence: "high",
+        severity: "high",
+        poc: "make target fetch callback domain",
+        impact: "internal fetch",
+        target: "oob-app",
+      });
+      const phase1 = await executeTool(pi, "PromoteFinding", {
+        id: added.details.record.id,
+        poc_path: pocScriptPath,
+        oob: true,
+      });
+      expect(phase1.isError).toBeUndefined();
+      const bundle = phase1.details.record.pendingConfirmation;
+      expect(bundle).toBeDefined();
+      expect(bundle.callbackVerified.attempted).toBe(true);
+      expect(bundle.callbackVerified.targetHits).toBe(1);
+      expect(bundle.callbackVerified.controlHits).toBe(0);
+      expect(bundle.callbackVerified.sourceSeparated).toBe(true);
+
+      // Phase 2 must NOT require a control target for OOB-only bundles — it
+      // re-polls the oracle freshly and commits on the same differential.
+      const confirm = await executeTool(pi, "ConfirmFinding", {
+        id: added.details.record.id,
+        verdict: {
+          verdict: "CONFIRMED",
+          reasoning: "oracle saw the target token only under attested source separation",
+          evidence_reviewed: ["poc"],
+          differential: "target_only",
+          re_execution_note: "fresh harness re-poll observed the same target-only differential",
+          disconfirmation_attempt:
+            "serial baseline and patched-control reasoning both fail to explain the callback",
+          canary_assessment: "not_applicable",
+          canary_reason: "the per-run OOB token IS the causality signal here",
+        },
+      });
+      expect(confirm.details.promoted).toBe(true);
+    } finally {
+      delete process.env.PI_OOB_ORACLE_URL;
+      delete process.env.PI_OOB_SOURCE_SEPARATED;
+      delete process.env.PI_OOB_POLL_MS;
+      delete process.env.PI_OOB_INTERVAL_MS;
+      delete process.env.PI_OOB_SETTLE_MS;
+      setOobOracleFetchForTest(undefined);
+    }
+  });
+
+  test("PromoteFinding oob:true rejects a bundle whose control token also fired", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+    // Cheating topology: BOTH tokens receive interactions — not target-dependent.
+    const provisioned: string[] = [];
+    setOobOracleFetchForTest(async (url: string, init?: RequestInit) => {
+      const u = new URL(url);
+      if (u.pathname === "/provision") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { token: string };
+        provisioned.push(body.token);
+        return new Response(JSON.stringify({ domain: `${body.token}.oob.test` }), { status: 200 });
+      }
+      if (u.pathname === "/interactions") {
+        return new Response(
+          JSON.stringify({
+            interactions: [{ protocol: "dns", src_ip: "203.0.113.7", ts: "", raw: "" }],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("not found", { status: 404 });
     });
-    expect(phase1.content[0].text).toContain("source-separated");
-    expect(phase1.details.record.pendingConfirmation).toBeUndefined();
+    process.env.PI_OOB_ORACLE_URL = "http://oob.test";
+    process.env.PI_OOB_SOURCE_SEPARATED = "1";
+    process.env.PI_OOB_POLL_MS = "600";
+    process.env.PI_OOB_INTERVAL_MS = "100";
+    process.env.PI_OOB_SETTLE_MS = "250";
+    try {
+      const added = await addCase(pi, {
+        title: "Cheating callback",
+        status: "investigating",
+        evidence: "suspected SSRF",
+        confidence: "high",
+        severity: "high",
+        poc: "curl callback unconditionally",
+        impact: "internal fetch",
+        target: "oob-app",
+      });
+      const phase1 = await executeTool(pi, "PromoteFinding", {
+        id: added.details.record.id,
+        poc_path: pocScriptPath,
+        oob: true,
+      });
+      // The gate rejects at store time: control-token interactions mean the
+      // callback is not target-dependent.
+      expect(phase1.isError).toBe(true);
+      expect(phase1.content[0].text).toContain("OOB VERIFY FAILED");
+      expect(phase1.content[0].text).toContain("not target-dependent");
+      expect(phase1.details.record.pendingConfirmation).toBeUndefined();
+    } finally {
+      for (const k of [
+        "PI_OOB_ORACLE_URL",
+        "PI_OOB_SOURCE_SEPARATED",
+        "PI_OOB_POLL_MS",
+        "PI_OOB_INTERVAL_MS",
+        "PI_OOB_SETTLE_MS",
+      ])
+        delete process.env[k];
+      setOobOracleFetchForTest(undefined);
+    }
+  });
+
+  test("OOB polling keeps watching after the first hit so delayed control hits are caught", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+    let pollCount = 0;
+    const provisioned: string[] = [];
+    setOobOracleFetchForTest(async (url: string, init?: RequestInit) => {
+      const u = new URL(url);
+      if (u.pathname === "/provision") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { token: string };
+        provisioned.push(body.token);
+        return new Response(JSON.stringify({ domain: `${body.token}.oob.test` }), { status: 200 });
+      }
+      if (u.pathname === "/interactions") {
+        pollCount += 1;
+        const token = u.searchParams.get("token") ?? "";
+        // Target token fires immediately; the CONTROL token only fires on a
+        // LATER poll — an early break would miss it and pass a cheater.
+        if (token === provisioned[0]) {
+          return new Response(
+            JSON.stringify({ interactions: [{ protocol: "dns", src_ip: "203.0.113.7" }] }),
+            { status: 200 },
+          );
+        }
+        const lateControl = pollCount >= 4;
+        return new Response(
+          JSON.stringify({
+            interactions: lateControl ? [{ protocol: "dns", src_ip: "203.0.113.9" }] : [],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    });
+    process.env.PI_OOB_ORACLE_URL = "http://oob.test";
+    process.env.PI_OOB_SOURCE_SEPARATED = "1";
+    process.env.PI_OOB_POLL_MS = "5000";
+    process.env.PI_OOB_INTERVAL_MS = "100";
+    process.env.PI_OOB_SETTLE_MS = "800";
+    try {
+      const added = await addCase(pi, {
+        title: "Late control hit",
+        status: "investigating",
+        evidence: "suspected SSRF",
+        confidence: "high",
+        severity: "high",
+        poc: "trigger",
+        impact: "fetch",
+        target: "oob-app",
+      });
+      const phase1 = await executeTool(pi, "PromoteFinding", {
+        id: added.details.record.id,
+        poc_path: pocScriptPath,
+        oob: true,
+      });
+      expect(phase1.isError).toBe(true);
+      expect(phase1.content[0].text).toContain("not target-dependent");
+    } finally {
+      for (const k of [
+        "PI_OOB_ORACLE_URL",
+        "PI_OOB_SOURCE_SEPARATED",
+        "PI_OOB_POLL_MS",
+        "PI_OOB_INTERVAL_MS",
+        "PI_OOB_SETTLE_MS",
+      ])
+        delete process.env[k];
+      setOobOracleFetchForTest(undefined);
+    }
+  }, 10_000);
+
+  test("unattributed interactions (missing src_ip) never count as target hits", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+    const provisioned: string[] = [];
+    setOobOracleFetchForTest(async (url: string, init?: RequestInit) => {
+      const u = new URL(url);
+      if (u.pathname === "/provision") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { token: string };
+        provisioned.push(body.token);
+        return new Response(JSON.stringify({ domain: `${body.token}.oob.test` }), { status: 200 });
+      }
+      if (u.pathname === "/interactions") {
+        const token = u.searchParams.get("token") ?? "";
+        // A fabricated-looking interaction with NO src_ip must be rejected.
+        const interactions =
+          token === provisioned[0] ? [{ protocol: "http", raw: "fabricated?" }] : [];
+        return new Response(JSON.stringify({ interactions }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    process.env.PI_OOB_ORACLE_URL = "http://oob.test";
+    process.env.PI_OOB_SOURCE_SEPARATED = "1";
+    process.env.PI_OOB_POLL_MS = "600";
+    process.env.PI_OOB_INTERVAL_MS = "100";
+    process.env.PI_OOB_SETTLE_MS = "250";
+    try {
+      const added = await addCase(pi, {
+        title: "Unattributed callback",
+        status: "investigating",
+        evidence: "suspected SSRF",
+        confidence: "high",
+        severity: "high",
+        poc: "trigger",
+        impact: "fetch",
+        target: "oob-app",
+      });
+      const phase1 = await executeTool(pi, "PromoteFinding", {
+        id: added.details.record.id,
+        poc_path: pocScriptPath,
+        oob: true,
+      });
+      expect(phase1.isError).toBe(true);
+      expect(phase1.content[0].text).toContain("no interaction with the target-run callback token");
+    } finally {
+      for (const k of [
+        "PI_OOB_ORACLE_URL",
+        "PI_OOB_SOURCE_SEPARATED",
+        "PI_OOB_POLL_MS",
+        "PI_OOB_INTERVAL_MS",
+        "PI_OOB_SETTLE_MS",
+      ])
+        delete process.env[k];
+      setOobOracleFetchForTest(undefined);
+    }
+  });
+
+  test("mode:'intra_target' combined with oob:true is rejected", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+    process.env.PI_OOB_ORACLE_URL = "http://oob.test";
+    try {
+      const added = await addCase(pi, {
+        title: "Intra OOB conflict",
+        status: "investigating",
+        evidence: "x",
+        confidence: "high",
+        severity: "high",
+        poc: "p",
+        impact: "i",
+        target: "oob-app",
+      });
+      const phase1 = await executeTool(pi, "PromoteFinding", {
+        id: added.details.record.id,
+        poc_path: pocScriptPath,
+        mode: "intra_target",
+        oob: true,
+      });
+      expect(phase1.isError).toBe(true);
+      expect(phase1.content[0].text).toContain("cannot be combined with oob:true");
+    } finally {
+      delete process.env.PI_OOB_ORACLE_URL;
+    }
+  });
+
+  test("oob:true + reflection canary in evidence is rejected with a clear message", async () => {
+    const pi = createFakePi();
+    casefileExtension(pi as any);
+    // Oracle configured so the run gets past provisioning; the canary lives
+    // in the PoC's evidence.json, so rejection happens after run 1.
+    setOobOracleFetchForTest(async (url: string, init?: RequestInit) => {
+      const u = new URL(url);
+      if (u.pathname === "/provision") {
+        const body = JSON.parse(String(init?.body ?? "{}")) as { token: string };
+        return new Response(JSON.stringify({ domain: `${body.token}.oob.test` }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ interactions: [] }), { status: 200 });
+    });
+    process.env.PI_OOB_ORACLE_URL = "http://oob.test";
+    try {
+      const added = await addCase(pi, {
+        title: "Canary plus OOB",
+        status: "investigating",
+        evidence: "x",
+        confidence: "high",
+        severity: "high",
+        poc: "p",
+        impact: "i",
+        target: "oob-app",
+      });
+      // PoC whose evidence declares a reflection canary.
+      const canaryPoc = join(tempDir, "canary-oob.sh");
+      writeFileSync(
+        canaryPoc,
+        [
+          "#!/bin/sh",
+          'E="$PI_POC_EVIDENCE_DIR"',
+          'mkdir -p "$E"',
+          'printf \'{"nonce":"%s","claim":"c","verify":{"method":"GET","url":"http://oob-app/x?c={{PI_POC_CANARY}}","expect":{"status":[200],"body_contains":["resp"]},"canary":{"mode":"reflection","placeholder":"{{PI_POC_CANARY}}"}},"observations":[]}\' "$PI_POC_NONCE" > "$E/evidence.json"',
+          "exit 0",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      const phase1 = await executeTool(pi, "PromoteFinding", {
+        id: added.details.record.id,
+        poc_path: canaryPoc,
+        oob: true,
+      });
+      expect(phase1.isError).toBe(true);
+      expect(phase1.content[0].text).toContain("cannot be combined with oob:true");
+      expect(phase1.details.record.pendingConfirmation).toBeUndefined();
+    } finally {
+      delete process.env.PI_OOB_ORACLE_URL;
+      setOobOracleFetchForTest(undefined);
+    }
   });
 
   test("PromoteFinding defaults control_path to poc_path but still requires an approved control target", async () => {

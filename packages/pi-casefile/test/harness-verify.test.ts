@@ -139,8 +139,10 @@ describe("harness-verify: replayVerify policy", () => {
     }
   });
 
-  it("fails closed on unresolvable public hostnames", async () => {
+  it("fails closed on unresolvable public hostnames", { timeout: 15_000 }, async () => {
     // .invalid is guaranteed NXDOMAIN (RFC 2606) — deterministic, offline.
+    // The generous timeout covers slow resolvers under parallel suite load;
+    // resolveHost's internal 5s cap still bounds the wait.
     const result = await replayVerify(evidence({ url: "http://does-not-exist.invalid/read" }));
     assert.strictEqual(result.attempted, true);
     assert.strictEqual(result.pass, false);

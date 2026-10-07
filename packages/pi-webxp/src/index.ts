@@ -14,6 +14,8 @@ import { context7Tool } from "./context7.ts";
 import { deepwikiTool } from "./deepwiki.ts";
 import exploitSearchExtension from "./exploitsearch.ts";
 import httpRequestExtension from "./httprequest.ts";
+import jwtExtension from "./jwtx.ts";
+import rawHttpExtension from "./rawhttp.ts";
 import websearchExtension from "./websearch.ts";
 
 export default function piWebxp(pi: ExtensionAPI) {
@@ -25,6 +27,12 @@ export default function piWebxp(pi: ExtensionAPI) {
 
   // ── http_request ──
   httpRequestExtension(pi);
+
+  // ── raw_request + race_send (byte-level attack transport) ──
+  rawHttpExtension(pi);
+
+  // ── jwt (token inspection + attack forging) ──
+  jwtExtension(pi);
 
   // ── context7 + deepwiki (same registration shape: name, call arg, success noun) ──
 

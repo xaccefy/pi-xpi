@@ -1,11 +1,16 @@
 /**
- * Machine-confirmation benchmark runner.
+ * Machine-confirmation soundness suite.
  *
  * Drives the REAL harness gate (harness-verify.ts) against every corpus
  * scenario's vulnerable and patched instance through a deterministic mock
  * fetch. A class scores iff the gate confirms the vulnerable target AND
  * rejects the patched one (sound differential). The pre-intra-target baseline
  * (6/12, inter-host + canary only) is recorded in bench/results/baseline.json.
+ *
+ * Naming honesty: this is a SOUNDNESS suite for the judge — it feeds
+ * hand-authored evidence into harness code, so it measures gate logic, not
+ * an agent's ability to find or exploit anything. Agent-in-the-loop numbers
+ * come from scripts/xbow/run-one.sh verdicts on real XBEN challenges.
  *
  * Run:  bun bench/run.ts            (human scoreboard + writes bench/results/latest.json)
  *       bun bench/run.ts --json     (JSON only)
@@ -131,7 +136,7 @@ export async function runBench(): Promise<BenchReport> {
 
 function scoreboard(report: BenchReport): string {
   const lines: string[] = [];
-  lines.push("XPI machine-confirmation benchmark — sound-confirm recall by vuln class");
+  lines.push("XPI machine-confirmation soundness suite — judge correctness by vuln class");
   lines.push("=".repeat(72));
   for (const r of report.results) {
     const mark = r.sound ? "PASS" : "FAIL";

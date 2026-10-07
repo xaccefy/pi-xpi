@@ -28,6 +28,8 @@ import {
 import {
   addCaseResult,
   addEvidenceItemResult,
+  addObjectiveResult,
+  addPrimitiveResult,
   applyConfirmationResult,
   assertPromotable,
   type CaseConfidence,
@@ -44,6 +46,8 @@ import {
   type CoverageScope,
   countCases,
   coverageSummary,
+  deleteObjectiveResult,
+  deletePrimitiveResult,
   EVIDENCE_ROLE_VALUES,
   type EvidenceItem,
   type EvidenceRole,
@@ -52,12 +56,23 @@ import {
   formatCases,
   getCaseById,
   getCasefilePath,
+  getObjectiveById,
+  getPrimitiveById,
   LINK_KIND_VALUES,
   linkCasesResult,
+  linkObjectiveCase,
+  linkPrimitiveResult,
+  listObjectives,
+  listPrimitives,
   type MainAgentVerification,
+  OBJECTIVE_PHASE_VALUES,
+  OBJECTIVE_STATUS_VALUES,
+  type OobVerification,
   type PendingConfirmation,
   type PocEvidenceRun,
+  PRIMITIVE_KIND_VALUES,
   PRIORITY_VALUES,
+  type PrimitiveKind,
   readActiveCases,
   readCasefile,
   recordCoverageResult,
@@ -67,9 +82,19 @@ import {
   searchCases,
   storePendingConfirmation,
   unlinkCasesResult,
+  unlinkObjectiveCase,
+  unlinkPrimitiveResult,
   updateCaseResult,
+  updateObjectiveStatusResult,
 } from "./ledger.ts";
 import { suggestChainsAsync, writeCaseContextAsync } from "./ledger-worker.ts";
+import {
+  type OobOracleConfig,
+  type ProvisionedCallback,
+  provisionCallback,
+  readOobOracleConfig,
+  verifyOobDifferential,
+} from "./oob-oracle.ts";
 import { pipeline_submit, SUBMIT_STAGES, type SubmitStage } from "./pipeline-submit.ts";
 import { type PocRun, type PocRunOptions, runPoc } from "./poc-runner.ts";
 import {
@@ -226,7 +251,7 @@ const PromoteSchema = Type.Object(
     oob: Type.Optional(
       Type.Boolean({
         description:
-          "Reserved for source-separated out-of-band verification. Currently fails closed because a loopback listener reachable by the PoC cannot prove target causation.",
+          "Blind/OOB confirmation via the operator-run oracle (PI_OOB_ORACLE_URL). The harness provisions per-run callback tokens, injects PI_POC_CALLBACK_DOMAIN into the runs, and polls the oracle itself: promotion requires target-token interactions, ZERO control-token interactions, attested source separation (PI_OOB_SOURCE_SEPARATED=1), and self-source/missing-src_ip interactions are rejected. Without an oracle this fails closed.",
       }),
     ),
   },
@@ -1153,6 +1178,352 @@ export default function casefileExtension(pi: ExtensionAPI) {
     },
   });
 
+  // ── Tool: Primitive (attack material) ──
+
+  const PrimitiveSchema = Type.Object(
+    {
+      action: Type.String({
+        enum: ["add", "list", "get", "link", "unlink", "delete"],
+        description: "Primitive management action.",
+      }),
+      kind: Type.Optional(
+        Type.String({
+          enum: [...PRIMITIVE_KIND_VALUES],
+          description:
+            "Primitive kind: credential | session | token | account | endpoint | param | payload.",
+        }),
+      ),
+      label: Type.Optional(
+        Type.String({
+          description: "Human-readable name (e.g. 'admin API token from debug dump').",
+        }),
+      ),
+      value_ref: Type.Optional(
+        Type.String({
+          description:
+            "REFERENCE to the value — env var name, file path, or hash prefix. NEVER store the live secret itself.",
+        }),
+      ),
+      capabilities: Type.Optional(
+        Type.String({
+          description: "What the primitive grants ('admin API access', 'victim session').",
+        }),
+      ),
+      notes: Type.Optional(Type.String({ description: "Free-form notes." })),
+      id: Type.Optional(Type.String({ description: "Primitive ID (for get/link/unlink/delete)." })),
+      case_id: Type.Optional(
+        Type.String({ description: "Case to link/unlink, or case filter for list." }),
+      ),
+      case_ids: Type.Optional(
+        Type.Array(Type.String(), { description: "Cases to attach on add (producer first)." }),
+      ),
+    },
+    { additionalProperties: false },
+  );
+
+  registerCaseTool({
+    name: "Primitive",
+    label: "Attack Primitive",
+    description:
+      "Track attack primitives — credentials, sessions, tokens, accounts, endpoints, params, payloads discovered during testing — as first-class objects linked to cases. Primitives are the AMMUNITION layer: a leaked token found by one case becomes reusable material for another case's escalation, and ChainSuggest pairs primitive-producing cases with cases whose surface accepts them. Store REFERENCES (env var, file, hash), never live secrets.",
+    promptSnippet: "Track attack material (credentials/tokens/sessions/endpoints) linked to cases",
+    promptGuidelines: [
+      "Record a primitive the moment testing produces reusable material: leaked API key, valid victim session, working payload, undocumented admin endpoint.",
+      "value_ref must be a REFERENCE (env var name, evidence file, sha256 prefix) — never paste live secrets into the ledger.",
+      "Link the producing case AND every case the primitive was used against — that usage graph is what ChainSuggest mines for escalation paths.",
+      "Before hunting escalation, run ChainSuggest on your case: primitive_use suggestions pair your material with other cases' attack surface.",
+    ],
+    parameters: PrimitiveSchema,
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const action = params.action as string;
+      switch (action) {
+        case "add": {
+          if (!params.kind) throw new Error("add requires kind");
+          if (!params.label) throw new Error("add requires label");
+          const primitive = addPrimitiveResult({
+            kind: params.kind as PrimitiveKind,
+            label: params.label as string,
+            valueRef: params.value_ref as string | undefined,
+            capabilities: params.capabilities as string | undefined,
+            notes: params.notes as string | undefined,
+            caseIds: params.case_ids as string[] | undefined,
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Primitive recorded: [${primitive.kind}] ${primitive.label} (${primitive.id})${primitive.caseIds.length ? ` linked to: ${primitive.caseIds.join(", ")}` : ""}`,
+              },
+            ],
+            details: { primitive },
+          };
+        }
+        case "list": {
+          const items = listPrimitives({
+            kind: params.kind as string | undefined,
+            caseId: params.case_id as string | undefined,
+          });
+          const text =
+            items.length === 0
+              ? "No primitives recorded."
+              : items
+                  .map(
+                    (p) =>
+                      `[${p.kind}] ${p.label} (${p.id})${p.capabilities ? ` — ${p.capabilities}` : ""}${p.caseIds.length ? ` · cases: ${p.caseIds.join(", ")}` : ""}`,
+                  )
+                  .join("\n");
+          return { content: [{ type: "text", text }], details: { primitives: items } };
+        }
+        case "get": {
+          const primitive = getPrimitiveById(params.id as string);
+          if (!primitive) throw new Error(`Primitive not found: ${params.id}`);
+          return {
+            content: [{ type: "text", text: JSON.stringify(primitive, null, 2) }],
+            details: { primitive },
+          };
+        }
+        case "link": {
+          if (!params.id || !params.case_id) throw new Error("link requires id and case_id");
+          const primitive = linkPrimitiveResult(params.id as string, params.case_id as string);
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Linked ${primitive.id} to ${params.case_id}. Cases: ${primitive.caseIds.join(", ")}`,
+              },
+            ],
+            details: { primitive },
+          };
+        }
+        case "unlink": {
+          if (!params.id || !params.case_id) throw new Error("unlink requires id and case_id");
+          const primitive = unlinkPrimitiveResult(params.id as string, params.case_id as string);
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Unlinked ${primitive.id} from ${params.case_id}. Remaining cases: ${primitive.caseIds.join(", ") || "none"}`,
+              },
+            ],
+            details: { primitive },
+          };
+        }
+        case "delete": {
+          if (!params.id) throw new Error("delete requires id");
+          const deleted = deletePrimitiveResult(params.id as string);
+          if (!deleted) throw new Error(`Primitive not found: ${params.id}`);
+          return {
+            content: [{ type: "text", text: `Deleted primitive ${params.id}.` }],
+            details: { deleted },
+          };
+        }
+        default:
+          throw new Error(`Unknown action: ${action}`);
+      }
+    },
+
+    renderCall(args, theme) {
+      return callLine(
+        theme,
+        "Primitive",
+        `${(args.action as string) ?? ""} ${(args.label as string) ?? (args.id as string) ?? ""}`,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const details = result.details as
+        | { primitive?: { kind?: string; label?: string } }
+        | undefined;
+      if (details?.primitive?.label) {
+        return new Text(
+          theme.fg("success", "✓ ") +
+            theme.fg("dim", `[${details.primitive.kind}] `) +
+            truncateToWidth(details.primitive.label, 50),
+          0,
+          0,
+        );
+      }
+      return new Text(theme.fg("success", "✓ primitive"), 0, 0);
+    },
+  });
+
+  // ── Tool: Objective (kill-chain OPPLAN-lite) ──
+
+  const ObjectiveSchema = Type.Object(
+    {
+      action: Type.String({
+        enum: ["add", "list", "get", "status", "link-case", "unlink-case", "delete"],
+        description: "Objective management action.",
+      }),
+      title: Type.Optional(Type.String({ description: "Objective title (for add)." })),
+      phase: Type.Optional(
+        Type.String({
+          enum: [...OBJECTIVE_PHASE_VALUES],
+          description: "Kill-chain phase: recon | initial-access | post-exploit | exfiltration.",
+        }),
+      ),
+      status: Type.Optional(
+        Type.String({
+          enum: [...OBJECTIVE_STATUS_VALUES],
+          description: "Target status for the status action (state-machine enforced).",
+        }),
+      ),
+      acceptance: Type.Optional(
+        Type.String({ description: "What proves this objective achieved." }),
+      ),
+      depends_on: Type.Optional(
+        Type.Array(Type.String(), { description: "Objective IDs that must complete first." }),
+      ),
+      blocked_reason: Type.Optional(
+        Type.String({ description: "Required when blocking an objective." }),
+      ),
+      id: Type.Optional(Type.String({ description: "Objective ID." })),
+      case_id: Type.Optional(Type.String({ description: "Case to link/unlink." })),
+    },
+    { additionalProperties: false },
+  );
+
+  registerCaseTool({
+    name: "Objective",
+    label: "Engagement Objective",
+    description:
+      "Track kill-chain objectives with phases (recon, initial-access, post-exploit, exfiltration), a pending → in-progress → completed/blocked/cancelled state machine, and dependencies that are enforced in code — an objective cannot start until its dependencies completed. Cases attach as evidence of work. This is the engagement's OPPLAN-lite: it answers 'am I winning?' while cases answer 'is this bug real?'.",
+    promptSnippet: "Manage kill-chain objectives with enforced dependencies and phases",
+    promptGuidelines: [
+      "Define objectives BEFORE hunting: 'OBJ: obtain admin session', 'OBJ: read cross-tenant data' — then hunt toward them instead of collecting unrelated bugs.",
+      "Dependencies are enforced: exploitation cannot start before recon completes. Mark progress honestly via the status action.",
+      "Link every case that serves an objective — the /casefile dashboard shows kill-chain progress from these links.",
+      "Blocked objectives require blocked_reason; a blocked objective is knowledge, not failure.",
+    ],
+    parameters: ObjectiveSchema,
+
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
+      const action = params.action as string;
+      switch (action) {
+        case "add": {
+          if (!params.title) throw new Error("add requires title");
+          if (!params.phase) throw new Error("add requires phase");
+          const objective = addObjectiveResult({
+            title: params.title as string,
+            phase: params.phase as string,
+            acceptance: params.acceptance as string | undefined,
+            dependsOn: params.depends_on as string[] | undefined,
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Objective created: [${objective.phase}] ${objective.title} (${objective.id}, ${objective.status})`,
+              },
+            ],
+            details: { objective },
+          };
+        }
+        case "list": {
+          const items = listObjectives({
+            phase: params.phase as string | undefined,
+            status: params.status as string | undefined,
+          });
+          const text =
+            items.length === 0
+              ? "No objectives defined."
+              : items
+                  .map(
+                    (o) =>
+                      `[${o.status}] (${o.phase}) ${o.title} (${o.id})${o.dependsOn.length ? ` · deps: ${o.dependsOn.join(",")}` : ""}${o.caseIds.length ? ` · cases: ${o.caseIds.join(",")}` : ""}`,
+                  )
+                  .join("\n");
+          return { content: [{ type: "text", text }], details: { objectives: items } };
+        }
+        case "get": {
+          const objective = getObjectiveById(params.id as string);
+          if (!objective) throw new Error(`Objective not found: ${params.id}`);
+          return {
+            content: [{ type: "text", text: JSON.stringify(objective, null, 2) }],
+            details: { objective },
+          };
+        }
+        case "status": {
+          if (!params.id || !params.status) throw new Error("status requires id and status");
+          const objective = updateObjectiveStatusResult(
+            params.id as string,
+            params.status as string,
+            params.blocked_reason as string | undefined,
+          );
+          return {
+            content: [
+              {
+                type: "text",
+                text: `${objective.id} -> ${objective.status}${objective.blockedReason ? ` (${objective.blockedReason})` : ""}`,
+              },
+            ],
+            details: { objective },
+          };
+        }
+        case "link-case": {
+          if (!params.id || !params.case_id) throw new Error("link-case requires id and case_id");
+          const objective = linkObjectiveCase(params.id as string, params.case_id as string);
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Linked case ${params.case_id} to ${objective.id}. Cases: ${objective.caseIds.join(", ")}`,
+              },
+            ],
+            details: { objective },
+          };
+        }
+        case "unlink-case": {
+          if (!params.id || !params.case_id) throw new Error("unlink-case requires id and case_id");
+          const objective = unlinkObjectiveCase(params.id as string, params.case_id as string);
+          return {
+            content: [
+              { type: "text", text: `Unlinked case ${params.case_id} from ${objective.id}.` },
+            ],
+            details: { objective },
+          };
+        }
+        case "delete": {
+          if (!params.id) throw new Error("delete requires id");
+          if (!deleteObjectiveResult(params.id as string)) {
+            throw new Error(`Objective not found: ${params.id}`);
+          }
+          return {
+            content: [{ type: "text", text: `Deleted objective ${params.id}.` }],
+            details: { deleted: true },
+          };
+        }
+        default:
+          throw new Error(`Unknown action: ${action}`);
+      }
+    },
+
+    renderCall(args, theme) {
+      return callLine(
+        theme,
+        "Objective",
+        `${(args.action as string) ?? ""} ${(args.title as string) ?? (args.id as string) ?? ""}`,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const details = result.details as
+        | { objective?: { status?: string; title?: string } }
+        | undefined;
+      if (details?.objective?.title) {
+        return new Text(
+          theme.fg("success", "✓ ") +
+            theme.fg("dim", `[${details.objective.status}] `) +
+            truncateToWidth(details.objective.title, 50),
+          0,
+          0,
+        );
+      }
+      return new Text(theme.fg("success", "✓ objective"), 0, 0);
+    },
+  });
+
   // ── Tool: PromoteFinding (phase 1) ──
 
   if (!startedAsSubagent)
@@ -1169,8 +1540,9 @@ export default function casefileExtension(pi: ExtensionAPI) {
         "The PoC MUST write evidence.json to $PI_POC_EVIDENCE_DIR: { nonce (echo $PI_POC_NONCE), claim, verify: { method, url, expect: { status?, body_contains/body_regex } }, observations }. A non-empty body predicate is mandatory; status-only evidence is rejected. verify.url must belong to the case target.",
         "For reflection-capable requests, place {{PI_POC_CANARY}} exactly once in verify.url/body/header values and declare verify.canary={mode:'reflection',placeholder:'{{PI_POC_CANARY}}'}. The harness substitutes an unpredictable value only after the PoC exits and requires target-only reflection; the raw token is not persisted.",
         "control_path is optional and defaults to poc_path; if supplied, it must be the SAME script as poc_path. control_target must be pre-approved by the operator in PI_POC_CONTROL_TARGETS. The harness derives the control request from the target request, changes only its origin, and applies the same predicates to two conclusive responses.",
+        "oob=true unlocks blind/OOB classes (SSRF, blind XSS, XXE): the harness provisions per-run callback tokens via the operator's oracle (PI_OOB_ORACLE_URL), injects PI_POC_CALLBACK_DOMAIN into the runs, and polls the oracle itself — target-token interactions with ZERO control-token interactions are required. Promotion additionally requires attested source separation (PI_OOB_SOURCE_SEPARATED=1); without it the verification stays diagnostic.",
         "local:true requires PI_POC_ALLOW_NETWORK=1. Private/internal harness replay additionally requires PI_POC_ALLOW_PRIVATE_REPLAY=1. Neither silently falls back to a model verdict.",
-        "Blind/OOB classes are not promotable through the built-in loopback listener because the PoC can self-call it; obtain a direct-response or state oracle, otherwise keep the case investigating.",
+        "Blind/OOB classes fail closed unless the operator configured an OOB oracle; self-interactions (PI_OOB_SELF_IPS) are rejected and never counted as target hits.",
         "After the bundle is recorded, stay in the main agent: inspect the script/evidence, attempt disconfirmation, and call ConfirmFinding itself; that call performs a fresh harness-owned target/control replay. Never delegate validation/confirmation and never CaseUpdate status='confirmed' directly.",
       ],
       parameters: PromoteSchema,
@@ -1203,13 +1575,47 @@ export default function casefileExtension(pi: ExtensionAPI) {
             missingPocPath: true,
           });
         }
-        // Control-target preconditions apply only to the inter-host differential.
-        // Intra-target proves target-dependence with a same-host baseline request
-        // carried in the evidence, so it needs no control target or control script.
-        if (!isIntra) {
+        const caseTarget = current.target ?? "";
+        // ── OOB callback (Tier 1, opt-in for blind classes) ──
+        // The operator-run oracle owns the evidence channel; the harness owns
+        // the secret (per-run token, provisioned before the runs and injected
+        // as env — the value does not exist when the script was written).
+        // Without an oracle this stays fail-closed.
+        const oobRequested = params.oob === true;
+        // Intra-target + OOB is rejected up front: intra_target's
+        // discriminating variable is identity/parameter on the SAME host;
+        // mixing it with a callback differential would make precedence
+        // ambiguous. OOB is for inter-host/blind classes.
+        if (isIntra && oobRequested) {
+          return fail(
+            "mode:'intra_target' cannot be combined with oob:true — intra-target proof uses a same-host baseline request, not a callback channel. Use one or the other.",
+            { intraOobConflict: true },
+          );
+        }
+        let oobConfig: OobOracleConfig | undefined;
+        let targetCallback: ProvisionedCallback | undefined;
+        let controlCallback: ProvisionedCallback | undefined;
+        if (oobRequested) {
+          const oracle = readOobOracleConfig();
+          if (!oracle.config) {
+            return fail(`OOB CONFIRMATION UNAVAILABLE: ${oracle.error}`, {
+              oobOracleNotConfigured: true,
+            });
+          }
+          oobConfig = oracle.config;
+          // Provision both identities concurrently — each is an oracle round trip.
+          [targetCallback, controlCallback] = await Promise.all([
+            provisionCallback(oobConfig),
+            provisionCallback(oobConfig),
+          ]);
+        }
+        // OOB-only bundles (blind classes, no operator-approved control host)
+        // prove target-dependence via the token differential instead.
+        const oobOnly = oobRequested && !controlTarget;
+        if (!isIntra && !oobOnly) {
           if (!controlTarget) {
             return fail(
-              "control_target is REQUIRED for inter-host mode: a distinct baseline target that lacks the vulnerability. For access-control/logic bugs use mode='intra_target' with an evidence baseline instead.",
+              "control_target is REQUIRED for inter-host mode: a distinct baseline target that lacks the vulnerability. For access-control/logic bugs use mode='intra_target' with an evidence baseline instead; for blind/OOB classes pass oob=true (with or without a control target).",
               { missingControlTarget: true },
             );
           }
@@ -1226,7 +1632,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
             { networkNotAuthorized: true },
           );
         }
-        if (!isIntra) {
+        if (!isIntra && !oobOnly) {
           const controlAuthorization = controlTargetAuthorizationError(controlTarget);
           if (controlAuthorization) {
             return fail(
@@ -1247,7 +1653,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
             sameFileCheckFailed: true,
           });
         }
-        if (!isIntra) {
+        if (!isIntra && !oobOnly) {
           let controlHash: string | undefined;
           try {
             controlHash = createHash("sha256").update(readFileSync(controlPath)).digest("hex");
@@ -1265,24 +1671,22 @@ export default function casefileExtension(pi: ExtensionAPI) {
           }
         }
 
-        // ── OOB callback (Tier 1, opt-in for blind classes) ──
-        const oobRequested = params.oob === true;
-        if (oobRequested) {
-          return fail(
-            "OOB confirmation is fail-closed: the built-in loopback listener is reachable by the PoC and cannot prove the target caused a callback. A source-separated, operator-owned callback service is required before blind findings can be promoted.",
-            { oobSourceSeparationRequired: true },
-          );
-        }
+        // ── OOB callback tokens were provisioned above, before the runs ──
         const runOptions = (pocMode: string, target: string): PocRunOptions => ({
           network: params.local === true ? "host" : "none",
           local: params.local === true,
           env: {
             PI_POC_MODE: pocMode,
             PI_POC_TARGET: target,
+            ...(oobRequested && targetCallback && controlCallback
+              ? {
+                  PI_POC_CALLBACK_DOMAIN:
+                    pocMode === "control" ? controlCallback.domain : targetCallback.domain,
+                }
+              : {}),
           },
         });
 
-        const caseTarget = current.target ?? "";
         // Determinism: TWO target runs. Exit 0 is run integrity only; nonce-bound
         // body evidence plus the harness-owned differential replay (inter-host
         // control, or intra-target same-host baseline) form the machine gate.
@@ -1336,8 +1740,18 @@ export default function casefileExtension(pi: ExtensionAPI) {
           evidenceRun(run2, "poc", caseTarget),
         ];
 
+        // Reflection canary + OOB is rejected after run 1 (the canary is
+        // declared inside evidence.json): the canary path requires a harness
+        // response transcript, which OOB-only bundles never produce — the
+        // per-run callback token IS the causality signal there.
+        if (oobRequested && targetRuns.some((r) => r.evidence.verify.canary !== undefined)) {
+          return fail(
+            "verify.canary cannot be combined with oob:true — the per-run callback token already provides a harness-owned causality signal. Remove the {{PI_POC_CANARY}} placeholder and verify.canary from evidence.json, then re-promote.",
+            { canaryOobConflict: true },
+          );
+        }
         const allowPrivateReplay = process.env.PI_POC_ALLOW_PRIVATE_REPLAY === "1";
-        let harnessVerified: HarnessVerifyResult;
+        let harnessVerified: HarnessVerifyResult | undefined;
         let controlRun: PocEvidenceRun | undefined;
         if (isIntra) {
           // Intra-target: prove target-dependence with the evidence's same-host
@@ -1359,7 +1773,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
           harnessVerified = await replayIntraTarget(ev0, caseTarget, {
             allowPrivate: allowPrivateReplay,
           });
-        } else {
+        } else if (!oobOnly) {
           // Inter-host (Tier 2): the harness executes the SAME request template
           // against target and operator-approved control, applying the target's
           // predicates to both. DNS is pinned at connect time.
@@ -1375,6 +1789,20 @@ export default function casefileExtension(pi: ExtensionAPI) {
             { allowPrivate: allowPrivateReplay },
           );
         }
+        // OOB differential: poll the oracle for both run tokens. The ledger's
+        // assertMachineConfirmation consumes this BEFORE the response-diff
+        // requirement — blind classes pass via this path when the oracle saw
+        // the target token and NOT the control token under attested source
+        // separation.
+        let callbackVerified: OobVerification | undefined;
+        if (oobConfig && targetCallback && controlCallback) {
+          callbackVerified = (
+            await verifyOobDifferential({
+              targetToken: targetCallback.token,
+              controlToken: controlCallback.token,
+            })
+          ).verification;
+        }
         const bundle: PendingConfirmation = {
           caseId,
           ranAt: new Date().toISOString(),
@@ -1383,7 +1811,16 @@ export default function casefileExtension(pi: ExtensionAPI) {
           mode,
           targetRuns,
           harnessVerified,
-          ...(isIntra ? {} : { controlPath, controlTarget, controlRun }),
+          ...(callbackVerified && targetCallback && controlCallback
+            ? {
+                callbackVerified,
+                oobTokens: {
+                  targetToken: targetCallback.token,
+                  controlToken: controlCallback.token,
+                },
+              }
+            : {}),
+          ...(!(isIntra || oobOnly) ? { controlPath, controlTarget, controlRun } : {}),
         };
 
         let record: CaseRecord;
@@ -1404,7 +1841,11 @@ export default function casefileExtension(pi: ExtensionAPI) {
                 `Mode: ${mode}. ${isIntra ? "Target runs: 2, same-host baseline differential" : "Target runs: 2, Control run: 1"} — all with validated nonce-bound evidence.json.\n` +
                 `Evidence sha256: ${targetRuns[0].evidenceSha256}\n` +
                 `PoC script sha256 (at run time): ${pocHash}\n` +
-                `Harness verify replay: ${harnessVerified.attempted ? (harnessVerified.pass ? `PASS (status ${harnessVerified.status})` : `FAILED — ${harnessVerified.note}`) : harnessVerified.note}\n` +
+                `Harness verify replay: ${harnessVerified?.attempted ? (harnessVerified.pass ? `PASS (status ${harnessVerified.status})` : `FAILED — ${harnessVerified.note}`) : (harnessVerified?.note ?? "not run")}
+` +
+                (callbackVerified
+                  ? `OOB oracle: target-token hits ${callbackVerified.targetHits}, control-token hits ${callbackVerified.controlHits}, source-separated: ${String(callbackVerified.sourceSeparated)} — ${callbackVerified.note}\n`
+                  : "") +
                 `\nMAIN-AGENT REVIEW REQUIRED (do not delegate): inspect case ${caseId}, PoC ${pocPath}, ${isIntra ? "same-host baseline" : `control ${controlTarget}`}, evidence ${targetRuns[0].evidenceSha256}, and PoC hash ${pocHash}. Hunt for a trivial predicate or fabricated differential and perform a concrete disconfirmation attempt, then call ConfirmFinding yourself. A CONFIRMED call performs and stores a fresh harness-owned ${isIntra ? "attack/baseline" : "target/control"} replay; NOT_CONFIRMED keeps the case investigating.`,
             },
           ],
@@ -1493,6 +1934,46 @@ export default function casefileExtension(pi: ExtensionAPI) {
             replay = await replayIntraTarget(bundle.targetRuns[0].evidence, caseTargetForReplay, {
               allowPrivate,
             });
+          } else if (bundle.callbackVerified?.attempted && bundle.oobTokens) {
+            // OOB differential: fresh harness-owned re-poll of BOTH run tokens.
+            // Re-polling at confirm time catches interactions that landed after
+            // phase 1 (e.g. a delayed control-token hit) — the verdict is bound
+            // to this fresh observation, not the stored one.
+            const { verification } = await verifyOobDifferential({
+              targetToken: bundle.oobTokens.targetToken,
+              controlToken: bundle.oobTokens.controlToken,
+            });
+            const oobPass =
+              verification.targetHits > 0 &&
+              verification.controlHits === 0 &&
+              verification.sourceSeparated === true;
+            replay = {
+              attempted: true,
+              pass: oobPass,
+              target: {
+                attempted: true,
+                matched: verification.targetHits > 0,
+                url: bundle.targetRuns[0].evidence.verify.url,
+                note: verification.note,
+              },
+              control: {
+                attempted: true,
+                matched: verification.controlHits > 0,
+                url: bundle.targetRuns[0].evidence.verify.url,
+                note: `${verification.controlHits} control-token interaction(s)`,
+              },
+              differential:
+                verification.targetHits > 0
+                  ? verification.controlHits === 0
+                    ? "target_only"
+                    : "both"
+                  : "neither",
+              note: `harness OOB re-poll: ${verification.note}`,
+            };
+          } else if (bundle.callbackVerified?.attempted) {
+            throw new Error(
+              "OOB bundle lacks its provisioned tokens (pre-token-storage ledger) — re-run PromoteFinding for a fresh bundle",
+            );
           } else {
             if (!bundle.controlTarget) {
               throw new Error("inter-host confirmation requires a control target");

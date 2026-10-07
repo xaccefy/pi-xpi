@@ -36,6 +36,8 @@
     "src/context7.ts",
     "src/deepwiki.ts",
     "src/exploitsearch.ts",
+    "src/rawhttp.ts",
+    "src/jwtx.ts",
     "README.md",
     "LICENSE"
   ],

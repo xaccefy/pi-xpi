@@ -74,7 +74,8 @@ function guardedLookup(
  * ignored there). A low-TTL rebinding attacker can pass the pre-flight and
  * then serve a private address to the connection. Node closes the window via
  * guardedLookup; Bun does not. Closing it on Bun would require a custom
- * socket layer.
+ * socket layer. Revisit if Bun ever honors undici dispatchers — until then
+ * this is disclosed in the http_request tool description.
  */
 export async function assertPublicDns(hostname: string, allowPrivateHosts = false): Promise<void> {
   if (allowPrivateHosts) return;

@@ -1,0 +1,292 @@
+{
+  "total": 33,
+  "shouldSuggest": 16,
+  "correctlySuggested": 16,
+  "correctlyRejected": 17,
+  "shouldNotSuggest": 17,
+  "score": 1,
+  "cGain": 1,
+  "details": [
+    {
+      "id": "cred-endpoint",
+      "pattern": "credential_endpoint",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "idor-leak",
+      "pattern": "idor_data_leak",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "xss-csrf",
+      "pattern": "xss_csrf",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "ssti-rce",
+      "pattern": "ssti_rce",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "lfi-upload-rce",
+      "pattern": "lfi_rce_chain",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "ssrf-internal",
+      "pattern": "ssrf_internal_pivot",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "jwt-privesc",
+      "pattern": "jwt_privilege_escalation",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "graphql-sqli",
+      "pattern": "graphql_chain",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "graphql-idor",
+      "pattern": "graphql_chain",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "deser-rce",
+      "pattern": "deserialization_rce",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "xxe-leak",
+      "pattern": "xxe_file_read",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "sqli-cred-dump",
+      "pattern": "sqli_credential_dump",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "sqli-upload",
+      "pattern": "sqli_credential_dump",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "bizlogic-priv",
+      "pattern": "business_logic_privilege",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "upload-rce",
+      "pattern": "upload_rce",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "crypto-bypass",
+      "pattern": "crypto_auth_bypass",
+      "expected": true,
+      "suggested": true,
+      "pass": true,
+      "note": "suggested"
+    },
+    {
+      "id": "neg-cross-asset",
+      "pattern": "credential_endpoint",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "neg-negated",
+      "pattern": "xss_csrf",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "nm-cred-cred",
+      "pattern": "credential_endpoint",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "nm-idor-idor",
+      "pattern": "idor_data_leak",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "nm-xss-read-only",
+      "pattern": "xss_csrf",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "nm-lfi-lfi",
+      "pattern": "lfi_rce_chain",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "nm-upload-upload",
+      "pattern": "upload_rce",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "nm-jwt-jwt",
+      "pattern": "jwt_privilege_escalation",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "nm-ssrf-ssrf",
+      "pattern": "ssrf_internal_pivot",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "nm-crypto-crypto",
+      "pattern": "crypto_auth_bypass",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "nm-bizlogic-nonauth",
+      "pattern": "business_logic_privilege",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "nm-gql-gql",
+      "pattern": "graphql_chain",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "nm-redirect-redirect",
+      "pattern": "redirect_oauth",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "nm-oauth-oauth",
+      "pattern": "redirect_oauth",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "nm-race-race",
+      "pattern": "race_condition_business",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "nm-subdomain-trap",
+      "pattern": "credential_endpoint",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    },
+    {
+      "id": "nm-negated-sqli",
+      "pattern": "sqli_credential_dump",
+      "expected": false,
+      "suggested": false,
+      "pass": true,
+      "note": "correctly rejected"
+    }
+  ],
+  "holdout": {
+    "total": 6,
+    "suggested": 4,
+    "recall": 0.6666666666666666,
+    "misses": [
+      {
+        "id": "h-xxe-paraphrase",
+        "pattern": "xxe_file_read",
+        "difficulty": "paraphrase"
+      },
+      {
+        "id": "h-deser-paraphrase",
+        "pattern": "deserialization_rce",
+        "difficulty": "paraphrase"
+      }
+    ]
+  }
+}
