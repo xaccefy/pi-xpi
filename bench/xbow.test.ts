@@ -7,6 +7,10 @@ import { runBench } from "./run.ts";
 import { runTransportSuite } from "./transport-run.ts";
 import { runXbow } from "./xbow-run.ts";
 
+// The gate suites exercise loopback transports (127.0.0.1 fixtures); the
+// tests are the operator, so the private-host gate opens for this process.
+process.env.PI_WEBXP_ALLOW_PRIVATE_HOSTS = "1";
+
 describe("gate soundness suites", () => {
   it("differential stays 12/12 (confirms vulnerable AND rejects patched)", async () => {
     const r = await runBench();

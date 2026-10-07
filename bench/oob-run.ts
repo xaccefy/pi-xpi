@@ -56,7 +56,9 @@ function makeOracle() {
 }
 
 const BASE_ENV = {
-  PI_OOB_ORACLE_URL: "http://oracle.test",
+  // In-memory oracle: fetch is intercepted before any connection, but the
+  // URL must still satisfy the transport rule (https, or loopback http).
+  PI_OOB_ORACLE_URL: "http://localhost",
   PI_OOB_SOURCE_SEPARATED: "1",
 };
 
@@ -73,12 +75,12 @@ const scenarios: Array<{ id: string; threat: string; run: () => Promise<string> 
       const oracle = makeOracle();
       setOobOracleFetchForTest(oracle.fetch);
       const t = await provisionCallback({
-        baseUrl: "http://oracle.test",
+        baseUrl: "http://localhost",
         sourceSeparated: true,
         selfIps: [SELF_IP],
       });
       const c = await provisionCallback({
-        baseUrl: "http://oracle.test",
+        baseUrl: "http://localhost",
         sourceSeparated: true,
         selfIps: [SELF_IP],
       });
@@ -107,12 +109,12 @@ const scenarios: Array<{ id: string; threat: string; run: () => Promise<string> 
       const oracle = makeOracle();
       setOobOracleFetchForTest(oracle.fetch);
       const t = await provisionCallback({
-        baseUrl: "http://oracle.test",
+        baseUrl: "http://localhost",
         sourceSeparated: true,
         selfIps: [],
       });
       const c = await provisionCallback({
-        baseUrl: "http://oracle.test",
+        baseUrl: "http://localhost",
         sourceSeparated: true,
         selfIps: [],
       });
@@ -207,7 +209,7 @@ const scenarios: Array<{ id: string; threat: string; run: () => Promise<string> 
       let threw = "";
       try {
         await provisionCallback({
-          baseUrl: "http://oracle.test",
+          baseUrl: "http://localhost",
           sourceSeparated: true,
           selfIps: [],
         });

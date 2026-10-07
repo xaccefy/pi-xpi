@@ -81,7 +81,9 @@ describe("network-safety: pinPublicHostForPlainHttp", () => {
 describe("network-safety: assertPrivateHostsAllowed", () => {
   it("is a no-op when private access was not requested", () => {
     assert.doesNotThrow(() => assertPrivateHostsAllowed(false, {}));
-    assert.doesNotThrow(() => assertPrivateHostsAllowed(false, { PI_WEBXP_ALLOW_PRIVATE_HOSTS: "1" }));
+    assert.doesNotThrow(() =>
+      assertPrivateHostsAllowed(false, { PI_WEBXP_ALLOW_PRIVATE_HOSTS: "1" }),
+    );
   });
 
   it("allows requested private access only with the operator gate", () => {

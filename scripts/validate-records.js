@@ -65,7 +65,8 @@ function isObject(v) {
 function rejectUnknown(err, obj, path, allowed) {
   if (!isObject(obj)) return;
   for (const key of Object.keys(obj)) {
-    if (!allowed.includes(key)) err.at(`${path}.${key}`, `unknown field (allowed: ${allowed.join(", ")})`);
+    if (!allowed.includes(key))
+      err.at(`${path}.${key}`, `unknown field (allowed: ${allowed.join(", ")})`);
   }
 }
 
@@ -91,28 +92,89 @@ function isDateTime(value) {
 
 function validateManifest(doc, err, root) {
   const allowed = [
-    "schema", "runId", "created", "ended", "status", "mode", "profile", "harness",
-    "target", "scope", "roles", "toolVersions", "budget", "priorRuns", "executionPolicy",
+    "schema",
+    "runId",
+    "created",
+    "ended",
+    "status",
+    "mode",
+    "profile",
+    "harness",
+    "target",
+    "scope",
+    "roles",
+    "toolVersions",
+    "budget",
+    "priorRuns",
+    "executionPolicy",
   ];
   rejectUnknown(err, doc, root, allowed);
   requireFields(err, doc, root, [
-    "schema", "runId", "created", "mode", "profile", "harness", "target", "scope", "executionPolicy", "status",
+    "schema",
+    "runId",
+    "created",
+    "mode",
+    "profile",
+    "harness",
+    "target",
+    "scope",
+    "executionPolicy",
+    "status",
   ]);
   err.check(`${root}.schema`, doc.schema === "xpi/audit-run@1", 'must be "xpi/audit-run@1"');
-  err.check(`${root}.runId`, RUN_ID.test(String(doc.runId ?? "")), "must match ^[a-z0-9][a-z0-9-]{5,63}$");
-  err.check(`${root}.created`, isDateTime(doc.created), "must be an RFC3339 date-time (YYYY-MM-DDTHH:MM:SSZ or with offset)");
-  if ("ended" in doc) err.check(`${root}.ended`, isDateTime(doc.ended), "must be an RFC3339 date-time (YYYY-MM-DDTHH:MM:SSZ or with offset)");
-  err.check(`${root}.status`, ["running", "completed", "aborted"].includes(doc.status), "invalid status enum");
-  err.check(`${root}.mode`, ["source_audit", "authorized_live"].includes(doc.mode), "invalid mode enum");
-  err.check(`${root}.profile`, ["quick", "standard", "deep"].includes(doc.profile), "invalid profile enum");
+  err.check(
+    `${root}.runId`,
+    RUN_ID.test(String(doc.runId ?? "")),
+    "must match ^[a-z0-9][a-z0-9-]{5,63}$",
+  );
+  err.check(
+    `${root}.created`,
+    isDateTime(doc.created),
+    "must be an RFC3339 date-time (YYYY-MM-DDTHH:MM:SSZ or with offset)",
+  );
+  if ("ended" in doc)
+    err.check(
+      `${root}.ended`,
+      isDateTime(doc.ended),
+      "must be an RFC3339 date-time (YYYY-MM-DDTHH:MM:SSZ or with offset)",
+    );
+  err.check(
+    `${root}.status`,
+    ["running", "completed", "aborted"].includes(doc.status),
+    "invalid status enum",
+  );
+  err.check(
+    `${root}.mode`,
+    ["source_audit", "authorized_live"].includes(doc.mode),
+    "invalid mode enum",
+  );
+  err.check(
+    `${root}.profile`,
+    ["quick", "standard", "deep"].includes(doc.profile),
+    "invalid profile enum",
+  );
   err.check(`${root}.harness`, ["pi", "omp"].includes(doc.harness), "invalid harness enum");
 
   const target = doc.target;
   if (err.check(`${root}.target`, isObject(target), "must be an object")) {
-    rejectUnknown(err, target, `${root}.target`, ["kind", "reference", "revision", "dirty", "dirtyFiles"]);
+    rejectUnknown(err, target, `${root}.target`, [
+      "kind",
+      "reference",
+      "revision",
+      "dirty",
+      "dirtyFiles",
+    ]);
     requireFields(err, target, `${root}.target`, ["kind", "reference"]);
-    err.check(`${root}.target.kind`, ["repository", "live_service"].includes(target.kind), "invalid target.kind");
-    err.check(`${root}.target.reference`, typeof target.reference === "string" && target.reference.length > 0, "must be a non-empty string");
+    err.check(
+      `${root}.target.kind`,
+      ["repository", "live_service"].includes(target.kind),
+      "invalid target.kind",
+    );
+    err.check(
+      `${root}.target.reference`,
+      typeof target.reference === "string" && target.reference.length > 0,
+      "must be a non-empty string",
+    );
     if ("revision" in target) {
       err.check(`${root}.target.revision`, typeof target.revision === "string", "must be a string");
     }
@@ -122,7 +184,8 @@ function validateManifest(doc, err, root) {
     if ("dirtyFiles" in target) {
       err.check(
         `${root}.target.dirtyFiles`,
-        Array.isArray(target.dirtyFiles) && target.dirtyFiles.every((f) => typeof f === "string" && f.length > 0),
+        Array.isArray(target.dirtyFiles) &&
+          target.dirtyFiles.every((f) => typeof f === "string" && f.length > 0),
         "must be an array of non-empty path strings",
       );
     }
@@ -131,29 +194,65 @@ function validateManifest(doc, err, root) {
   const scope = doc.scope;
   if (err.check(`${root}.scope`, isObject(scope), "must be an object")) {
     rejectUnknown(err, scope, `${root}.scope`, ["include", "exclude", "authorization"]);
-    if (err.check(`${root}.scope.include`, Array.isArray(scope.include) && scope.include.length >= 1, "must be a non-empty array of paths")) {
+    if (
+      err.check(
+        `${root}.scope.include`,
+        Array.isArray(scope.include) && scope.include.length >= 1,
+        "must be a non-empty array of paths",
+      )
+    ) {
       for (const [i, inc] of scope.include.entries()) {
-        err.check(`${root}.scope.include[${i}]`, typeof inc === "string" && inc.length > 0 && !inc.includes(".."), "must be a non-empty repo-relative path without '..'");
+        err.check(
+          `${root}.scope.include[${i}]`,
+          typeof inc === "string" && inc.length > 0 && !inc.includes(".."),
+          "must be a non-empty repo-relative path without '..'",
+        );
       }
     }
     if ("exclude" in scope) {
       err.check(`${root}.scope.exclude`, Array.isArray(scope.exclude), "must be an array of paths");
       if (Array.isArray(scope.exclude)) {
         for (const [i, exc] of scope.exclude.entries()) {
-          err.check(`${root}.scope.exclude[${i}]`, typeof exc === "string" && exc.length > 0, "must be a non-empty path");
+          err.check(
+            `${root}.scope.exclude[${i}]`,
+            typeof exc === "string" && exc.length > 0,
+            "must be a non-empty path",
+          );
         }
       }
     }
     // Mode rules.
     if (doc.mode === "authorized_live") {
       const auth = scope.authorization;
-      if (err.check(`${root}.scope.authorization`, isObject(auth), "authorized_live requires an authorization record")) {
-        rejectUnknown(err, auth, `${root}.scope.authorization`, ["reference", "operator", "validUntil"]);
+      if (
+        err.check(
+          `${root}.scope.authorization`,
+          isObject(auth),
+          "authorized_live requires an authorization record",
+        )
+      ) {
+        rejectUnknown(err, auth, `${root}.scope.authorization`, [
+          "reference",
+          "operator",
+          "validUntil",
+        ]);
         requireFields(err, auth, `${root}.scope.authorization`, ["reference", "operator"]);
-        err.check(`${root}.scope.authorization.reference`, typeof auth.reference === "string" && auth.reference.length > 0, "must be a non-empty engagement/program reference");
-        err.check(`${root}.scope.authorization.operator`, typeof auth.operator === "string" && auth.operator.length > 0, "must name the authorizing principal");
+        err.check(
+          `${root}.scope.authorization.reference`,
+          typeof auth.reference === "string" && auth.reference.length > 0,
+          "must be a non-empty engagement/program reference",
+        );
+        err.check(
+          `${root}.scope.authorization.operator`,
+          typeof auth.operator === "string" && auth.operator.length > 0,
+          "must name the authorizing principal",
+        );
         if ("validUntil" in auth) {
-          err.check(`${root}.scope.authorization.validUntil`, isDateOnly(auth.validUntil), "must be an ISO date (YYYY-MM-DD)");
+          err.check(
+            `${root}.scope.authorization.validUntil`,
+            isDateOnly(auth.validUntil),
+            "must be an ISO date (YYYY-MM-DD)",
+          );
         }
       }
     }
@@ -161,38 +260,84 @@ function validateManifest(doc, err, root) {
 
   const policy = doc.executionPolicy;
   if (err.check(`${root}.executionPolicy`, isObject(policy), "must be an object")) {
-    rejectUnknown(err, policy, `${root}.executionPolicy`, ["network", "sandbox", "sandboxFailClosed", "notes"]);
+    rejectUnknown(err, policy, `${root}.executionPolicy`, [
+      "network",
+      "sandbox",
+      "sandboxFailClosed",
+      "notes",
+    ]);
     requireFields(err, policy, `${root}.executionPolicy`, ["network"]);
-    err.check(`${root}.executionPolicy.network`, ["none", "loopback", "target"].includes(policy.network), "invalid network enum");
+    err.check(
+      `${root}.executionPolicy.network`,
+      ["none", "loopback", "target"].includes(policy.network),
+      "invalid network enum",
+    );
     if (doc.mode === "source_audit") {
-      err.check(`${root}.executionPolicy.network`, ["none", "loopback"].includes(policy.network), "source_audit cannot use target network");
+      err.check(
+        `${root}.executionPolicy.network`,
+        ["none", "loopback"].includes(policy.network),
+        "source_audit cannot use target network",
+      );
     }
     if (doc.mode === "authorized_live" && policy.network === "target") {
-      err.check(`${root}.scope.authorization`, isObject(scope && scope.authorization), "network 'target' requires an authorization record");
+      err.check(
+        `${root}.scope.authorization`,
+        isObject(scope && scope.authorization),
+        "network 'target' requires an authorization record",
+      );
     }
     if ("sandbox" in policy) {
-      err.check(`${root}.executionPolicy.sandbox`, ["docker", "none", "operator-host"].includes(policy.sandbox), "invalid sandbox enum");
+      err.check(
+        `${root}.executionPolicy.sandbox`,
+        ["docker", "none", "operator-host"].includes(policy.sandbox),
+        "invalid sandbox enum",
+      );
       if (policy.sandbox === "operator-host") {
-        err.check(`${root}.executionPolicy.sandboxFailClosed`, policy.sandboxFailClosed === true, "operator-host sandbox must still record sandboxFailClosed: true (host opt-in never disables the closed-failure default)");
+        err.check(
+          `${root}.executionPolicy.sandboxFailClosed`,
+          policy.sandboxFailClosed === true,
+          "operator-host sandbox must still record sandboxFailClosed: true (host opt-in never disables the closed-failure default)",
+        );
       }
     }
     if ("sandboxFailClosed" in policy && policy.sandboxFailClosed !== true) {
-      err.at(`${root}.executionPolicy.sandboxFailClosed`, "must be true when present — the closed-failure default cannot be recorded as disabled");
+      err.at(
+        `${root}.executionPolicy.sandboxFailClosed`,
+        "must be true when present — the closed-failure default cannot be recorded as disabled",
+      );
     }
     if ("notes" in policy) {
-      err.check(`${root}.executionPolicy.notes`, typeof policy.notes === "string", "must be a string");
+      err.check(
+        `${root}.executionPolicy.notes`,
+        typeof policy.notes === "string",
+        "must be a string",
+      );
     }
   }
 
   if (doc.roles !== undefined) {
-    err.check(`${root}.roles`, isObject(doc.roles), "must be an object of role -> {model, provider}");
+    err.check(
+      `${root}.roles`,
+      isObject(doc.roles),
+      "must be an object of role -> {model, provider}",
+    );
     for (const [role, cfg] of Object.entries(doc.roles ?? {})) {
       const p = `${root}.roles.${role}`;
       err.check(p, ROLE_KEY.test(role), "role key must match ^[a-z][a-z0-9_-]*$");
-      if (err.check(p, isObject(cfg) && typeof cfg.model === "string" && cfg.model.length > 0, "each role needs at least a model")) {
+      if (
+        err.check(
+          p,
+          isObject(cfg) && typeof cfg.model === "string" && cfg.model.length > 0,
+          "each role needs at least a model",
+        )
+      ) {
         rejectUnknown(err, cfg, p, ["model", "provider"]);
         if ("provider" in cfg) {
-          err.check(`${p}.provider`, typeof cfg.provider === "string", "provider must be a string when present");
+          err.check(
+            `${p}.provider`,
+            typeof cfg.provider === "string",
+            "provider must be a string when present",
+          );
         }
       }
     }
@@ -202,7 +347,11 @@ function validateManifest(doc, err, root) {
     const p = `${root}.toolVersions`;
     err.check(p, isObject(doc.toolVersions), "must be an object of name -> version string");
     for (const [name, version] of Object.entries(doc.toolVersions ?? {})) {
-      err.check(`${p}.${name}`, typeof version === "string" && version.length > 0, "version values must be non-empty strings");
+      err.check(
+        `${p}.${name}`,
+        typeof version === "string" && version.length > 0,
+        "version values must be non-empty strings",
+      );
     }
   }
 
@@ -219,12 +368,20 @@ function validateManifest(doc, err, root) {
       ]);
       for (const field of ["wallClockMinutes", "modelCalls"]) {
         if (field in b) {
-          err.check(`${p}.${field}`, Number.isInteger(b[field]) && b[field] >= 1, "must be an integer >= 1");
+          err.check(
+            `${p}.${field}`,
+            Number.isInteger(b[field]) && b[field] >= 1,
+            "must be an integer >= 1",
+          );
         }
       }
       for (const field of ["reservedForCoverageReviewPercent", "reservedForVerificationPercent"]) {
         if (field in b) {
-          err.check(`${p}.${field}`, Number.isInteger(b[field]) && b[field] >= 0 && b[field] <= 90, "must be an integer between 0 and 90");
+          err.check(
+            `${p}.${field}`,
+            Number.isInteger(b[field]) && b[field] >= 0 && b[field] <= 90,
+            "must be an integer between 0 and 90",
+          );
         }
       }
       if ("notes" in b) {
@@ -234,7 +391,11 @@ function validateManifest(doc, err, root) {
   }
 
   if (doc.priorRuns !== undefined) {
-    err.check(`${root}.priorRuns`, Array.isArray(doc.priorRuns), "must be an array of prior-run entries");
+    err.check(
+      `${root}.priorRuns`,
+      Array.isArray(doc.priorRuns),
+      "must be an array of prior-run entries",
+    );
   }
   if (Array.isArray(doc.priorRuns)) {
     for (const [i, prior] of doc.priorRuns.entries()) {
@@ -244,8 +405,16 @@ function validateManifest(doc, err, root) {
         continue;
       }
       rejectUnknown(err, prior, p, ["runId", "disposition", "note"]);
-      err.check(`${p}.runId`, RUN_ID.test(String(prior.runId ?? "")), "must match ^[a-z0-9][a-z0-9-]{5,63}$");
-      err.check(`${p}.disposition`, ["revalidated", "carried_forward", "superseded"].includes(prior.disposition), "invalid prior-run disposition");
+      err.check(
+        `${p}.runId`,
+        RUN_ID.test(String(prior.runId ?? "")),
+        "must match ^[a-z0-9][a-z0-9-]{5,63}$",
+      );
+      err.check(
+        `${p}.disposition`,
+        ["revalidated", "carried_forward", "superseded"].includes(prior.disposition),
+        "invalid prior-run disposition",
+      );
       if ("note" in prior) {
         err.check(`${p}.note`, typeof prior.note === "string", "must be a string");
       }
@@ -257,43 +426,121 @@ function validateManifest(doc, err, root) {
   }
 }
 
-const UNIT_STATUSES = ["planned", "in_progress", "covered", "candidate", "blocked", "deferred", "not_applicable", "out_of_scope"];
+const UNIT_STATUSES = [
+  "planned",
+  "in_progress",
+  "covered",
+  "candidate",
+  "blocked",
+  "deferred",
+  "not_applicable",
+  "out_of_scope",
+];
 
 function validateLedger(doc, err, root) {
   rejectUnknown(err, doc, root, ["schema", "runId", "units"]);
   requireFields(err, doc, root, ["schema", "runId", "units"]);
-  err.check(`${root}.schema`, doc.schema === "xpi/coverage-ledger@1", 'must be "xpi/coverage-ledger@1"');
-  err.check(`${root}.runId`, RUN_ID.test(String(doc.runId ?? "")), "must match ^[a-z0-9][a-z0-9-]{5,63}$");
-  if (!err.check(`${root}.units`, Array.isArray(doc.units) && doc.units.length >= 1, "must be a non-empty array")) return;
+  err.check(
+    `${root}.schema`,
+    doc.schema === "xpi/coverage-ledger@1",
+    'must be "xpi/coverage-ledger@1"',
+  );
+  err.check(
+    `${root}.runId`,
+    RUN_ID.test(String(doc.runId ?? "")),
+    "must match ^[a-z0-9][a-z0-9-]{5,63}$",
+  );
+  if (
+    !err.check(
+      `${root}.units`,
+      Array.isArray(doc.units) && doc.units.length >= 1,
+      "must be a non-empty array",
+    )
+  )
+    return;
 
   const seen = new Map();
   for (const [i, unit] of doc.units.entries()) {
     const p = `${root}.units[${i}]`;
     if (!err.check(p, isObject(unit), "must be an object")) continue;
-    rejectUnknown(err, unit, p, ["id", "kind", "description", "status", "reviewedPaths", "checks", "findings", "reason", "revisitWhen", "sourceRevision"]);
+    rejectUnknown(err, unit, p, [
+      "id",
+      "kind",
+      "description",
+      "status",
+      "reviewedPaths",
+      "checks",
+      "findings",
+      "reason",
+      "revisitWhen",
+      "sourceRevision",
+    ]);
     requireFields(err, unit, p, ["id", "kind", "description", "status"]);
-    err.check(`${p}.id`, typeof unit.id === "string" && UNIT_ID.test(unit.id), "must be a stable unit id (e.g. src/api/upload.ts:unauth:file-upload)");
+    err.check(
+      `${p}.id`,
+      typeof unit.id === "string" && UNIT_ID.test(unit.id),
+      "must be a stable unit id (e.g. src/api/upload.ts:unauth:file-upload)",
+    );
     if (unit.id !== undefined) {
-      if (seen.has(unit.id)) err.at(`${p}.id`, `duplicate unit id (first at units[${seen.get(unit.id)}])`);
+      if (seen.has(unit.id))
+        err.at(`${p}.id`, `duplicate unit id (first at units[${seen.get(unit.id)}])`);
       else seen.set(unit.id, i);
     }
-    err.check(`${p}.kind`, ["surface", "trust_boundary", "attack_class", "lifecycle_path", "exclusion", "dependency"].includes(unit.kind), "invalid unit kind");
-    err.check(`${p}.description`, typeof unit.description === "string" && unit.description.length > 0, "must be a non-empty string");
-    err.check(`${p}.status`, UNIT_STATUSES.includes(unit.status), `invalid status (allowed: ${UNIT_STATUSES.join(", ")})`);
+    err.check(
+      `${p}.kind`,
+      [
+        "surface",
+        "trust_boundary",
+        "attack_class",
+        "lifecycle_path",
+        "exclusion",
+        "dependency",
+      ].includes(unit.kind),
+      "invalid unit kind",
+    );
+    err.check(
+      `${p}.description`,
+      typeof unit.description === "string" && unit.description.length > 0,
+      "must be a non-empty string",
+    );
+    err.check(
+      `${p}.status`,
+      UNIT_STATUSES.includes(unit.status),
+      `invalid status (allowed: ${UNIT_STATUSES.join(", ")})`,
+    );
 
     if ("reviewedPaths" in unit) {
-      err.check(`${p}.reviewedPaths`, Array.isArray(unit.reviewedPaths), "must be an array of repo-relative paths");
+      err.check(
+        `${p}.reviewedPaths`,
+        Array.isArray(unit.reviewedPaths),
+        "must be an array of repo-relative paths",
+      );
       if (Array.isArray(unit.reviewedPaths)) {
         for (const [j, path] of unit.reviewedPaths.entries()) {
-          err.check(`${p}.reviewedPaths[${j}]`, typeof path === "string" && path.length > 0 && !path.startsWith("/") && !path.includes(".."), "must be repo-relative without '..' or leading '/'");
+          err.check(
+            `${p}.reviewedPaths[${j}]`,
+            typeof path === "string" &&
+              path.length > 0 &&
+              !path.startsWith("/") &&
+              !path.includes(".."),
+            "must be repo-relative without '..' or leading '/'",
+          );
         }
       }
     }
     if ("findings" in unit) {
-      err.check(`${p}.findings`, Array.isArray(unit.findings), "must be an array of finding fingerprints");
+      err.check(
+        `${p}.findings`,
+        Array.isArray(unit.findings),
+        "must be an array of finding fingerprints",
+      );
       if (Array.isArray(unit.findings)) {
         for (const [j, fp] of unit.findings.entries()) {
-          err.check(`${p}.findings[${j}]`, HEX16.test(String(fp)), "finding fingerprint must be 16 lowercase hex chars");
+          err.check(
+            `${p}.findings[${j}]`,
+            HEX16.test(String(fp)),
+            "finding fingerprint must be 16 lowercase hex chars",
+          );
         }
       }
     }
@@ -303,12 +550,23 @@ function validateLedger(doc, err, root) {
         for (const [j, check] of unit.checks.entries()) {
           const cp = `${p}.checks[${j}]`;
           if (!isObject(check)) {
-            err.at(cp, "must be an object with kind (case|evidence_item|artifact|tool_call) and ref");
+            err.at(
+              cp,
+              "must be an object with kind (case|evidence_item|artifact|tool_call) and ref",
+            );
             continue;
           }
           rejectUnknown(err, check, cp, ["kind", "ref"]);
-          err.check(`${cp}.kind`, ["case", "evidence_item", "artifact", "tool_call"].includes(check.kind), "invalid check kind");
-          err.check(`${cp}.ref`, typeof check.ref === "string" && check.ref.length > 0, "must be a non-empty reference");
+          err.check(
+            `${cp}.kind`,
+            ["case", "evidence_item", "artifact", "tool_call"].includes(check.kind),
+            "invalid check kind",
+          );
+          err.check(
+            `${cp}.ref`,
+            typeof check.ref === "string" && check.ref.length > 0,
+            "must be a non-empty reference",
+          );
         }
       }
     }
@@ -317,26 +575,54 @@ function validateLedger(doc, err, root) {
     if (unit.status === "covered" || unit.status === "not_applicable") {
       const paths = Array.isArray(unit.reviewedPaths) ? unit.reviewedPaths.length : 0;
       const checks = Array.isArray(unit.checks) ? unit.checks.length : 0;
-      err.check(`${p}.reviewedPaths`, paths >= 1, `${unit.status} requires at least one reviewed path`);
-      err.check(`${p}.checks`, checks >= 1, `${unit.status} requires at least one evidence-backed check — "agent found nothing" is not coverage`);
+      err.check(
+        `${p}.reviewedPaths`,
+        paths >= 1,
+        `${unit.status} requires at least one reviewed path`,
+      );
+      err.check(
+        `${p}.checks`,
+        checks >= 1,
+        `${unit.status} requires at least one evidence-backed check — "agent found nothing" is not coverage`,
+      );
     }
     if (["blocked", "deferred", "out_of_scope", "not_applicable"].includes(unit.status)) {
-      err.check(`${p}.reason`, typeof unit.reason === "string" && unit.reason.length > 0, `${unit.status} requires a reason`);
+      err.check(
+        `${p}.reason`,
+        typeof unit.reason === "string" && unit.reason.length > 0,
+        `${unit.status} requires a reason`,
+      );
     }
     if (unit.status === "deferred") {
-      err.check(`${p}.revisitWhen`, typeof unit.revisitWhen === "string" && unit.revisitWhen.length > 0, "deferred requires a concrete revisit trigger");
+      err.check(
+        `${p}.revisitWhen`,
+        typeof unit.revisitWhen === "string" && unit.revisitWhen.length > 0,
+        "deferred requires a concrete revisit trigger",
+      );
     }
     if ("revisitWhen" in unit && unit.status !== "deferred") {
-      err.check(`${p}.revisitWhen`, typeof unit.revisitWhen === "string" && unit.revisitWhen.length > 0, "must be a non-empty string when present");
+      err.check(
+        `${p}.revisitWhen`,
+        typeof unit.revisitWhen === "string" && unit.revisitWhen.length > 0,
+        "must be a non-empty string when present",
+      );
     }
     if ("sourceRevision" in unit) {
-      err.check(`${p}.sourceRevision`, typeof unit.sourceRevision === "string" && unit.sourceRevision.length > 0, "must be a non-empty revision string when present");
+      err.check(
+        `${p}.sourceRevision`,
+        typeof unit.sourceRevision === "string" && unit.sourceRevision.length > 0,
+        "must be a non-empty revision string when present",
+      );
     }
   }
 }
 
 function validateEvidenceList(err, list, p, kinds) {
-  err.check(p, Array.isArray(list) && list.length >= 1, "must be a non-empty array of evidence refs");
+  err.check(
+    p,
+    Array.isArray(list) && list.length >= 1,
+    "must be a non-empty array of evidence refs",
+  );
   if (!Array.isArray(list)) return;
   for (const [i, ev] of list.entries()) {
     const ep = `${p}[${i}]`;
@@ -345,113 +631,315 @@ function validateEvidenceList(err, list, p, kinds) {
       continue;
     }
     rejectUnknown(err, ev, ep, ["kind", "ref"]);
-    err.check(ep, kinds.includes(ev.kind) && typeof ev.ref === "string" && ev.ref.length > 0, `each item needs kind (${kinds.join("|")}) and ref`);
+    err.check(
+      ep,
+      kinds.includes(ev.kind) && typeof ev.ref === "string" && ev.ref.length > 0,
+      `each item needs kind (${kinds.join("|")}) and ref`,
+    );
   }
 }
 
 function validateFinding(doc, err, root) {
-  rejectUnknown(err, doc, root, ["schema", "fingerprint", "runId", "caseId", "title", "coverageUnits", "disposition", "verifiedBy", "confirmed", "needs_validation", "rejected"]);
-  requireFields(err, doc, root, ["schema", "fingerprint", "runId", "caseId", "title", "disposition"]);
-  err.check(`${root}.schema`, doc.schema === "xpi/finding-record@1", 'must be "xpi/finding-record@1"');
-  err.check(`${root}.fingerprint`, HEX16.test(String(doc.fingerprint ?? "")), "must be 16 lowercase hex chars");
-  err.check(`${root}.runId`, RUN_ID.test(String(doc.runId ?? "")), "must match ^[a-z0-9][a-z0-9-]{5,63}$");
-  err.check(`${root}.caseId`, typeof doc.caseId === "string" && doc.caseId.length > 0, "must be a non-empty string");
-  err.check(`${root}.title`, typeof doc.title === "string" && doc.title.length > 0, "must be a non-empty string");
+  rejectUnknown(err, doc, root, [
+    "schema",
+    "fingerprint",
+    "runId",
+    "caseId",
+    "title",
+    "coverageUnits",
+    "disposition",
+    "verifiedBy",
+    "confirmed",
+    "needs_validation",
+    "rejected",
+  ]);
+  requireFields(err, doc, root, [
+    "schema",
+    "fingerprint",
+    "runId",
+    "caseId",
+    "title",
+    "disposition",
+  ]);
+  err.check(
+    `${root}.schema`,
+    doc.schema === "xpi/finding-record@1",
+    'must be "xpi/finding-record@1"',
+  );
+  err.check(
+    `${root}.fingerprint`,
+    HEX16.test(String(doc.fingerprint ?? "")),
+    "must be 16 lowercase hex chars",
+  );
+  err.check(
+    `${root}.runId`,
+    RUN_ID.test(String(doc.runId ?? "")),
+    "must match ^[a-z0-9][a-z0-9-]{5,63}$",
+  );
+  err.check(
+    `${root}.caseId`,
+    typeof doc.caseId === "string" && doc.caseId.length > 0,
+    "must be a non-empty string",
+  );
+  err.check(
+    `${root}.title`,
+    typeof doc.title === "string" && doc.title.length > 0,
+    "must be a non-empty string",
+  );
   if (doc.coverageUnits !== undefined) {
-    err.check(`${root}.coverageUnits`, Array.isArray(doc.coverageUnits) && doc.coverageUnits.length >= 1, "must be a non-empty array of ledger unit ids");
+    err.check(
+      `${root}.coverageUnits`,
+      Array.isArray(doc.coverageUnits) && doc.coverageUnits.length >= 1,
+      "must be a non-empty array of ledger unit ids",
+    );
     if (Array.isArray(doc.coverageUnits)) {
       for (const [i, unit] of doc.coverageUnits.entries()) {
-        err.check(`${root}.coverageUnits[${i}]`, typeof unit === "string" && unit.length > 0, "must be a non-empty ledger unit id");
+        err.check(
+          `${root}.coverageUnits[${i}]`,
+          typeof unit === "string" && unit.length > 0,
+          "must be a non-empty ledger unit id",
+        );
       }
     }
   }
-  err.check(`${root}.disposition`, ["confirmed", "needs_validation", "rejected"].includes(doc.disposition), "invalid disposition enum");
+  err.check(
+    `${root}.disposition`,
+    ["confirmed", "needs_validation", "rejected"].includes(doc.disposition),
+    "invalid disposition enum",
+  );
 
   // Disposition payloads are mutually exclusive — a record carries exactly
   // the payload matching its disposition.
   const present = ["confirmed", "needs_validation", "rejected"].filter((k) => k in doc);
   if (present.length > 1) {
-    err.at(`${root}.${present[1]}`, `disposition payloads are mutually exclusive (found ${present.join(" + ")})`);
+    err.at(
+      `${root}.${present[1]}`,
+      `disposition payloads are mutually exclusive (found ${present.join(" + ")})`,
+    );
   }
 
   const d = doc.disposition;
   if (d === "confirmed") {
     const c = doc.confirmed;
     if (err.check(`${root}.confirmed`, isObject(c), "confirmed requires a confirmed payload")) {
-      rejectUnknown(err, c, `${root}.confirmed`, ["sourceTrace", "attackerModel", "observedResult", "affectedResource", "conditions", "evidence", "severity", "smallestFix", "verification"]);
-      requireFields(err, c, `${root}.confirmed`, ["sourceTrace", "attackerModel", "observedResult", "affectedResource", "conditions", "evidence", "severity", "smallestFix", "verification"]);
-      err.check(`${root}.confirmed.sourceTrace`, Array.isArray(c.sourceTrace), "must be an array of {path, lines} objects");
+      rejectUnknown(err, c, `${root}.confirmed`, [
+        "sourceTrace",
+        "attackerModel",
+        "observedResult",
+        "affectedResource",
+        "conditions",
+        "evidence",
+        "severity",
+        "smallestFix",
+        "verification",
+      ]);
+      requireFields(err, c, `${root}.confirmed`, [
+        "sourceTrace",
+        "attackerModel",
+        "observedResult",
+        "affectedResource",
+        "conditions",
+        "evidence",
+        "severity",
+        "smallestFix",
+        "verification",
+      ]);
+      err.check(
+        `${root}.confirmed.sourceTrace`,
+        Array.isArray(c.sourceTrace),
+        "must be an array of {path, lines} objects",
+      );
       if (Array.isArray(c.sourceTrace)) {
-        err.check(`${root}.confirmed.sourceTrace`, c.sourceTrace.length >= 1, "needs at least one source location");
+        err.check(
+          `${root}.confirmed.sourceTrace`,
+          c.sourceTrace.length >= 1,
+          "needs at least one source location",
+        );
         for (const [i, tr] of c.sourceTrace.entries()) {
-          err.check(`${root}.confirmed.sourceTrace[${i}]`, isObject(tr) && typeof tr.path === "string" && tr.path.length > 0 && !tr.path.includes("..") && /^\d+(-\d+)?$/.test(String(tr.lines ?? "")), "each trace needs a repo-relative path and lines like '120' or '120-145'");
+          err.check(
+            `${root}.confirmed.sourceTrace[${i}]`,
+            isObject(tr) &&
+              typeof tr.path === "string" &&
+              tr.path.length > 0 &&
+              !tr.path.includes("..") &&
+              /^\d+(-\d+)?$/.test(String(tr.lines ?? "")),
+            "each trace needs a repo-relative path and lines like '120' or '120-145'",
+          );
           if (isObject(tr) && "note" in tr) {
-            err.check(`${root}.confirmed.sourceTrace[${i}].note`, typeof tr.note === "string", "must be a string");
+            err.check(
+              `${root}.confirmed.sourceTrace[${i}].note`,
+              typeof tr.note === "string",
+              "must be a string",
+            );
           }
         }
       }
       for (const field of ["attackerModel", "observedResult", "affectedResource", "smallestFix"]) {
-        err.check(`${root}.confirmed.${field}`, typeof c[field] === "string" && c[field].length > 0, "must be a non-empty string");
+        err.check(
+          `${root}.confirmed.${field}`,
+          typeof c[field] === "string" && c[field].length > 0,
+          "must be a non-empty string",
+        );
       }
-      err.check(`${root}.confirmed.conditions`, Array.isArray(c.conditions) && c.conditions.length >= 1, "must list at least one precondition");
+      err.check(
+        `${root}.confirmed.conditions`,
+        Array.isArray(c.conditions) && c.conditions.length >= 1,
+        "must list at least one precondition",
+      );
       if (Array.isArray(c.conditions)) {
         for (const [i, cond] of c.conditions.entries()) {
-          err.check(`${root}.confirmed.conditions[${i}]`, typeof cond === "string" && cond.length > 0, "each precondition must be a non-empty string");
+          err.check(
+            `${root}.confirmed.conditions[${i}]`,
+            typeof cond === "string" && cond.length > 0,
+            "each precondition must be a non-empty string",
+          );
         }
       }
-      validateEvidenceList(err, c.evidence, `${root}.confirmed.evidence`, ["evidence_item", "artifact", "poc_run"]);
-      err.check(`${root}.confirmed.severity`, ["info", "low", "medium", "high", "critical"].includes(c.severity), "invalid severity enum");
-      if (err.check(`${root}.confirmed.verification`, isObject(c.verification), "must be an object")) {
-        rejectUnknown(err, c.verification, `${root}.confirmed.verification`, ["mode", "harnessNote"]);
-        err.check(`${root}.confirmed.verification.mode`, ["inter_host", "intra_target", "oob", "static_only"].includes(c.verification.mode), "invalid verification mode");
+      validateEvidenceList(err, c.evidence, `${root}.confirmed.evidence`, [
+        "evidence_item",
+        "artifact",
+        "poc_run",
+      ]);
+      err.check(
+        `${root}.confirmed.severity`,
+        ["info", "low", "medium", "high", "critical"].includes(c.severity),
+        "invalid severity enum",
+      );
+      if (
+        err.check(`${root}.confirmed.verification`, isObject(c.verification), "must be an object")
+      ) {
+        rejectUnknown(err, c.verification, `${root}.confirmed.verification`, [
+          "mode",
+          "harnessNote",
+        ]);
+        err.check(
+          `${root}.confirmed.verification.mode`,
+          ["inter_host", "intra_target", "oob", "static_only"].includes(c.verification.mode),
+          "invalid verification mode",
+        );
         if ("harnessNote" in c.verification) {
-          err.check(`${root}.confirmed.verification.harnessNote`, typeof c.verification.harnessNote === "string", "must be a string");
+          err.check(
+            `${root}.confirmed.verification.harnessNote`,
+            typeof c.verification.harnessNote === "string",
+            "must be a string",
+          );
         }
       }
     }
     const v = doc.verifiedBy;
-    if (err.check(`${root}.verifiedBy`, isObject(v), "confirmed requires verification provenance")) {
-      rejectUnknown(err, v, `${root}.verifiedBy`, ["verifierRole", "recordCheckRole", "coordinatorConfirmRole"]);
+    if (
+      err.check(`${root}.verifiedBy`, isObject(v), "confirmed requires verification provenance")
+    ) {
+      rejectUnknown(err, v, `${root}.verifiedBy`, [
+        "verifierRole",
+        "recordCheckRole",
+        "coordinatorConfirmRole",
+      ]);
       requireFields(err, v, `${root}.verifiedBy`, ["verifierRole", "recordCheckRole"]);
-      err.check(`${root}.verifiedBy.verifierRole`, typeof v.verifierRole === "string" && v.verifierRole.length > 0, "must name the fresh verifier role");
-      err.check(`${root}.verifiedBy.recordCheckRole`, typeof v.recordCheckRole === "string" && v.recordCheckRole.length > 0, "must name the final record-check role");
+      err.check(
+        `${root}.verifiedBy.verifierRole`,
+        typeof v.verifierRole === "string" && v.verifierRole.length > 0,
+        "must name the fresh verifier role",
+      );
+      err.check(
+        `${root}.verifiedBy.recordCheckRole`,
+        typeof v.recordCheckRole === "string" && v.recordCheckRole.length > 0,
+        "must name the final record-check role",
+      );
       if ("coordinatorConfirmRole" in v) {
-        err.check(`${root}.verifiedBy.coordinatorConfirmRole`, typeof v.coordinatorConfirmRole === "string" && v.coordinatorConfirmRole.length > 0, "must be a non-empty string");
+        err.check(
+          `${root}.verifiedBy.coordinatorConfirmRole`,
+          typeof v.coordinatorConfirmRole === "string" && v.coordinatorConfirmRole.length > 0,
+          "must be a non-empty string",
+        );
       }
       if (v.verifierRole && v.recordCheckRole && v.verifierRole === v.recordCheckRole) {
-        err.at(`${root}.verifiedBy.recordCheckRole`, "record check must be a different pass from the candidate verifier");
+        err.at(
+          `${root}.verifiedBy.recordCheckRole`,
+          "record check must be a different pass from the candidate verifier",
+        );
       }
     }
   } else if (d === "needs_validation") {
     const n = doc.needs_validation;
-    if (err.check(`${root}.needs_validation`, isObject(n), "needs_validation requires a needs_validation payload")) {
-      rejectUnknown(err, n, `${root}.needs_validation`, ["exactClaim", "unresolvedFact", "resolutionPlan"]);
-      requireFields(err, n, `${root}.needs_validation`, ["exactClaim", "unresolvedFact", "resolutionPlan"]);
+    if (
+      err.check(
+        `${root}.needs_validation`,
+        isObject(n),
+        "needs_validation requires a needs_validation payload",
+      )
+    ) {
+      rejectUnknown(err, n, `${root}.needs_validation`, [
+        "exactClaim",
+        "unresolvedFact",
+        "resolutionPlan",
+      ]);
+      requireFields(err, n, `${root}.needs_validation`, [
+        "exactClaim",
+        "unresolvedFact",
+        "resolutionPlan",
+      ]);
       for (const field of ["exactClaim", "unresolvedFact"]) {
-        err.check(`${root}.needs_validation.${field}`, typeof n[field] === "string" && n[field].length > 0, "must be a non-empty string");
+        err.check(
+          `${root}.needs_validation.${field}`,
+          typeof n[field] === "string" && n[field].length > 0,
+          "must be a non-empty string",
+        );
       }
       const plan = n.resolutionPlan;
-      if (err.check(`${root}.needs_validation.resolutionPlan`, isObject(plan), "must be an object")) {
-        err.check(`${root}.needs_validation.resolutionPlan.approach`, ["safe_local", "owner_observed"].includes(plan.approach), "approach must be safe_local or owner_observed");
+      if (
+        err.check(`${root}.needs_validation.resolutionPlan`, isObject(plan), "must be an object")
+      ) {
+        err.check(
+          `${root}.needs_validation.resolutionPlan.approach`,
+          ["safe_local", "owner_observed"].includes(plan.approach),
+          "approach must be safe_local or owner_observed",
+        );
         rejectUnknown(err, plan, `${root}.needs_validation.resolutionPlan`, ["approach", "steps"]);
         if ("steps" in plan) {
-          err.check(`${root}.needs_validation.resolutionPlan.steps`, Array.isArray(plan.steps) && plan.steps.every((s) => typeof s === "string" && s.length > 0), "must be an array of non-empty step strings");
+          err.check(
+            `${root}.needs_validation.resolutionPlan.steps`,
+            Array.isArray(plan.steps) &&
+              plan.steps.every((s) => typeof s === "string" && s.length > 0),
+            "must be an array of non-empty step strings",
+          );
         }
       }
-      err.check(`${root}.confirmed`, !("confirmed" in doc), "needs_validation carries no confirmed payload");
+      err.check(
+        `${root}.confirmed`,
+        !("confirmed" in doc),
+        "needs_validation carries no confirmed payload",
+      );
     }
   } else if (d === "rejected") {
     const r = doc.rejected;
     if (err.check(`${root}.rejected`, isObject(r), "rejected requires a rejected payload")) {
-      rejectUnknown(err, r, `${root}.rejected`, ["disprovedClaim", "reason", "changedEvidenceWouldReopen", "evidence"]);
+      rejectUnknown(err, r, `${root}.rejected`, [
+        "disprovedClaim",
+        "reason",
+        "changedEvidenceWouldReopen",
+        "evidence",
+      ]);
       requireFields(err, r, `${root}.rejected`, ["disprovedClaim", "reason", "evidence"]);
       for (const field of ["disprovedClaim", "reason"]) {
-        err.check(`${root}.rejected.${field}`, typeof r[field] === "string" && r[field].length > 0, "must be a non-empty string");
+        err.check(
+          `${root}.rejected.${field}`,
+          typeof r[field] === "string" && r[field].length > 0,
+          "must be a non-empty string",
+        );
       }
       if ("changedEvidenceWouldReopen" in r) {
-        err.check(`${root}.rejected.changedEvidenceWouldReopen`, typeof r.changedEvidenceWouldReopen === "boolean", "must be a boolean");
+        err.check(
+          `${root}.rejected.changedEvidenceWouldReopen`,
+          typeof r.changedEvidenceWouldReopen === "boolean",
+          "must be a boolean",
+        );
       }
-      validateEvidenceList(err, r.evidence, `${root}.rejected.evidence`, ["evidence_item", "artifact", "source_reading"]);
+      validateEvidenceList(err, r.evidence, `${root}.rejected.evidence`, [
+        "evidence_item",
+        "artifact",
+        "source_reading",
+      ]);
     }
   }
 }
@@ -473,7 +961,10 @@ function validateDocument(doc) {
       validateFinding(doc, err, "$");
       break;
     default:
-      err.at("$.schema", 'unknown record type — expected "xpi/audit-run@1", "xpi/coverage-ledger@1", or "xpi/finding-record@1"');
+      err.at(
+        "$.schema",
+        'unknown record type — expected "xpi/audit-run@1", "xpi/coverage-ledger@1", or "xpi/finding-record@1"',
+      );
   }
   return err;
 }
@@ -556,7 +1047,9 @@ function main(argv) {
         continue;
       }
       if (typeOverride && doc.schema !== EXPECTED_TYPE[typeOverride]) {
-        console.error(`${path}: expected ${EXPECTED_TYPE[typeOverride]}, got ${String(doc.schema)}`);
+        console.error(
+          `${path}: expected ${EXPECTED_TYPE[typeOverride]}, got ${String(doc.schema)}`,
+        );
         code = 1;
         continue;
       }
@@ -576,7 +1069,10 @@ function main(argv) {
     for (const { path, doc } of docs) {
       if (doc.schema === "xpi/coverage-ledger@1" && Array.isArray(doc.units)) {
         const ids = new Set(
-          doc.units.filter(isObject).map((u) => u.id).filter((id) => typeof id === "string"),
+          doc.units
+            .filter(isObject)
+            .map((u) => u.id)
+            .filter((id) => typeof id === "string"),
         );
         ledgers.set(doc.runId, { ids, path });
       }
@@ -593,7 +1089,9 @@ function main(argv) {
       }
       for (const unit of doc.coverageUnits) {
         if (!ledger.ids.has(unit)) {
-          console.error(`${path}: $.coverageUnits: "${unit}" not present in ${ledger.path} (runId ${doc.runId})`);
+          console.error(
+            `${path}: $.coverageUnits: "${unit}" not present in ${ledger.path} (runId ${doc.runId})`,
+          );
           code = 1;
         }
       }
@@ -603,7 +1101,9 @@ function main(argv) {
 
   const file = positional[0];
   if (!file) {
-    console.error("usage: node scripts/validate-records.js <file.json> [--type manifest|ledger|finding] | --all <dir>");
+    console.error(
+      "usage: node scripts/validate-records.js <file.json> [--type manifest|ledger|finding] | --all <dir>",
+    );
     return 2;
   }
   const result = validateFile(file, typeOverride);
@@ -612,11 +1112,10 @@ function main(argv) {
   return result.code;
 }
 
-
 const invokedDirectly =
   process.argv[1] && import.meta.url === `file://${realpathSync(process.argv[1])}`;
 if (invokedDirectly) {
   process.exit(main(process.argv));
 }
 
-export { validateDocument, validateManifest, validateLedger, validateFinding };
+export { validateDocument, validateFinding, validateLedger, validateManifest };

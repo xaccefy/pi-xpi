@@ -16,7 +16,6 @@ import {
 } from "./ledger-internal.ts";
 import type { DatabaseSync } from "./sqlite-compat/index.ts";
 
-
 /** Automated exploit-chain patterns (ported shape from CyberStrike chain.ts + XBOW 104 expansion). */
 const CHAIN_PATTERN_VALUES = [
   "credential_endpoint",
@@ -162,7 +161,6 @@ export function sameAssetOrRelated(a: CaseRecord, b: CaseRecord): boolean {
   if (ta.endsWith(`.${tb}`) || tb.endsWith(`.${ta}`)) return true;
   return eTLDPlus1(ta) === eTLDPlus1(tb);
 }
-
 
 function mapPrimitiveRow(row: any, caseIds: string[]): PrimitiveRecord {
   return {

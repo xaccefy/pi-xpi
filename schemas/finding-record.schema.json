@@ -31,13 +31,26 @@
       "properties": {
         "verifierRole": { "type": "string", "minLength": 1 },
         "recordCheckRole": { "type": "string", "minLength": 1 },
-        "coordinatorConfirmRole": { "type": "string", "description": "The coordinator remains the only semantic confirmer." }
+        "coordinatorConfirmRole": {
+          "type": "string",
+          "description": "The coordinator remains the only semantic confirmer."
+        }
       }
     },
     "confirmed": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["sourceTrace", "attackerModel", "observedResult", "affectedResource", "conditions", "evidence", "severity", "smallestFix", "verification"],
+      "required": [
+        "sourceTrace",
+        "attackerModel",
+        "observedResult",
+        "affectedResource",
+        "conditions",
+        "evidence",
+        "severity",
+        "smallestFix",
+        "verification"
+      ],
       "properties": {
         "sourceTrace": {
           "type": "array",
@@ -53,10 +66,23 @@
             }
           }
         },
-        "attackerModel": { "type": "string", "minLength": 1, "description": "Who the attacker is and what access they start with." },
-        "observedResult": { "type": "string", "minLength": 1, "description": "Bounded observed result — what was actually demonstrated, no extrapolation." },
+        "attackerModel": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Who the attacker is and what access they start with."
+        },
+        "observedResult": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Bounded observed result — what was actually demonstrated, no extrapolation."
+        },
         "affectedResource": { "type": "string", "minLength": 1 },
-        "conditions": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 }, "description": "Required preconditions/config/state." },
+        "conditions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Required preconditions/config/state."
+        },
         "evidence": {
           "type": "array",
           "minItems": 1,
@@ -74,7 +100,11 @@
           "enum": ["info", "low", "medium", "high", "critical"],
           "description": "Impact-based, assigned only after the gate passed."
         },
-        "smallestFix": { "type": "string", "minLength": 1, "description": "Smallest change that removes the vulnerability." },
+        "smallestFix": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Smallest change that removes the vulnerability."
+        },
         "verification": {
           "type": "object",
           "additionalProperties": false,
@@ -92,8 +122,16 @@
       "required": ["exactClaim", "unresolvedFact", "resolutionPlan"],
       "description": "No severity — an unverified lead has none.",
       "properties": {
-        "exactClaim": { "type": "string", "minLength": 1, "description": "The precise source-grounded claim." },
-        "unresolvedFact": { "type": "string", "minLength": 1, "description": "The single fact that, if resolved, decides the claim." },
+        "exactClaim": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The precise source-grounded claim."
+        },
+        "unresolvedFact": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The single fact that, if resolved, decides the claim."
+        },
         "resolutionPlan": {
           "type": "object",
           "additionalProperties": false,
@@ -130,8 +168,17 @@
     }
   },
   "allOf": [
-    { "if": { "properties": { "disposition": { "const": "confirmed" } } }, "then": { "required": ["confirmed", "verifiedBy"] } },
-    { "if": { "properties": { "disposition": { "const": "needs_validation" } } }, "then": { "required": ["needs_validation"] } },
-    { "if": { "properties": { "disposition": { "const": "rejected" } } }, "then": { "required": ["rejected"] } }
+    {
+      "if": { "properties": { "disposition": { "const": "confirmed" } } },
+      "then": { "required": ["confirmed", "verifiedBy"] }
+    },
+    {
+      "if": { "properties": { "disposition": { "const": "needs_validation" } } },
+      "then": { "required": ["needs_validation"] }
+    },
+    {
+      "if": { "properties": { "disposition": { "const": "rejected" } } },
+      "then": { "required": ["rejected"] }
+    }
   ]
 }

@@ -39,7 +39,6 @@ import {
 } from "./ledger-internal.ts";
 import type { DatabaseSync } from "./sqlite-compat/index.ts";
 
-
 function mapObjectiveRow(row: any, caseIds: string[]): ObjectiveRecord {
   return {
     id: row.id,

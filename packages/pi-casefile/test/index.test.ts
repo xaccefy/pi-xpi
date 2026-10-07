@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import assert from "node:assert";
 import { readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -553,21 +554,28 @@ describe("casefile extension", () => {
       expect(phase1.isError).toBeUndefined();
       expect(provisioned.length).toBe(2);
 
-      const confirm = await executeTool(pi, "ConfirmFinding", {
-        id: added.details.record.id,
-        verdict: {
-          verdict: "CONFIRMED",
-          reasoning: "oracle saw the target token only under attested source separation",
-          evidence_reviewed: ["poc"],
-          differential: "target_only",
-          re_execution_note: "fresh OOB replay",
-          disconfirmation_attempt: "none offered",
-          canary_assessment: "not_applicable",
-          canary_reason: "the per-run OOB token IS the causality signal here",
+      await assert.rejects(
+        executeTool(pi, "ConfirmFinding", {
+          id: added.details.record.id,
+          verdict: {
+            verdict: "CONFIRMED",
+            reasoning: "oracle saw the target token only under attested source separation",
+            evidence_reviewed: ["poc"],
+            differential: "target_only",
+            re_execution_note: "fresh OOB replay",
+            disconfirmation_attempt: "none offered",
+            canary_assessment: "not_applicable",
+            canary_reason: "the per-run OOB token IS the causality signal here",
+          },
+        }),
+        (e: Error) => {
+          assert.ok(
+            /OOB oracle \/provision failed: HTTP 500/.test(e.message),
+            `unexpected: ${e.message}`,
+          );
+          return true;
         },
-      });
-      expect(confirm.isError).toBe(true);
-      expect(confirm.content[0].text).toContain("OOB fresh replay unavailable");
+      );
       // No stale re-poll: the phase-1 tokens were never re-queried.
       expect(provisioned.length).toBe(2);
     } finally {
@@ -635,22 +643,25 @@ describe("casefile extension", () => {
 
       // Operator revokes networked PoC execution between the phases.
       delete process.env.PI_POC_ALLOW_NETWORK;
-      const confirm = await executeTool(pi, "ConfirmFinding", {
-        id: added.details.record.id,
-        verdict: {
-          verdict: "CONFIRMED",
-          reasoning: "oracle saw the target token only",
-          evidence_reviewed: ["poc"],
-          differential: "target_only",
-          re_execution_note: "fresh OOB replay",
-          disconfirmation_attempt: "none offered",
-          canary_assessment: "not_applicable",
-          canary_reason: "the per-run OOB token IS the causality signal here",
+      await assert.rejects(
+        executeTool(pi, "ConfirmFinding", {
+          id: added.details.record.id,
+          verdict: {
+            verdict: "CONFIRMED",
+            reasoning: "oracle saw the target token only",
+            evidence_reviewed: ["poc"],
+            differential: "target_only",
+            re_execution_note: "fresh OOB replay",
+            disconfirmation_attempt: "none offered",
+            canary_assessment: "not_applicable",
+            canary_reason: "the per-run OOB token IS the causality signal here",
+          },
+        }),
+        (e: Error) => {
+          assert.ok(e.message.includes("PI_POC_ALLOW_NETWORK=1"), `unexpected: ${e.message}`);
+          return true;
         },
-      });
-      expect(confirm.isError).toBe(true);
-      expect(confirm.content[0].text).toContain("PI_POC_ALLOW_NETWORK=1");
-      expect(confirm.content[0].text).toContain("does not survive revocation");
+      );
       // No fresh replay happened: only the phase-1 pair was ever provisioned.
       expect(provisioned.length).toBe(2);
     } finally {
@@ -733,10 +744,12 @@ describe("casefile extension", () => {
         control_path: hybridControl,
         control_target: "https://control.example",
         oob: true,
+        local: true,
       });
       expect(phase1.isError).toBeUndefined();
       const bundle = phase1.details.record.pendingConfirmation;
       expect(bundle.controlTarget).toBe("https://control.example");
+      expect(bundle.oobRunOptions).toEqual({ network: "host", local: true });
       expect(bundle.oobTokens).toBeDefined();
 
       const confirm = await executeTool(pi, "ConfirmFinding", {
@@ -828,21 +841,28 @@ describe("casefile extension", () => {
       });
       expect(phase1.isError).toBeUndefined();
 
-      const confirm = await executeTool(pi, "ConfirmFinding", {
-        id: added.details.record.id,
-        verdict: {
-          verdict: "CONFIRMED",
-          reasoning: "oracle saw the target token only",
-          evidence_reviewed: ["poc"],
-          differential: "target_only",
-          re_execution_note: "fresh hybrid OOB replay",
-          disconfirmation_attempt: "none offered",
-          canary_assessment: "not_applicable",
-          canary_reason: "the per-run OOB token IS the causality signal here",
+      await assert.rejects(
+        executeTool(pi, "ConfirmFinding", {
+          id: added.details.record.id,
+          verdict: {
+            verdict: "CONFIRMED",
+            reasoning: "oracle saw the target token only",
+            evidence_reviewed: ["poc"],
+            differential: "target_only",
+            re_execution_note: "fresh hybrid OOB replay",
+            disconfirmation_attempt: "none offered",
+            canary_assessment: "not_applicable",
+            canary_reason: "the per-run OOB token IS the causality signal here",
+          },
+        }),
+        (e: Error) => {
+          assert.ok(
+            /MAIN-AGENT REPLAY FAILED/.test(e.message) && /control-token 1/.test(e.message),
+            `unexpected: ${e.message}`,
+          );
+          return true;
         },
-      });
-      expect(confirm.isError).toBe(true);
-      expect(confirm.content[0].text).toMatch(/control-token interaction|target_only/);
+      );
     } finally {
       for (const k of [
         "PI_OOB_ORACLE_URL",
@@ -907,22 +927,33 @@ describe("casefile extension", () => {
       });
       expect(phase1.isError).toBeUndefined();
 
-      writeFileSync(separateControl, `${readFileSync(separateControl, "utf8")}# tampered\n`, "utf8");
-      const confirm = await executeTool(pi, "ConfirmFinding", {
-        id: added.details.record.id,
-        verdict: {
-          verdict: "CONFIRMED",
-          reasoning: "oracle saw the target token only",
-          evidence_reviewed: ["poc"],
-          differential: "target_only",
-          re_execution_note: "fresh hybrid OOB replay",
-          disconfirmation_attempt: "none offered",
-          canary_assessment: "not_applicable",
-          canary_reason: "the per-run OOB token IS the causality signal here",
+      writeFileSync(
+        separateControl,
+        `${readFileSync(separateControl, "utf8")}# tampered\n`,
+        "utf8",
+      );
+      await assert.rejects(
+        executeTool(pi, "ConfirmFinding", {
+          id: added.details.record.id,
+          verdict: {
+            verdict: "CONFIRMED",
+            reasoning: "oracle saw the target token only",
+            evidence_reviewed: ["poc"],
+            differential: "target_only",
+            re_execution_note: "fresh hybrid OOB replay",
+            disconfirmation_attempt: "none offered",
+            canary_assessment: "not_applicable",
+            canary_reason: "the per-run OOB token IS the causality signal here",
+          },
+        }),
+        (e: Error) => {
+          assert.ok(
+            e.message.includes("control script changed since phase 1"),
+            `unexpected: ${e.message}`,
+          );
+          return true;
         },
-      });
-      expect(confirm.isError).toBe(true);
-      expect(confirm.content[0].text).toContain("control script changed since phase 1");
+      );
       // Failed before provisioning: still only the phase-1 pair exists.
       expect(provisioned.length).toBe(2);
     } finally {

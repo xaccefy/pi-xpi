@@ -78,34 +78,34 @@ describe("pi-webxp: raw_request / race_send", () => {
   });
 
   /** Server that consumes requests but never responds; `ready` resolves once
- * `minHeads` connections delivered bytes — proof the sockets are established
- * and head writes flushed, so a test can abort deterministically mid-capture
- * instead of racing the dial phase. */
-function startHoldingServer(minHeads: number): Promise<{
-  server: Server;
-  port: number;
-  ready: Promise<void>;
-}> {
-  return new Promise((resolve) => {
-    let heads = 0;
-    let readyResolve: () => void;
-    const ready = new Promise<void>((r) => {
-      readyResolve = r;
-    });
-    const server = net.createServer((socket) => {
-      socket.on("data", () => {
-        heads += 1;
-        if (heads >= minHeads) readyResolve();
+   * `minHeads` connections delivered bytes — proof the sockets are established
+   * and head writes flushed, so a test can abort deterministically mid-capture
+   * instead of racing the dial phase. */
+  function startHoldingServer(minHeads: number): Promise<{
+    server: Server;
+    port: number;
+    ready: Promise<void>;
+  }> {
+    return new Promise((resolve) => {
+      let heads = 0;
+      let readyResolve: () => void;
+      const ready = new Promise<void>((r) => {
+        readyResolve = r;
       });
-      socket.on("error", () => undefined);
+      const server = net.createServer((socket) => {
+        socket.on("data", () => {
+          heads += 1;
+          if (heads >= minHeads) readyResolve();
+        });
+        socket.on("error", () => undefined);
+      });
+      server.listen(0, "127.0.0.1", () => {
+        resolve({ server, port: (server.address() as AddressInfo).port, ready });
+      });
     });
-    server.listen(0, "127.0.0.1", () => {
-      resolve({ server, port: (server.address() as AddressInfo).port, ready });
-    });
-  });
-}
+  }
 
-function tool(name: string) {
+  function tool(name: string) {
     const t = api.tools.find((x) => x.name === name);
     assert.ok(t, `${name} registered`);
     return t!;
@@ -275,6 +275,7 @@ function tool(name: string) {
           target: `http://127.0.0.1:${port}`,
           requests: Array.from({ length: 2 }, () => "GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
           responseWaitMs: 3000,
+          allowPrivateHosts: true,
         },
         controller.signal,
         () => {},
@@ -300,6 +301,7 @@ function tool(name: string) {
           target: `http://127.0.0.1:${port}`,
           raw: "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
           responseWaitMs: 3000,
+          allowPrivateHosts: true,
         },
         controller.signal,
         () => {},

@@ -2,10 +2,10 @@ import assert from "node:assert";
 import { afterEach, describe, it } from "node:test";
 import {
   fetchInteractions,
+  type OobOracleConfig,
   provisionCallback,
   readOobOracleConfig,
   setOobOracleFetchForTest,
-  type OobOracleConfig,
 } from "../src/oob-oracle.ts";
 
 const GATE_KEYS = [
@@ -42,7 +42,12 @@ describe("oob-oracle: readOobOracleConfig transport rules", () => {
   });
 
   it("accepts plaintext http only on exact loopback endpoints", () => {
-    for (const url of ["http://localhost:9953", "http://127.0.0.1:9953", "http://127.8.9.10:1", "http://[::1]:9953"]) {
+    for (const url of [
+      "http://localhost:9953",
+      "http://127.0.0.1:9953",
+      "http://127.8.9.10:1",
+      "http://[::1]:9953",
+    ]) {
       withEnv({ PI_OOB_ORACLE_URL: url }, () => {
         assert.strictEqual(readOobOracleConfig().error, undefined, url);
       });
