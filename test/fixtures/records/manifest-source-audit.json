@@ -1,0 +1,34 @@
+{
+  "schema": "xpi/audit-run@1",
+  "runId": "audit-xpi-2025-1001",
+  "created": "2025-10-01T09:00:00Z",
+  "ended": "2025-10-01T11:42:00Z",
+  "status": "completed",
+  "mode": "source_audit",
+  "profile": "standard",
+  "harness": "pi",
+  "target": {
+    "kind": "repository",
+    "reference": "https://github.com/example/widget-api",
+    "revision": "4f9c1a2b7d3e5f608192a3b4c5d6e7f890123456",
+    "dirty": false
+  },
+  "scope": {
+    "include": ["src/"],
+    "exclude": ["src/legacy/"]
+  },
+  "roles": {
+    "coordinator": { "model": "claude-sonnet-4-5", "provider": "anthropic" },
+    "auditor": { "model": "claude-sonnet-4-5", "provider": "anthropic" },
+    "coverage-critic": { "model": "claude-sonnet-4-5", "provider": "anthropic" },
+    "finding-verifier": { "model": "claude-opus-4-1", "provider": "anthropic" }
+  },
+  "toolVersions": { "xpi": "b26bce0", "ast-grep": "absent" },
+  "budget": {
+    "wallClockMinutes": 180,
+    "modelCalls": 120,
+    "reservedForCoverageReviewPercent": 10,
+    "reservedForVerificationPercent": 15
+  },
+  "executionPolicy": { "network": "none", "sandbox": "docker", "sandboxFailClosed": true }
+}

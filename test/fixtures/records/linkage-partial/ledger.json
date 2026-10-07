@@ -1,0 +1,14 @@
+{
+  "schema": "xpi/coverage-ledger@1",
+  "runId": "audit-link-2025-0001",
+  "units": [
+    {
+      "id": "src/api/orders.ts:authz:idor",
+      "kind": "surface",
+      "description": "Order access authorization boundary",
+      "status": "covered",
+      "reviewedPaths": ["src/api/orders.ts"],
+      "checks": [{ "kind": "case", "ref": "case-101" }]
+    }
+  ]
+}

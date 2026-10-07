@@ -1,0 +1,17 @@
+{
+  "schema": "xpi/finding-record@1",
+  "fingerprint": "09f8e7d6c5b4a312",
+  "runId": "audit-xpi-2025-1001",
+  "caseId": "case-003",
+  "title": "Password reset token may not be single-use",
+  "coverageUnits": ["src/auth/reset.ts:user:business-logic"],
+  "disposition": "needs_validation",
+  "needs_validation": {
+    "exactClaim": "src/auth/reset.ts:132 does not invalidate the token after a successful reset",
+    "unresolvedFact": "whether a second reset with the same token within the TTL is rejected by the token store",
+    "resolutionPlan": {
+      "approach": "safe_local",
+      "steps": ["Re-read token store consumption logic", "If inconclusive, owner-observed staging test with two sequential resets"]
+    }
+  }
+}

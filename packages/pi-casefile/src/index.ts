@@ -1818,6 +1818,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
                   targetToken: targetCallback.token,
                   controlToken: controlCallback.token,
                 },
+                oobRunOptions: {
+                  network: params.local === true ? "host" : "none",
+                  local: params.local === true,
+                },
               }
             : {}),
           ...(!(isIntra || oobOnly) ? { controlPath, controlTarget, controlRun } : {}),
@@ -1895,7 +1899,7 @@ export default function casefileExtension(pi: ExtensionAPI) {
       name: "ConfirmFinding",
       label: "Main-Agent Confirmation",
       description:
-        "Phase 2 of confirmation, reserved for the main/coordinator agent: commit or refuse promotion after personally reviewing the machine bundle. On CONFIRMED, this tool performs a fresh harness-owned target/control replay; the verdict requires a target-only differential, a concrete re_execution_note and disconfirmation_attempt, a canary assessment, and the still-valid PromoteFinding bundle. The machine transcript is evidence, not the semantic vulnerability verdict. Worker/subagent processes are rejected. NOT_CONFIRMED records the review and keeps the case investigating.",
+        "Phase 2 of confirmation, reserved for the main/coordinator agent: commit or refuse promotion after personally reviewing the machine bundle. On CONFIRMED, this tool performs a fresh harness-owned target/control replay; OOB bundles provision NEW oracle tokens and re-execute the PoC so the differential is a fresh observation, not a re-read of phase-1 interactions. The verdict requires a target-only differential, a concrete re_execution_note and disconfirmation_attempt, a canary assessment, and the still-valid PromoteFinding bundle. The machine transcript is evidence, not the semantic vulnerability verdict. Worker/subagent processes are rejected. NOT_CONFIRMED records the review and keeps the case investigating.",
       promptSnippet: "Main agent: independently review and commit or refuse PoC confirmation",
       promptGuidelines: [
         "Run only in the main/coordinator agent after PromoteFinding returns. Do not dispatch a worker to decide or author this verdict.",
@@ -1935,13 +1939,142 @@ export default function casefileExtension(pi: ExtensionAPI) {
               allowPrivate,
             });
           } else if (bundle.callbackVerified?.attempted && bundle.oobTokens) {
-            // OOB differential: fresh harness-owned re-poll of BOTH run tokens.
-            // Re-polling at confirm time catches interactions that landed after
-            // phase 1 (e.g. a delayed control-token hit) — the verdict is bound
-            // to this fresh observation, not the stored one.
+            // OOB fresh replay: provision NEW tokens and re-execute the PoC so
+            // the differential binds to an interaction the target causes NOW.
+            // Re-polling the phase-1 tokens cannot distinguish a fresh effect
+            // from phase-1 history, so it is never used as the phase-2 check.
+            if (!bundle.oobRunOptions || !bundle.pocPath) {
+              throw new Error(
+                "OOB bundle predates fresh-replay support (no stored sandbox policy) — " +
+                  "re-run PromoteFinding for a fresh bundle",
+              );
+            }
+            // Target binding: the case target must still match the target the
+            // phase-1 evidence was bound to — mixing a changed target with the
+            // old evidence would confirm against the wrong subject.
+            const phase1Target = bundle.targetRuns[0]?.target;
+            if (current.target && phase1Target && current.target !== phase1Target) {
+              throw new Error(
+                "OOB fresh replay: the case target changed since phase 1 — " +
+                  "re-run PromoteFinding so the evidence binds to the current target",
+              );
+            }
+            // Operator authorization is re-checked NOW: phase-1 approval does
+            // not survive revocation of the networked-PoC gate.
+            if (bundle.oobRunOptions.local === true && process.env.PI_POC_ALLOW_NETWORK !== "1") {
+              throw new Error(
+                "OOB fresh replay: networked PoC execution requires the operator's current " +
+                  "PI_POC_ALLOW_NETWORK=1 — phase-1 authorization does not survive revocation; " +
+                  "re-run PromoteFinding after the operator re-authorizes",
+              );
+            }
+            // Control authorization is likewise re-checked NOW: phase-1
+            // approval of the control target does not survive revocation of
+            // PI_POC_CONTROL_TARGETS.
+            if (bundle.controlTarget) {
+              const revokedControlAuthorization = controlTargetAuthorizationError(bundle.controlTarget);
+              if (revokedControlAuthorization) {
+                throw new Error(
+                  `CONTROL AUTHORIZATION FAILED: ${revokedControlAuthorization}. ` +
+                    "The operator's control-target approval was revoked since phase 1 — " +
+                    "re-run PromoteFinding with a currently authorized control.",
+                );
+              }
+            }
+            // Script integrity: the exact bytes hashed at phase 1 must still
+            // be on disk, and must still be there after the replay — a script
+            // that changed in between is not the evidence the bundle describes.
+            const pocSha = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+            const readPoc = (p: string) => {
+              try {
+                return readFileSync(p);
+              } catch (e) {
+                throw new Error(
+                  `OOB fresh replay: cannot read the PoC script (${(e as Error).message}) — ` +
+                    "re-run PromoteFinding",
+                );
+              }
+            };
+            if (pocSha(readPoc(bundle.pocPath)) !== bundle.pocSha256) {
+              throw new Error(
+                "OOB fresh replay: PoC script changed since phase 1 (sha256 mismatch) — " +
+                  "re-run PromoteFinding for a fresh bundle",
+              );
+            }
+            if (bundle.controlPath && pocSha(readPoc(bundle.controlPath)) !== bundle.pocSha256) {
+              throw new Error(
+                "OOB fresh replay: control script changed since phase 1 (same-file sha256 mismatch) — " +
+                  "re-run PromoteFinding for a fresh bundle",
+              );
+            }
+            const freshOracle = readOobOracleConfig();
+            if (!freshOracle.config) {
+              throw new Error(`OOB fresh replay unavailable: ${freshOracle.error}`);
+            }
+            const [freshTarget, freshControl] = await Promise.all([
+              provisionCallback(freshOracle.config),
+              provisionCallback(freshOracle.config),
+            ]);
+            const rerunOptions = (pocMode: string, target: string, domain: string): PocRunOptions => ({
+              network: bundle.oobRunOptions!.network,
+              local: bundle.oobRunOptions!.local,
+              env: {
+                PI_POC_MODE: pocMode,
+                PI_POC_TARGET: target,
+                PI_POC_CALLBACK_DOMAIN: domain,
+              },
+            });
+            const requireComplete = (r: PocRun, label: string) => {
+              if (!r.completed || r.exitCode !== 0) {
+                throw new Error(
+                  `OOB fresh replay: ${label} re-execution failed (completed=${r.completed}, ` +
+                    `exit=${r.exitCode}) — a crash is not evidence; re-run PromoteFinding`,
+                );
+              }
+            };
+            if (bundle.controlTarget && bundle.controlPath) {
+              // OOB + control bundle: the SAME verified script runs against
+              // BOTH origins, each with its own fresh callback domain — the
+              // control token is exercised by a real control execution, not
+              // silent by construction.
+              const targetRerun = runPoc(
+                bundle.pocPath,
+                rerunOptions("poc", caseTargetForReplay, freshTarget.domain),
+              );
+              const controlRerun = runPoc(
+                bundle.controlPath,
+                rerunOptions("control", bundle.controlTarget, freshControl.domain),
+              );
+              requireComplete(targetRerun, "target");
+              requireComplete(controlRerun, "control");
+            } else {
+              // OOB-only policy (no control target): there is no control
+              // execution to repeat. The fresh control token exists purely as
+              // the canary that must stay silent — zero interactions with it
+              // is the differential, and any hit falsifies target-dependence.
+              requireComplete(
+                runPoc(bundle.pocPath, rerunOptions("poc", caseTargetForReplay, freshTarget.domain)),
+                "target",
+              );
+            }
+            // Post-run integrity: bytes must be unchanged across the replay —
+            // both scripts, because the control may be a separate same-byte
+            // file that could be swapped independently of the PoC.
+            if (pocSha(readPoc(bundle.pocPath)) !== bundle.pocSha256) {
+              throw new Error(
+                "OOB fresh replay: PoC script changed during the replay (sha256 mismatch) — " +
+                  "result discarded; re-run PromoteFinding",
+              );
+            }
+            if (bundle.controlPath && pocSha(readPoc(bundle.controlPath)) !== bundle.pocSha256) {
+              throw new Error(
+                "OOB fresh replay: control script changed during the replay (sha256 mismatch) — " +
+                  "result discarded; re-run PromoteFinding",
+              );
+            }
             const { verification } = await verifyOobDifferential({
-              targetToken: bundle.oobTokens.targetToken,
-              controlToken: bundle.oobTokens.controlToken,
+              targetToken: freshTarget.token,
+              controlToken: freshControl.token,
             });
             const oobPass =
               verification.targetHits > 0 &&
@@ -1956,19 +2089,26 @@ export default function casefileExtension(pi: ExtensionAPI) {
                 url: bundle.targetRuns[0].evidence.verify.url,
                 note: verification.note,
               },
-              control: {
-                attempted: true,
-                matched: verification.controlHits > 0,
-                url: bundle.targetRuns[0].evidence.verify.url,
-                note: `${verification.controlHits} control-token interaction(s)`,
-              },
+              control: bundle.controlTarget
+                ? {
+                    attempted: true,
+                    matched: verification.controlHits > 0,
+                    url: bundle.controlTarget,
+                    note: `${verification.controlHits} control-token interaction(s)`,
+                  }
+                : {
+                    attempted: true,
+                    matched: verification.controlHits > 0,
+                    url: "oob://silent-control-token",
+                    note: `${verification.controlHits} control-token interaction(s) — no control execution by policy; the fresh control token must stay silent`,
+                  },
               differential:
                 verification.targetHits > 0
                   ? verification.controlHits === 0
                     ? "target_only"
                     : "both"
                   : "neither",
-              note: `harness OOB re-poll: ${verification.note}`,
+              note: `harness OOB fresh replay (newly provisioned tokens, PoC re-executed): ${verification.note}`,
             };
           } else if (bundle.callbackVerified?.attempted) {
             throw new Error(

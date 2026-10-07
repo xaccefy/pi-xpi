@@ -1,0 +1,14 @@
+{
+  "schema": "xpi/finding-record@1",
+  "fingerprint": "d1e2f3a4b5c60720",
+  "runId": "audit-link-2025-0001",
+  "caseId": "case-102",
+  "title": "Finding references a coverage unit the ledger does not contain",
+  "coverageUnits": ["src/api/orders.ts:authz:idor", "src/missing/unit.ts:none:ghost"],
+  "disposition": "needs_validation",
+  "needs_validation": {
+    "exactClaim": "src/missing/unit.ts:1 lacks a guard",
+    "unresolvedFact": "whether the guard exists",
+    "resolutionPlan": { "approach": "safe_local" }
+  }
+}

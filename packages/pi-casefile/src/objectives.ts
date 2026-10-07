@@ -39,7 +39,6 @@ import {
 } from "./ledger-internal.ts";
 import type { DatabaseSync } from "./sqlite-compat/index.ts";
 
-// ── Engagement objectives (OPPLAN-lite) ────────────────────────────
 
 function mapObjectiveRow(row: any, caseIds: string[]): ObjectiveRecord {
   return {
@@ -336,7 +335,6 @@ export function suggestChains(caseId?: string): ChainSuggestion[] {
       rationale: (a, b) =>
         `Use internal URL/config from "${a.title}" as SSRF target via "${b.title}"`,
     },
-    // ── XBOW expansion ─────────────────────────────────────────────
     {
       pattern: "sqli_credential_dump",
       a: CHAIN_CLASS_RE.sqli,

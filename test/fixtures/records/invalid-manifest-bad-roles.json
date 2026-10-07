@@ -1,0 +1,16 @@
+{
+  "schema": "xpi/audit-run@1",
+  "runId": "audit-xpi-2025-9997",
+  "created": "2025-10-01T09:00:00Z",
+  "status": "running",
+  "mode": "source_audit",
+  "profile": "standard",
+  "harness": "pi",
+  "target": { "kind": "repository", "reference": "https://github.com/example/widget-api" },
+  "scope": { "include": ["src/"] },
+  "roles": {
+    "Coordinator": { "model": "claude-sonnet-4-5" },
+    "auditor": { "model": "claude-sonnet-4-5", "temperature": 0.2 }
+  },
+  "executionPolicy": { "network": "none", "sandboxFailClosed": true }
+}

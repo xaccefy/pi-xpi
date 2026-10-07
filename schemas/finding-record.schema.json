@@ -1,0 +1,137 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/xaccefy/pi-xpi/schemas/finding-record.schema.json",
+  "title": "XPI final finding record",
+  "description": "The final, machine-checkable disposition of one finding after independent verification and record check. Maps to Casefile lifecycle: confirmed -> case confirmed; needs_validation -> investigating with an exact unresolved fact; rejected -> killed with reason so later runs do not resurrect it without changed evidence. blocked is a COVERAGE unit state, never a finding verdict. Validator success establishes format only, not truth. Validated by scripts/validate-records.js.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "fingerprint", "runId", "caseId", "title", "disposition"],
+  "properties": {
+    "schema": { "const": "xpi/finding-record@1" },
+    "fingerprint": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{16}$",
+      "description": "Stable hash of the claim's location and class — links the record to coverage units and prior runs."
+    },
+    "runId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{5,63}$" },
+    "caseId": { "type": "string", "minLength": 1 },
+    "title": { "type": "string", "minLength": 1 },
+    "coverageUnits": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" },
+      "description": "Ledger unit IDs that produced or ruled out the lead."
+    },
+    "disposition": { "enum": ["confirmed", "needs_validation", "rejected"] },
+    "verifiedBy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verifierRole", "recordCheckRole"],
+      "description": "Provenance of the independent passes. The verifier must not be the candidate's author or skeptic; the record checker must be neither the author nor the coverage critic.",
+      "properties": {
+        "verifierRole": { "type": "string", "minLength": 1 },
+        "recordCheckRole": { "type": "string", "minLength": 1 },
+        "coordinatorConfirmRole": { "type": "string", "description": "The coordinator remains the only semantic confirmer." }
+      }
+    },
+    "confirmed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceTrace", "attackerModel", "observedResult", "affectedResource", "conditions", "evidence", "severity", "smallestFix", "verification"],
+      "properties": {
+        "sourceTrace": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "lines"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1 },
+              "lines": { "type": "string", "pattern": "^[0-9]+(-[0-9]+)?$" },
+              "note": { "type": "string" }
+            }
+          }
+        },
+        "attackerModel": { "type": "string", "minLength": 1, "description": "Who the attacker is and what access they start with." },
+        "observedResult": { "type": "string", "minLength": 1, "description": "Bounded observed result — what was actually demonstrated, no extrapolation." },
+        "affectedResource": { "type": "string", "minLength": 1 },
+        "conditions": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 }, "description": "Required preconditions/config/state." },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "ref"],
+            "properties": {
+              "kind": { "enum": ["evidence_item", "artifact", "poc_run"] },
+              "ref": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "severity": {
+          "enum": ["info", "low", "medium", "high", "critical"],
+          "description": "Impact-based, assigned only after the gate passed."
+        },
+        "smallestFix": { "type": "string", "minLength": 1, "description": "Smallest change that removes the vulnerability." },
+        "verification": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": { "enum": ["inter_host", "intra_target", "oob", "static_only"] },
+            "harnessNote": { "type": "string" }
+          }
+        }
+      }
+    },
+    "needs_validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exactClaim", "unresolvedFact", "resolutionPlan"],
+      "description": "No severity — an unverified lead has none.",
+      "properties": {
+        "exactClaim": { "type": "string", "minLength": 1, "description": "The precise source-grounded claim." },
+        "unresolvedFact": { "type": "string", "minLength": 1, "description": "The single fact that, if resolved, decides the claim." },
+        "resolutionPlan": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["approach"],
+          "properties": {
+            "approach": { "enum": ["safe_local", "owner_observed"] },
+            "steps": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    },
+    "rejected": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["disprovedClaim", "reason", "evidence"],
+      "properties": {
+        "disprovedClaim": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "changedEvidenceWouldReopen": { "type": "boolean" },
+        "evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "ref"],
+            "properties": {
+              "kind": { "enum": ["evidence_item", "artifact", "source_reading"] },
+              "ref": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    { "if": { "properties": { "disposition": { "const": "confirmed" } } }, "then": { "required": ["confirmed", "verifiedBy"] } },
+    { "if": { "properties": { "disposition": { "const": "needs_validation" } } }, "then": { "required": ["needs_validation"] } },
+    { "if": { "properties": { "disposition": { "const": "rejected" } } }, "then": { "required": ["rejected"] } }
+  ]
+}

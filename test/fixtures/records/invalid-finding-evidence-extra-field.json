@@ -1,0 +1,23 @@
+{
+  "schema": "xpi/finding-record@1",
+  "fingerprint": "f1a2b3c4d5e60722",
+  "runId": "audit-xpi-2025-1001",
+  "caseId": "case-007",
+  "title": "Evidence item carries an unknown field",
+  "disposition": "confirmed",
+  "verifiedBy": {
+    "verifierRole": "finding-verifier",
+    "recordCheckRole": "coordinator"
+  },
+  "confirmed": {
+    "sourceTrace": [{ "path": "src/api/upload.ts", "lines": "88-104" }],
+    "attackerModel": "Unauthenticated caller",
+    "observedResult": "Stored executable extension",
+    "affectedResource": "Uploads bucket",
+    "conditions": ["endpoint enabled"],
+    "evidence": [{ "kind": "poc_run", "ref": "poc-013", "note": "not part of the contract" }],
+    "severity": "medium",
+    "smallestFix": "Lowercase extension check",
+    "verification": { "mode": "static_only" }
+  }
+}

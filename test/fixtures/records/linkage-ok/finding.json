@@ -1,0 +1,14 @@
+{
+  "schema": "xpi/finding-record@1",
+  "fingerprint": "e1f2a3b4c5d60721",
+  "runId": "audit-link-2025-0002",
+  "caseId": "case-202",
+  "title": "Finding whose coverage units all resolve in the sibling ledger",
+  "coverageUnits": ["src/api/orders.ts:authz:idor"],
+  "disposition": "needs_validation",
+  "needs_validation": {
+    "exactClaim": "src/api/orders.ts:12 misses an ownership check",
+    "unresolvedFact": "whether middleware covers it",
+    "resolutionPlan": { "approach": "safe_local" }
+  }
+}

@@ -1,0 +1,131 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/xaccefy/pi-xpi/schemas/audit-run.schema.json",
+  "title": "XPI audit run manifest",
+  "description": "Pins one XPI audit run: what was reviewed, under which mode and scope, with which models/tools and budget. Written by the coordinator at run start; visible to every stage; no tool call may expand it. Validated by scripts/validate-records.js.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "runId", "created", "mode", "profile", "harness", "target", "scope", "executionPolicy", "status"],
+  "properties": {
+    "schema": { "const": "xpi/audit-run@1" },
+    "runId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{5,63}$" },
+    "created": { "type": "string", "format": "date-time" },
+    "ended": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["running", "completed", "aborted"] },
+    "mode": {
+      "enum": ["source_audit", "authorized_live"],
+      "description": "source_audit: source/local only — live target tools and external services disabled during target-controlled checks. authorized_live: explicit scope + authorization required before network tools are enabled."
+    },
+    "profile": {
+      "enum": ["quick", "standard", "deep"],
+      "description": "quick: bounded single-pass, cannot claim full coverage. standard: default. deep: multi-round with coverage review."
+    },
+    "harness": { "enum": ["pi", "omp"] },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "reference"],
+      "properties": {
+        "kind": { "enum": ["repository", "live_service"] },
+        "reference": { "type": "string", "minLength": 1, "description": "Repo URL/path or service origin." },
+        "revision": { "type": "string", "description": "Commit SHA actually reviewed." },
+        "dirty": { "type": "boolean", "description": "True when the working tree had uncommitted changes." },
+        "dirtyFiles": { "type": "array", "items": { "type": "string" }, "description": "Modified/untracked paths present during the run." }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["include"],
+      "properties": {
+        "include": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "exclude": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "authorization": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reference", "operator"],
+          "properties": {
+            "reference": { "type": "string", "minLength": 1, "description": "Engagement/program reference, grant ID, or signed-scope pointer." },
+            "operator": { "type": "string", "minLength": 1, "description": "Who authorized (named principal, not 'the user')." },
+            "validUntil": { "type": "string", "format": "date" }
+          }
+        }
+      }
+    },
+    "roles": {
+      "type": "object",
+      "description": "Model/provider per pipeline role actually used.",
+      "additionalProperties": { "$ref": "#/definitions/roleConfig" },
+      "propertyNames": { "pattern": "^[a-z][a-z0-9_-]*$" }
+    },
+    "toolVersions": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "XPI revision plus versions of tools whose behavior affects results (e.g. xpi: b26bce0, ast-grep: 0.38.1)."
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "wallClockMinutes": { "type": "integer", "minimum": 1 },
+        "modelCalls": { "type": "integer", "minimum": 1 },
+        "reservedForCoverageReviewPercent": { "type": "integer", "minimum": 0, "maximum": 90 },
+        "reservedForVerificationPercent": { "type": "integer", "minimum": 0, "maximum": 90 },
+        "notes": { "type": "string" }
+      }
+    },
+    "priorRuns": {
+      "type": "array",
+      "description": "Prior run manifests carried forward. A narrow prior run is never full coverage; changed source must be revalidated.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["runId", "disposition"],
+        "properties": {
+          "runId": { "type": "string" },
+          "disposition": { "enum": ["revalidated", "carried_forward", "superseded"] },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "executionPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["network"],
+      "properties": {
+        "network": {
+          "enum": ["none", "loopback", "target"],
+          "description": "source_audit must be 'none' or 'loopback'; 'target' requires mode authorized_live."
+        },
+        "sandbox": { "enum": ["docker", "none", "operator-host"] },
+        "sandboxFailClosed": { "const": true, "description": "Always true: sandbox failure blocks, never falls back to host without operator opt-in." },
+        "notes": { "type": "string" }
+      }
+    }
+  },
+  "definitions": {
+    "roleConfig": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model"],
+      "properties": {
+        "model": { "type": "string", "minLength": 1 },
+        "provider": { "type": "string" }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "mode": { "const": "authorized_live" } } },
+      "then": { "required": ["scope"], "properties": { "scope": { "required": ["authorization"] } } }
+    },
+    {
+      "if": { "properties": { "mode": { "const": "source_audit" } } },
+      "then": { "properties": { "executionPolicy": { "properties": { "network": { "enum": ["none", "loopback"] } } } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "completed" } } },
+      "then": { "required": ["ended"] }
+    }
+  ]
+}

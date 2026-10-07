@@ -1,0 +1,23 @@
+{
+  "schema": "xpi/finding-record@1",
+  "fingerprint": "a1b2c3d4e5f60723",
+  "runId": "audit-xpi-2025-1001",
+  "caseId": "case-008",
+  "title": "Condition member is not a string",
+  "disposition": "confirmed",
+  "verifiedBy": {
+    "verifierRole": "finding-verifier",
+    "recordCheckRole": "coordinator"
+  },
+  "confirmed": {
+    "sourceTrace": [{ "path": "src/api/upload.ts", "lines": "88-104" }],
+    "attackerModel": "Unauthenticated caller",
+    "observedResult": "Stored executable extension",
+    "affectedResource": "Uploads bucket",
+    "conditions": ["endpoint enabled", 42],
+    "evidence": [{ "kind": "poc_run", "ref": "poc-013" }],
+    "severity": "medium",
+    "smallestFix": "Lowercase extension check",
+    "verification": { "mode": "static_only" }
+  }
+}

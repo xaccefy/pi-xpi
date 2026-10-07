@@ -65,15 +65,47 @@ describe("pi-webxp: raw_request / race_send", () => {
   beforeEach(() => {
     api = new MockExtensionAPI();
     piWebxp(api as any);
+    // Loopback test servers are private hosts: the operator gate must be
+    // open for these tests, exactly as an internal-lab operator would.
+    process.env.PI_WEBXP_ALLOW_PRIVATE_HOSTS = "1";
   });
 
   afterEach(async () => {
+    delete process.env.PI_WEBXP_ALLOW_PRIVATE_HOSTS;
     await Promise.all(
       started.splice(0).map((s) => new Promise<void>((resolve) => s.close(() => resolve()))),
     );
   });
 
-  function tool(name: string) {
+  /** Server that consumes requests but never responds; `ready` resolves once
+ * `minHeads` connections delivered bytes — proof the sockets are established
+ * and head writes flushed, so a test can abort deterministically mid-capture
+ * instead of racing the dial phase. */
+function startHoldingServer(minHeads: number): Promise<{
+  server: Server;
+  port: number;
+  ready: Promise<void>;
+}> {
+  return new Promise((resolve) => {
+    let heads = 0;
+    let readyResolve: () => void;
+    const ready = new Promise<void>((r) => {
+      readyResolve = r;
+    });
+    const server = net.createServer((socket) => {
+      socket.on("data", () => {
+        heads += 1;
+        if (heads >= minHeads) readyResolve();
+      });
+      socket.on("error", () => undefined);
+    });
+    server.listen(0, "127.0.0.1", () => {
+      resolve({ server, port: (server.address() as AddressInfo).port, ready });
+    });
+  });
+}
+
+function tool(name: string) {
     const t = api.tools.find((x) => x.name === name);
     assert.ok(t, `${name} registered`);
     return t!;
@@ -165,6 +197,119 @@ describe("pi-webxp: raw_request / race_send", () => {
       ),
       /private\/internal/,
     );
+  });
+
+  it("rejects allowPrivateHosts=true without the operator gate", async () => {
+    const previous = process.env.PI_WEBXP_ALLOW_PRIVATE_HOSTS;
+    delete process.env.PI_WEBXP_ALLOW_PRIVATE_HOSTS;
+    try {
+      await assert.rejects(
+        tool("raw_request").execute(
+          "g1",
+          {
+            target: "http://127.0.0.1:9",
+            raw: "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+            allowPrivateHosts: true,
+          },
+          null,
+          () => {},
+          {},
+        ),
+        /PI_WEBXP_ALLOW_PRIVATE_HOSTS=1/,
+      );
+      await assert.rejects(
+        tool("race_send").execute(
+          "g2",
+          {
+            target: "http://127.0.0.1:9",
+            requests: ["GET / HTTP/1.1\r\nHost: x\r\n\r\n", "GET / HTTP/1.1\r\nHost: x\r\n\r\n"],
+            allowPrivateHosts: true,
+          },
+          null,
+          () => {},
+          {},
+        ),
+        /PI_WEBXP_ALLOW_PRIVATE_HOSTS=1/,
+      );
+    } finally {
+      if (previous !== undefined) process.env.PI_WEBXP_ALLOW_PRIVATE_HOSTS = previous;
+    }
+  });
+
+  it("honors an already-aborted signal without touching the network", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+      tool("raw_request").execute(
+        "a1",
+        { target: "http://93.184.216.34:9", raw: "GET / HTTP/1.1\r\nHost: x\r\n\r\n" },
+        controller.signal,
+        () => {},
+        {},
+      ),
+      /aborted/,
+    );
+    await assert.rejects(
+      tool("race_send").execute(
+        "a2",
+        {
+          target: "http://93.184.216.34:9",
+          requests: ["GET / HTTP/1.1\r\nHost: x\r\n\r\n", "GET / HTTP/1.1\r\nHost: x\r\n\r\n"],
+        },
+        controller.signal,
+        () => {},
+        {},
+      ),
+      /aborted/,
+    );
+  });
+
+  it("aborts a race burst mid-capture and destroys every socket", async () => {
+    const { server, port, ready } = await startHoldingServer(2);
+    started.push(server);
+    const controller = new AbortController();
+    const pending = assert.rejects(
+      tool("race_send").execute(
+        "a3",
+        {
+          target: `http://127.0.0.1:${port}`,
+          requests: Array.from({ length: 2 }, () => "GET / HTTP/1.1\r\nHost: x\r\n\r\n"),
+          responseWaitMs: 3000,
+        },
+        controller.signal,
+        () => {},
+        {},
+      ),
+      /aborted/,
+    );
+    // Synchronize on the server receiving head bytes: aborting earlier would
+    // race the dial phase rather than exercise mid-capture cancellation.
+    await ready;
+    controller.abort();
+    await pending;
+  });
+
+  it("aborts raw_request during the response wait", async () => {
+    const { server, port, ready } = await startHoldingServer(1);
+    started.push(server);
+    const controller = new AbortController();
+    const pending = assert.rejects(
+      tool("raw_request").execute(
+        "a4",
+        {
+          target: `http://127.0.0.1:${port}`,
+          raw: "GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+          responseWaitMs: 3000,
+        },
+        controller.signal,
+        () => {},
+        {},
+      ),
+      /aborted/,
+    );
+    await ready;
+    controller.abort();
+    await pending;
   });
 
   it("rejects invalid targets and requests", async () => {

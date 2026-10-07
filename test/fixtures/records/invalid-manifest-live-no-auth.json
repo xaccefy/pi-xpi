@@ -1,0 +1,12 @@
+{
+  "schema": "xpi/audit-run@1",
+  "runId": "audit-shop-2025-9999",
+  "created": "2025-10-02T14:00:00Z",
+  "status": "running",
+  "mode": "authorized_live",
+  "profile": "standard",
+  "harness": "pi",
+  "target": { "kind": "live_service", "reference": "https://shop.example.com" },
+  "scope": { "include": ["shop.example.com"] },
+  "executionPolicy": { "network": "target", "sandboxFailClosed": true }
+}

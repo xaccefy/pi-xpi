@@ -1,7 +1,11 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
 import { isPublicIpAddress as sharedIsPublicIpAddress } from "@xaccefy/pi-shared";
-import { isPublicIpAddress, pinPublicHostForPlainHttp } from "../src/network-safety.ts";
+import {
+  assertPrivateHostsAllowed,
+  isPublicIpAddress,
+  pinPublicHostForPlainHttp,
+} from "../src/network-safety.ts";
 
 describe("network-safety: isPublicIpAddress", () => {
   it("re-exports the exact shared classifier rather than a hand-synced copy", () => {
@@ -71,5 +75,26 @@ describe("network-safety: pinPublicHostForPlainHttp", () => {
     );
     assert.strictEqual(await pinPublicHostForPlainHttp(new URL("https://example.com/")), null);
     assert.strictEqual(await pinPublicHostForPlainHttp(new URL("http://127.0.0.1/")), null);
+  });
+});
+
+describe("network-safety: assertPrivateHostsAllowed", () => {
+  it("is a no-op when private access was not requested", () => {
+    assert.doesNotThrow(() => assertPrivateHostsAllowed(false, {}));
+    assert.doesNotThrow(() => assertPrivateHostsAllowed(false, { PI_WEBXP_ALLOW_PRIVATE_HOSTS: "1" }));
+  });
+
+  it("allows requested private access only with the operator gate", () => {
+    assert.doesNotThrow(() =>
+      assertPrivateHostsAllowed(true, { PI_WEBXP_ALLOW_PRIVATE_HOSTS: "1" }),
+    );
+  });
+
+  it("fails closed when the agent requests private access without the operator gate", () => {
+    assert.throws(() => assertPrivateHostsAllowed(true, {}), /PI_WEBXP_ALLOW_PRIVATE_HOSTS=1/);
+    assert.throws(
+      () => assertPrivateHostsAllowed(true, { PI_WEBXP_ALLOW_PRIVATE_HOSTS: "0" }),
+      /operator-gated/,
+    );
   });
 });

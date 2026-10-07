@@ -1,0 +1,12 @@
+{
+  "schema": "xpi/audit-run@1",
+  "runId": "audit-xpi-2025-9998",
+  "created": "2025-10-01T09:00:00Z",
+  "status": "running",
+  "mode": "source_audit",
+  "profile": "quick",
+  "harness": "pi",
+  "target": { "kind": "repository", "reference": "https://github.com/example/widget-api" },
+  "scope": { "include": ["src/"] },
+  "executionPolicy": { "network": "target", "sandboxFailClosed": true }
+}

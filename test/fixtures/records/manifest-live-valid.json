@@ -1,0 +1,24 @@
+{
+  "schema": "xpi/audit-run@1",
+  "runId": "audit-shop-2025-1002",
+  "created": "2025-10-02T14:00:00Z",
+  "status": "running",
+  "mode": "authorized_live",
+  "profile": "deep",
+  "harness": "pi",
+  "target": {
+    "kind": "live_service",
+    "reference": "https://shop.example.com",
+    "revision": "live"
+  },
+  "scope": {
+    "include": ["shop.example.com"],
+    "exclude": ["status.shop.example.com"],
+    "authorization": {
+      "reference": "hackerone-program-12345",
+      "operator": "example-security",
+      "validUntil": "2025-12-31"
+    }
+  },
+  "executionPolicy": { "network": "target", "sandbox": "docker", "sandboxFailClosed": true }
+}

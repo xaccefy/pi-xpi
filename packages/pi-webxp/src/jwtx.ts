@@ -224,8 +224,6 @@ export function jwtAttack(params: {
   };
 }
 
-// ── Tool registration ────────────────────────────────────────────────
-
 const ActionParam = Type.String({
   enum: ["decode", "alg_none", "key_confusion", "sign"],
 });

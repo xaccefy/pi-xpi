@@ -1,0 +1,23 @@
+{
+  "schema": "xpi/finding-record@1",
+  "fingerprint": "b1a2c3d4e5f60718",
+  "runId": "audit-xpi-2025-1001",
+  "caseId": "case-005",
+  "title": "Non-array sourceTrace",
+  "disposition": "confirmed",
+  "verifiedBy": {
+    "verifierRole": "finding-verifier",
+    "recordCheckRole": "coordinator"
+  },
+  "confirmed": {
+    "sourceTrace": "src/api/upload.ts:88-104",
+    "attackerModel": "Unauthenticated caller",
+    "observedResult": "Stored executable extension",
+    "affectedResource": "Uploads bucket",
+    "conditions": ["endpoint enabled"],
+    "evidence": [{ "kind": "poc_run", "ref": "poc-013" }],
+    "severity": "medium",
+    "smallestFix": "Lowercase extension check",
+    "verification": { "mode": "static_only" }
+  }
+}

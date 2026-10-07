@@ -28,6 +28,7 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { isIP } from "node:net";
 
 export type OobInteraction = {
   protocol?: string;
@@ -42,6 +43,20 @@ export type OobOracleConfig = {
   sourceSeparated: boolean;
   selfIps: string[];
 };
+
+/** Exact loopback only: the literal "localhost" and IP-parsed loopback
+ * addresses. DNS names like foo.localhost or 127-anything.example.com are
+ * NOT accepted for plaintext HTTP — a name is not an address. */
+function isLoopbackHost(host: string): boolean {
+  if (host === "localhost") return true;
+  const family = isIP(host);
+  if (family === 4) return host.split(".")[0] === "127";
+  if (family === 6) {
+    const h = host.toLowerCase();
+    return h === "::1" || h === "::ffff:127.0.0.1" || h === "::ffff:7f00:1";
+  }
+  return false;
+}
 
 /** Read the operator's oracle configuration; error text explains what's missing. */
 export function readOobOracleConfig(env: NodeJS.ProcessEnv = process.env): {
@@ -62,10 +77,22 @@ export function readOobOracleConfig(env: NodeJS.ProcessEnv = process.env): {
   try {
     baseUrl = new URL(raw);
   } catch {
-    return { error: `PI_OOB_ORACLE_URL is not a valid URL: ${raw}` };
+    return { error: "PI_OOB_ORACLE_URL is not a valid URL" };
   }
-  if (baseUrl.protocol !== "http:" && baseUrl.protocol !== "https:") {
-    return { error: `PI_OOB_ORACLE_URL must be http(s), got ${baseUrl.protocol}` };
+  if (baseUrl.username || baseUrl.password) {
+    return {
+      error:
+        "PI_OOB_ORACLE_URL must not contain userinfo (user:password@) — embedded credentials leak into logs and error text",
+    };
+  }
+  // The bearer token and run tokens travel on this channel; plaintext HTTP is
+  // allowed only for an exact loopback endpoint (parsed, not name-based).
+  const host = baseUrl.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  if (baseUrl.protocol !== "https:" && !(baseUrl.protocol === "http:" && isLoopbackHost(host))) {
+    return {
+      error:
+        "PI_OOB_ORACLE_URL must use https (plaintext http is allowed only on a loopback host for development)",
+    };
   }
   const selfIps = (env.PI_OOB_SELF_IPS ?? "")
     .split(",")
@@ -106,11 +133,33 @@ async function oracleFetch(
   if (config.bearer) headers.authorization = `Bearer ${config.bearer}`;
   const fetchImpl = oracleFetchForTest ?? fetch;
   // Bounded: an unresponsive oracle must fail the run, not hang the tool.
-  return fetchImpl(`${config.baseUrl}${path}`, {
-    ...init,
-    headers,
-    signal: AbortSignal.timeout(30_000),
-  });
+  // Redirects are refused: the interactions query carries the run token,
+  // and a redirect could forward it to any origin the oracle names.
+  // Errors below report the ORIGIN only, and any URL/path/query fragment in
+  // the underlying error text is redacted before it can reach logs.
+  let origin: string;
+  try {
+    origin = new URL(config.baseUrl).origin;
+  } catch {
+    origin = "(invalid oracle URL)";
+  }
+  const requestUrl = `${config.baseUrl}${path}`;
+  try {
+    return await fetchImpl(requestUrl, {
+      ...init,
+      headers,
+      redirect: "error",
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (e) {
+    const raw = (e as Error).message ?? String(e);
+    const safe = raw
+      .split(requestUrl)
+      .join("[redacted-url]")
+      .split(path)
+      .join("[redacted-path]");
+    throw new Error(`OOB oracle unreachable (${origin}): ${safe}`);
+  }
 }
 
 export type ProvisionedCallback = {
@@ -127,15 +176,11 @@ export type ProvisionedCallback = {
 export async function provisionCallback(config: OobOracleConfig): Promise<ProvisionedCallback> {
   const token = makeToken();
   let res: Response;
-  try {
-    res = await oracleFetch(config, "/provision", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token }),
-    });
-  } catch (e) {
-    throw new Error(`OOB oracle unreachable (${config.baseUrl}): ${(e as Error).message}`);
-  }
+  res = await oracleFetch(config, "/provision", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
   if (!res.ok) {
     throw new Error(`OOB oracle /provision failed: HTTP ${res.status}`);
   }
@@ -165,11 +210,7 @@ export async function fetchInteractions(
   token: string,
 ): Promise<OobPollResult> {
   let res: Response;
-  try {
-    res = await oracleFetch(config, `/interactions?token=${encodeURIComponent(token)}`);
-  } catch (e) {
-    throw new Error(`OOB oracle unreachable (${config.baseUrl}): ${(e as Error).message}`);
-  }
+  res = await oracleFetch(config, `/interactions?token=${encodeURIComponent(token)}`);
   if (!res.ok) {
     throw new Error(`OOB oracle /interactions failed: HTTP ${res.status}`);
   }

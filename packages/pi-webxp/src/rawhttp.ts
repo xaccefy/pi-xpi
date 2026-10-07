@@ -32,6 +32,7 @@ import { type TLSSocket, connect as tlsConnect } from "node:tls";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { isPublicIpAddress } from "@xaccefy/pi-shared";
+import { assertPrivateHostsAllowed } from "./network-safety.ts";
 import { Type } from "typebox";
 import {
   DEFAULT_MAX_BODY as DEFAULT_MAX_RESPONSE_BYTES,
@@ -88,7 +89,7 @@ async function resolvePublicAddresses(
   if (isIP(host)) {
     if (!allowPrivateHosts && !isPublicIpAddress(host)) {
       throw new Error(
-        `Blocked: ${host} is a private/internal host. Set allowPrivateHosts=true to test internal targets.`,
+        `Blocked: ${host} is a private/internal host. Requires allowPrivateHosts=true plus the operator's PI_WEBXP_ALLOW_PRIVATE_HOSTS=1.`,
       );
     }
     return [{ address: host }];
@@ -104,7 +105,7 @@ async function resolvePublicAddresses(
     const blocked = answers.find((a) => !isPublicIpAddress(a.address));
     if (blocked) {
       throw new Error(
-        `Blocked: ${host} resolved to private/internal address ${blocked.address}. Set allowPrivateHosts=true to test internal targets.`,
+        `Blocked: ${host} resolved to private/internal address ${blocked.address}. Requires allowPrivateHosts=true plus the operator's PI_WEBXP_ALLOW_PRIVATE_HOSTS=1.`,
       );
     }
   }
@@ -116,38 +117,58 @@ function dialSocket(
   address: PinnedAddress,
   verifyTls: boolean,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<Socket> {
   return new Promise((resolve, reject) => {
-    const onError = (err: Error) => {
+    let settled = false;
+    let socket: Socket | undefined;
+    // Every failure path destroys the pending socket: an undestroyed dial can
+    // still complete later, leaving a live connection nobody owns (leak plus
+    // stray traffic to the target).
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      socket?.destroy();
       reject(err);
     };
-    const timer = setTimeout(
-      () => onError(new Error(`connect timed out after ${timeoutMs}ms`)),
-      timeoutMs,
-    );
-    const onEstablished = (socket: Socket) => {
+    const onAbort = () => fail(new Error("aborted before the connection was established"));
+    if (signal?.aborted) {
+      reject(new Error("aborted before the connection was established"));
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(() => fail(new Error(`connect timed out after ${timeoutMs}ms`)), timeoutMs);
+    const onEstablished = (established: Socket) => {
+      if (settled) {
+        // A connection completing after timeout/abort: nobody owns it.
+        established.destroy();
+        return;
+      }
+      settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       // Detach the dial-stage error handler: a socket that dies LATER must
       // not have its single 'error' event consumed by this stale listener
       // (later stages would then never see the failure and hang forever).
-      socket.removeListener("error", onError);
-      socket.setTimeout(timeoutMs);
-      resolve(socket);
+      established.removeListener("error", fail);
+      established.setTimeout(timeoutMs);
+      resolve(established);
     };
     if (target.tls) {
-      const socket = tlsConnect({
+      socket = tlsConnect({
         host: address.address,
         port: target.port,
         servername: isIP(target.host) ? undefined : target.host,
         rejectUnauthorized: verifyTls,
       }) as unknown as TLSSocket;
-      socket.once("error", onError);
-      socket.once("secureConnect", () => onEstablished(socket));
+      socket.once("error", fail);
+      socket.once("secureConnect", () => onEstablished(socket as Socket));
     } else {
-      const socket = netConnect({ host: address.address, port: target.port });
-      socket.once("error", onError);
-      socket.once("connect", () => onEstablished(socket));
+      socket = netConnect({ host: address.address, port: target.port });
+      socket.once("error", fail);
+      socket.once("connect", () => onEstablished(socket as Socket));
     }
   });
 }
@@ -312,8 +333,9 @@ function summarizeCapture(cap: ResponseCapture, startedAt: number): RawHttpRespo
     completed: cap.finished,
     // Measured from the capture's own settle timestamp — NOT from map time
     // after Promise.all (which would report ~0 for every request and destroy
-    // the response-side sync signal the report exists to carry).
-    timingMs: (cap.finishedAt ?? Date.now()) - startedAt,
+    // the response-side sync signal the report exists to carry). Clamped at
+    // zero: a peer that closes mid-burst can settle before the epoch.
+    timingMs: Math.max(0, (cap.finishedAt ?? Date.now()) - startedAt),
   };
 }
 
@@ -327,9 +349,11 @@ export async function sendRawRequest(
     verifyTls?: boolean;
     allowPrivateHosts?: boolean;
     maxResponseBytes?: number;
+    signal?: AbortSignal;
   } = {},
 ): Promise<RawHttpResponse> {
   validateRawRequest(rawRequest, "raw");
+  assertPrivateHostsAllowed(opts.allowPrivateHosts === true);
   const dial = parseDialTarget(target);
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const waitMs = opts.responseWaitMs ?? DEFAULT_RESPONSE_WAIT_MS;
@@ -341,20 +365,31 @@ export async function sendRawRequest(
 
   const addresses = await resolvePublicAddresses(dial.host, opts.allowPrivateHosts === true);
   const startedAt = Date.now();
-  const socket = await dialSocket(dial, addresses[0], verifyTls, timeoutMs);
+  const socket = await dialSocket(dial, addresses[0], verifyTls, timeoutMs, opts.signal);
+  const onAbort = () => socket.destroy();
+  if (opts.signal?.aborted) {
+    socket.destroy();
+    throw new Error("aborted before the request was sent");
+  }
+  opts.signal?.addEventListener("abort", onAbort, { once: true });
   try {
     // Write FIRST, capture SECOND: the response window must not include flush
     // time (a slow large-request write would otherwise burn responseWaitMs
     // and report a misleading empty "hung" observation). Responses arriving
     // mid-write are safe — TCP flow control holds them until the socket is
     // read.
-    await writeChunk(socket, Buffer.from(rawRequest, "utf8"), timeoutMs);
+    try {
+      await writeChunk(socket, Buffer.from(rawRequest, "utf8"), timeoutMs);
+    } catch (e) {
+      if (opts.signal?.aborted) throw new Error("aborted during raw_request (write)");
+      throw e;
+    }
     const capture = captureResponse(socket, maxBytes, waitMs);
     const cap = await capture.done;
+    if (opts.signal?.aborted) throw new Error("aborted during raw_request (response wait)");
     return summarizeCapture(cap, startedAt);
   } finally {
-    // No error path leaves the socket open: write failures and capture
-    // exceptions both land here.
+    opts.signal?.removeEventListener("abort", onAbort);
     socket.destroy();
   }
 }
@@ -398,6 +433,7 @@ export async function raceSendRequests(
     verifyTls?: boolean;
     allowPrivateHosts?: boolean;
     maxResponseBytes?: number;
+    signal?: AbortSignal;
   } = {},
 ): Promise<RaceSendReport> {
   if (!Array.isArray(requests) || requests.length < MIN_RACE_REQUESTS) {
@@ -410,6 +446,8 @@ export async function raceSendRequests(
     validateRawRequest(r, `requests[${i}]`);
   });
 
+  assertPrivateHostsAllowed(opts.allowPrivateHosts === true);
+  if (opts.signal?.aborted) throw new Error("aborted before race_send dialing");
   const dial = parseDialTarget(target);
   const holdLastByte = opts.holdLastByte !== false;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -427,11 +465,17 @@ export async function raceSendRequests(
   // exists for. A failure anywhere fails the whole burst AND destroys every
   // already-open socket: a partially-released burst would poison the race
   // observation, and a leaked dial would hold a connection to the target.
+  // Each pending dial also self-destroys on abort or timeout inside
+  // dialSocket, so no late-connecting socket can outlive a failed burst.
   const sockets: Socket[] = [];
+  const onAbort = () => {
+    for (const s of sockets) s.destroy();
+  };
+  opts.signal?.addEventListener("abort", onAbort, { once: true });
   try {
     const dialed = await Promise.allSettled(
       requests.map((_, i) =>
-        dialSocket(dial, addresses[i % addresses.length], verifyTls, timeoutMs),
+        dialSocket(dial, addresses[i % addresses.length], verifyTls, timeoutMs, opts.signal),
       ),
     );
     for (const d of dialed) if (d.status === "fulfilled") sockets.push(d.value);
@@ -446,7 +490,12 @@ export async function raceSendRequests(
 
     // Phase 1: everything except the final byte, and WAIT for each flush so
     // the bytes are already sitting in the target's receive buffer.
-    await Promise.all(sockets.map((s, i) => writeChunk(s, parts[i]!.head, timeoutMs)));
+    try {
+      await Promise.all(sockets.map((s, i) => writeChunk(s, parts[i]!.head, timeoutMs)));
+    } catch (e) {
+      if (opts.signal?.aborted) throw new Error("aborted during race_send (head write)");
+      throw e;
+    }
 
     // Captures start only now: responseWaitMs must measure the RESPONSE
     // window, not include head-flush time (large requests would otherwise
@@ -468,8 +517,8 @@ export async function raceSendRequests(
 
     const settled = await Promise.all(captures.map((c) => c.done));
     for (const s of sockets) s.destroy();
+    if (opts.signal?.aborted) throw new Error("aborted during race_send (burst)");
 
-    const burstStart = Date.now();
     const results: RaceSendResult[] = settled.map((cap, i) => ({
       index: i,
       // Batch release: every tail was issued in the same turn, so the
@@ -477,8 +526,14 @@ export async function raceSendRequests(
       // signal is response-side: firstResponseMs per request and
       // responseSpreadMs across the burst.
       releaseOffsetMs: 0,
-      firstResponseMs: cap.firstDataAt !== undefined ? cap.firstDataAt - releaseAt : null,
-      ...summarizeCapture(cap, burstStart),
+      // Clamped at zero: bytes arriving before the release count as an
+      // immediate (0ms) response rather than a negative latency.
+      firstResponseMs:
+        cap.firstDataAt !== undefined ? Math.max(0, cap.firstDataAt - releaseAt) : null,
+      // Duration is measured from the release epoch captured BEFORE awaiting
+      // the captures — a timestamp taken after they settle would under-report
+      // every request and could go negative.
+      ...summarizeCapture(cap, releaseAt),
     }));
 
     const arrived = results
@@ -503,10 +558,10 @@ export async function raceSendRequests(
   } catch (e) {
     for (const s of sockets) s.destroy();
     throw e;
+  } finally {
+    opts.signal?.removeEventListener("abort", onAbort);
   }
 }
-
-// ── Tool registration ────────────────────────────────────────────────
 
 const TargetParam = Type.String({
   description: "Target origin, e.g. https://example.com or http://10.0.0.1:8080",
@@ -519,7 +574,7 @@ const VerifyTlsParam = Type.Optional(
 const AllowPrivateParam = Type.Optional(
   Type.Boolean({
     description:
-      "Allow private/internal hosts (default false, SSRF-safe). Set true for lab/internal targets.",
+      "Request private/internal host access (default false, SSRF-safe). Takes effect only when the operator set PI_WEBXP_ALLOW_PRIVATE_HOSTS=1; otherwise the call fails closed.",
   }),
 );
 const TimeoutParam = Type.Optional(
@@ -552,7 +607,7 @@ export default function rawHttpExtension(pi: ExtensionAPI) {
       "Provide the FULL request including request line, headers, and terminating blank line: 'POST /x HTTP/1.1\\r\\nHost: t\\r\\nContent-Length: 4\\r\\n\\r\\nABCD'. Nothing is auto-corrected — wrong Content-Length is your technique, not an error.",
       "Timing probe first: a partial TE.CL payload makes the socket hang waiting for bytes — completed:false plus a distinct delay indicates front/back-end disagreement.",
       "Confirm impact before reporting: smuggle an attributable prefix (e.g. force the next request to GET /<your-canary>) and observe the effect on a request you control.",
-      "Private/internal hosts are blocked unless allowPrivateHosts=true; DNS is resolved once and every answer must be public — the socket dials the validated IP directly.",
+      "Private/internal hosts need allowPrivateHosts=true AND the operator's PI_WEBXP_ALLOW_PRIVATE_HOSTS=1; DNS is resolved once and every answer must be public — the socket dials the validated IP directly.",
     ],
     parameters: Type.Object(
       {
@@ -569,7 +624,7 @@ export default function rawHttpExtension(pi: ExtensionAPI) {
       { additionalProperties: false },
     ),
 
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
+    async execute(_id, params, signal, _onUpdate, _ctx) {
       try {
         const result = await sendRawRequest(params.target as string, params.raw as string, {
           timeoutMs: params.timeoutMs as number | undefined,
@@ -577,6 +632,7 @@ export default function rawHttpExtension(pi: ExtensionAPI) {
           verifyTls: params.verifyTls !== false,
           allowPrivateHosts: params.allowPrivateHosts === true,
           maxResponseBytes: params.maxResponseBytes as number | undefined,
+          signal: signal as AbortSignal | undefined,
         });
         const note = result.completed
           ? "peer closed the connection"
@@ -653,7 +709,7 @@ export default function rawHttpExtension(pi: ExtensionAPI) {
       { additionalProperties: false },
     ),
 
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
+    async execute(_id, params, signal, _onUpdate, _ctx) {
       try {
         const report = await raceSendRequests(
           params.target as string,
@@ -665,6 +721,7 @@ export default function rawHttpExtension(pi: ExtensionAPI) {
             verifyTls: params.verifyTls !== false,
             allowPrivateHosts: params.allowPrivateHosts === true,
             maxResponseBytes: params.maxResponseBytes as number | undefined,
+            signal: signal as AbortSignal | undefined,
           },
         );
         const spread = report.responseSpreadMs;

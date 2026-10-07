@@ -16,7 +16,6 @@ import {
 } from "./ledger-internal.ts";
 import type { DatabaseSync } from "./sqlite-compat/index.ts";
 
-// ── Chain suggestions ───────────────────────────────────────────────
 
 /** Automated exploit-chain patterns (ported shape from CyberStrike chain.ts + XBOW 104 expansion). */
 const CHAIN_PATTERN_VALUES = [
@@ -28,7 +27,6 @@ const CHAIN_PATTERN_VALUES = [
   "ssti_rce",
   "race_condition_business",
   "primitive_use",
-  // ── XBOW expansion — chaining-heavy benchmarks (XBEN-020..104) ───────────
   "sqli_credential_dump",
   "lfi_rce_chain",
   "ssrf_internal_pivot",
@@ -72,7 +70,6 @@ export const CHAIN_CLASS_RE = {
   payment: /\b(payment|transfer|order|checkout|cart|purchase|balance|credit|withdraw|deposit)\b/i,
   infoDisclosure: /\b(info[ _-]?disclosure|information[ _-]?disclosure|leak|exposure|debug)\b/i,
   ssrf: /\b(ssrf|server[ _-]?side[ _-]?request)\b/i,
-  // ── XBOW expansion — new classifiers for chaining-heavy classes ──────
   sqli: /\b(sqli|sql[ _-]?injection|blind[ _-]?sqli|nosqli|nosql[ _-]?injection|union[ _-]?select|sql[ _-]?map)\b/i,
   lfi: /\b(lfi|local[ _-]?file[ _-]?inclusion|path[ _-]?traversal|directory[ _-]?traversal|file[ _-]?inclusion|arbitrary[ _-]?file[ _-]?read)\b/i,
   fileUpload:
@@ -166,7 +163,6 @@ export function sameAssetOrRelated(a: CaseRecord, b: CaseRecord): boolean {
   return eTLDPlus1(ta) === eTLDPlus1(tb);
 }
 
-// ── Attack primitives ─────────────────────────────────────────────
 
 function mapPrimitiveRow(row: any, caseIds: string[]): PrimitiveRecord {
   return {

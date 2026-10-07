@@ -11,6 +11,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { CookieJar } from "tough-cookie";
 import { Type } from "typebox";
 import {
+  assertPrivateHostsAllowed,
   assertPublicDns,
   assertPublicHttpUrl,
   createSafeDispatcher,
@@ -135,7 +136,6 @@ function origin(url: URL): string {
   return `${url.protocol}//${url.host}`;
 }
 
-// ── Named sessions (multi-identity testing) ──────────────────────────
 
 const DEFAULT_SESSION = "default";
 const MAX_SESSION_NAME_CHARS = 64;
@@ -191,7 +191,7 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
       "Use http_request for authenticated web-app testing: POST to login, then GET protected resources — the cookie jar persists across calls automatically.",
       "Default redirect mode is 'manual' — you'll see 302/301 as-is (critical for redirect-chain analysis). Use 'follow' to auto-follow redirects.",
       "Pass json for JSON bodies (Content-Type set automatically); pass body for raw/form payloads.",
-      "Private/internal hosts (127.0.0.1, 10.x, 192.168.x, fc00::/7) are blocked by default. Set allowPrivateHosts=true for internal pentest targets.",
+      "Private/internal hosts (127.0.0.1, 10.x, 192.168.x, fc00::/7) are blocked by default. allowPrivateHosts=true additionally requires the operator's PI_WEBXP_ALLOW_PRIVATE_HOSTS=1 — internal-lab access is operator-gated, not agent-selectable.",
       "Use verifyTls=false for self-signed cert targets (e.g., internal staging apps). TLS verification is enabled by default.",
       "Set-Cookie is stored with RFC cookie scope. Explicit Cookie applies only to the first request; redirects use jar cookies for the new URL.",
       "Use session:'attacker' and session:'victim' to hold two authenticated identities at once — replay a victim object URL under the attacker session to prove IDOR/access-control bugs without losing either login.",
@@ -246,7 +246,7 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
         allowPrivateHosts: Type.Optional(
           Type.Boolean({
             description:
-              "Allow private/internal hostnames (default false, SSRF-safe). Set true for internal pentest targets.",
+              "Request private/internal hostname access (default false, SSRF-safe). Takes effect only when the operator set PI_WEBXP_ALLOW_PRIVATE_HOSTS=1; otherwise the call fails closed.",
           }),
         ),
         maxBody: Type.Optional(
@@ -266,6 +266,7 @@ export default function httpRequestExtension(pi: ExtensionAPI) {
       const jar = jarFor(sessionName);
       const allowPrivateHosts = params.allowPrivateHosts === true;
       const verifyTls = params.verifyTls !== false;
+      assertPrivateHostsAllowed(allowPrivateHosts);
       assertPublicHttpUrl(parsed, allowPrivateHosts);
       // Bun's fetch ignores the undici dispatcher, so the DNS guard must run
       // pre-flight to stay effective there (fail closed on private answers).

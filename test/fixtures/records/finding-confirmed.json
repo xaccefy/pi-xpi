@@ -1,0 +1,31 @@
+{
+  "schema": "xpi/finding-record@1",
+  "fingerprint": "a1b2c3d4e5f60718",
+  "runId": "audit-xpi-2025-1001",
+  "caseId": "case-001",
+  "title": "Unauthenticated avatar upload stores executable extensions",
+  "coverageUnits": ["src/api/upload.ts:unauth:file-upload"],
+  "disposition": "confirmed",
+  "verifiedBy": {
+    "verifierRole": "finding-verifier",
+    "recordCheckRole": "coordinator",
+    "coordinatorConfirmRole": "coordinator"
+  },
+  "confirmed": {
+    "sourceTrace": [
+      { "path": "src/api/upload.ts", "lines": "88-104", "note": "extension allow-list check is case-sensitive" },
+      { "path": "src/lib/storage.ts", "lines": "40-42" }
+    ],
+    "attackerModel": "Unauthenticated internet caller with access to the upload endpoint",
+    "observedResult": "A .pHp avatar was stored with a public URL under /uploads/; execution was NOT observed — impact limited to stored malicious content served with application MIME sniffing",
+    "affectedResource": "Public uploads storage bucket + serving path",
+    "conditions": ["upload endpoint enabled (default)", "no WAF rule blocking double extensions"],
+    "evidence": [
+      { "kind": "evidence_item", "ref": "ev-004" },
+      { "kind": "poc_run", "ref": "poc-013" }
+    ],
+    "severity": "medium",
+    "smallestFix": "Lowercase the extension before allow-list comparison in src/api/upload.ts:97",
+    "verification": { "mode": "static_only", "harnessNote": "source-only run: intra_target differential deferred to authorized follow-up" }
+  }
+}

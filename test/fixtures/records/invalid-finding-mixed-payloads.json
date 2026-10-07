@@ -1,0 +1,28 @@
+{
+  "schema": "xpi/finding-record@1",
+  "fingerprint": "c1d2e3f4a5b60719",
+  "runId": "audit-xpi-2025-1001",
+  "caseId": "case-006",
+  "title": "Mutually exclusive payloads present",
+  "disposition": "confirmed",
+  "verifiedBy": {
+    "verifierRole": "finding-verifier",
+    "recordCheckRole": "coordinator"
+  },
+  "confirmed": {
+    "sourceTrace": [{ "path": "src/api/upload.ts", "lines": "88-104" }],
+    "attackerModel": "Unauthenticated caller",
+    "observedResult": "Stored executable extension",
+    "affectedResource": "Uploads bucket",
+    "conditions": ["endpoint enabled"],
+    "evidence": [{ "kind": "poc_run", "ref": "poc-013" }],
+    "severity": "medium",
+    "smallestFix": "Lowercase extension check",
+    "verification": { "mode": "static_only" }
+  },
+  "rejected": {
+    "disprovedClaim": "Contradictory rejected payload on the same record",
+    "reason": "disposition payloads are exclusive",
+    "evidence": [{ "kind": "source_reading", "ref": "src/api/upload.ts:88" }]
+  }
+}

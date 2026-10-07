@@ -41,6 +41,7 @@
     "packages/pi-webxp/src/",
     "packages/pi-xtodo/index.ts",
     "install.sh",
+    "scripts/validate-records.js",
     "README.md",
     "LICENSE"
   ],
@@ -94,6 +95,11 @@
   "scripts": {
     "test": "bun test --isolate",
     "bench": "bun bench/run.ts",
+    "bench:chain": "bun bench/chain-run.ts",
+    "bench:xbow": "bun bench/xbow-run.ts",
+    "bench:adversarial": "bun bench/adversarial.ts",
+    "bench:oob": "bun bench/oob-run.ts",
+    "bench:transport": "bun bench/transport-run.ts",
     "test:casefile": "bun test --isolate packages/pi-casefile",
     "test:webxp": "bun test --isolate packages/pi-webxp",
     "test:xtodo": "bun test --isolate packages/pi-xtodo",

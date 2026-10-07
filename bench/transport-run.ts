@@ -109,6 +109,8 @@ async function raceBurst(): Promise<ScenarioResult> {
       (_, i) =>
         `POST /buy HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nContent-Length: 9\r\nX-N: ${i}\r\n\r\ncount=up`,
     );
+    // Loopback target: the operator must export PI_WEBXP_ALLOW_PRIVATE_HOSTS=1
+    // before running this bench (private access is operator-gated).
     const report = await raceSendRequests(`http://127.0.0.1:${port}`, reqs, {
       allowPrivateHosts: true,
       timeoutMs: 5000,

@@ -1,0 +1,13 @@
+{
+  "schema": "xpi/coverage-ledger@1",
+  "runId": "audit-xpi-2025-9992",
+  "units": [
+    {
+      "id": "src/api/upload.ts:unauth:file-upload",
+      "kind": "surface",
+      "description": "Upload endpoint",
+      "status": "planned",
+      "reviewedPaths": "src/api/upload.ts"
+    }
+  ]
+}

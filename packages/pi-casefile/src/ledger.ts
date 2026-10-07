@@ -446,10 +446,17 @@ export type PendingConfirmation = {
   controlRun?: PocEvidenceRun;
   /** Harness's own replay of evidence.verify (public targets). Absent = legacy bundle. */
   harnessVerified?: HarnessVerifyResult;
-  /** OOB-only bundles: per-run oracle tokens so phase-2 can re-poll freshly.
-   * Stored raw deliberately: the oracle is operator-owned and bearer-gated,
-   * so a ledger reader without oracle write access cannot fabricate hits. */
+  /** OOB-only bundles: per-run oracle tokens from phase 1, kept for audit
+   * trail. Phase 2 does NOT re-poll these — it provisions NEW tokens and
+   * re-executes the PoC (oobRunOptions below) so the verdict binds to a
+   * fresh interaction. Stored raw deliberately: the oracle is operator-owned
+   * and bearer-gated, so a ledger reader without oracle write access cannot
+   * fabricate hits. */
   oobTokens?: { targetToken: string; controlToken: string };
+  /** Sandbox policy recorded at phase 1 so phase 2 can re-execute the PoC
+   * under the operator's original authorization. Bundles that predate fresh
+   * OOB replay lack this field and fail closed with a re-promote instruction. */
+  oobRunOptions?: { network: "none" | "host"; local: boolean };
   /** Harness-owned OOB listener log for the run (opt-in blind classes). */
   callbackVerified?: OobVerification;
 };

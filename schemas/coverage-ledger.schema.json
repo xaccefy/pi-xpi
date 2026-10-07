@@ -1,0 +1,79 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/xaccefy/pi-xpi/schemas/coverage-ledger.schema.json",
+  "title": "XPI per-run coverage ledger",
+  "description": "Deterministic record of what one audit run did and did not examine. Complements Casefile CoverageAdd/CoverageReport (tested asset x attack-class view): the ledger is the per-run authority for review units and their evidence. A unit closed as covered/not_applicable must list reviewed paths and evidence-backed checks — an agent returning no finding is never coverage. Validated by scripts/validate-records.js.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "runId", "units"],
+  "properties": {
+    "schema": { "const": "xpi/coverage-ledger@1" },
+    "runId": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]{5,63}$" },
+    "units": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/definitions/unit" }
+    }
+  },
+  "definitions": {
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "description", "status"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9./:_-]{2,127}$",
+          "description": "Stable ID derived from source/surface, trust boundary, subsystem, and attack class where relevant, e.g. 'src/api/upload.ts:unauth:file-upload'."
+        },
+        "kind": {
+          "enum": ["surface", "trust_boundary", "attack_class", "lifecycle_path", "exclusion", "dependency"]
+        },
+        "description": { "type": "string", "minLength": 1 },
+        "status": {
+          "enum": ["planned", "in_progress", "covered", "candidate", "blocked", "deferred", "not_applicable", "out_of_scope"]
+        },
+        "reviewedPaths": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "description": "Repo-relative source paths actually read. Required to close a unit as covered or not_applicable."
+        },
+        "checks": {
+          "type": "array",
+          "description": "Evidence-backed checks performed for this unit.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "ref"],
+            "properties": {
+              "kind": { "enum": ["case", "evidence_item", "artifact", "tool_call"] },
+              "ref": { "type": "string", "minLength": 1, "description": "Case ID, evidence item ID, artifact path, or recorded tool call reference." }
+            }
+          }
+        },
+        "findings": {
+          "type": "array",
+          "description": "Finding fingerprints produced or ruled out by this unit.",
+          "items": { "type": "string", "pattern": "^[a-f0-9]{16}$" }
+        },
+        "reason": { "type": "string", "description": "Why the unit is blocked/deferred/out_of_scope/not_applicable — required for those statuses." },
+        "revisitWhen": { "type": "string", "description": "Concrete trigger for deferred units (new endpoint, new creds, new CVE)." },
+        "sourceRevision": { "type": "string", "description": "Revision the unit was last validated against; changed source invalidates the unit." }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "enum": ["covered", "not_applicable"] } } },
+          "then": { "required": ["reviewedPaths", "checks"], "properties": { "reviewedPaths": { "minItems": 1 }, "checks": { "minItems": 1 } } }
+        },
+        {
+          "if": { "properties": { "status": { "enum": ["blocked", "deferred", "out_of_scope", "not_applicable"] } } },
+          "then": { "required": ["reason"] }
+        },
+        {
+          "if": { "properties": { "status": { "const": "deferred" } } },
+          "then": { "required": ["revisitWhen"] }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "schema": "xpi/coverage-ledger@1",
+  "runId": "audit-xpi-2025-1001",
+  "units": [
+    {
+      "id": "src/api/upload.ts:unauth:file-upload",
+      "kind": "surface",
+      "description": "Unauthenticated upload endpoint and its storage pipeline",
+      "status": "covered",
+      "reviewedPaths": ["src/api/upload.ts", "src/lib/storage.ts"],
+      "checks": [
+        { "kind": "case", "ref": "case-001" },
+        { "kind": "evidence_item", "ref": "ev-004" }
+      ],
+      "findings": ["a1b2c3d4e5f60718"],
+      "sourceRevision": "4f9c1a2b7d3e5f608192a3b4c5d6e7f890123456"
+    },
+    {
+      "id": "src/api/upload.ts:unauth:content-type",
+      "kind": "attack_class",
+      "description": "Content-type/extension confusion on the upload path",
+      "status": "candidate",
+      "reviewedPaths": ["src/api/upload.ts"],
+      "checks": [{ "kind": "case", "ref": "case-002" }]
+    },
+    {
+      "id": "src/legacy/xmlrpc:deprecated:deserialization",
+      "kind": "exclusion",
+      "description": "Legacy XML-RPC surface excluded from this run's scope",
+      "status": "out_of_scope",
+      "reason": "src/legacy/ excluded by run scope; operator confirmed decommission scheduled"
+    },
+    {
+      "id": "src/payments/webhook.ts:stripe-signature:business-logic",
+      "kind": "trust_boundary",
+      "description": "Webhook signature verification boundary",
+      "status": "blocked",
+      "reason": "signature verification needs the live Stripe signing secret; not available in source-only mode"
+    },
+    {
+      "id": "src/admin/export.rs:admin:ssrf",
+      "kind": "attack_class",
+      "description": "Admin export URL fetch",
+      "status": "deferred",
+      "reason": "no admin credentials this run",
+      "revisitWhen": "admin test credentials provided for staging"
+    },
+    {
+      "id": "src/auth/reset.ts:user:business-logic",
+      "kind": "trust_boundary",
+      "description": "Password reset token consumption boundary",
+      "status": "candidate",
+      "reviewedPaths": ["src/auth/reset.ts"],
+      "checks": [{ "kind": "case", "ref": "case-003" }]
+    },
+    {
+      "id": "src/search.ts:public:xss",
+      "kind": "surface",
+      "description": "Public search results rendering",
+      "status": "covered",
+      "reviewedPaths": ["src/search.ts"],
+      "checks": [{ "kind": "evidence_item", "ref": "ev-009" }],
+      "findings": ["1a2b3c4d5e6f7081"]
+    }
+  ]
+}

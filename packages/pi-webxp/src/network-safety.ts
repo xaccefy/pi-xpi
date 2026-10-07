@@ -95,6 +95,24 @@ export async function assertPublicDns(hostname: string, allowPrivateHosts = fals
   }
 }
 
+/**
+ * Operator gate for private/internal target access. `allowPrivateHosts` in a
+ * tool call is an agent-supplied REQUEST; it only takes effect when the
+ * operator has set PI_WEBXP_ALLOW_PRIVATE_HOSTS=1 for the session. Without
+ * the operator env the call fails closed — internal-lab use stays possible,
+ * but the lab operator opts in, not the agent mid-session.
+ */
+export function assertPrivateHostsAllowed(requested: boolean, env: NodeJS.ProcessEnv = process.env): void {
+  if (!requested) return;
+  if (env.PI_WEBXP_ALLOW_PRIVATE_HOSTS !== "1") {
+    throw new Error(
+      "Blocked: allowPrivateHosts requires the operator's PI_WEBXP_ALLOW_PRIVATE_HOSTS=1 — " +
+        "private/internal target access is operator-gated and not agent-selectable. " +
+        "Ask the operator to enable it for this internal-lab session.",
+    );
+  }
+}
+
 export function createSafeDispatcher(options: {
   allowPrivateHosts?: boolean;
   verifyTls?: boolean;

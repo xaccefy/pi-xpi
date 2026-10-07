@@ -1,0 +1,18 @@
+{
+  "schema": "xpi/finding-record@1",
+  "fingerprint": "1a2b3c4d5e6f7081",
+  "runId": "audit-xpi-2025-1001",
+  "caseId": "case-004",
+  "title": "Reflected search query XSS (disproved)",
+  "coverageUnits": ["src/search.ts:public:xss"],
+  "disposition": "rejected",
+  "rejected": {
+    "disprovedClaim": "The search query reflects unescaped into the results page",
+    "reason": "Query is rendered through the framework's auto-escaping text binding; the auditor tested the raw API response, not the rendered page",
+    "changedEvidenceWouldReopen": true,
+    "evidence": [
+      { "kind": "source_reading", "ref": "src/search.ts:55-61" },
+      { "kind": "evidence_item", "ref": "ev-009" }
+    ]
+  }
+}
