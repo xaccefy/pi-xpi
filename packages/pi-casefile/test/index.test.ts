@@ -567,8 +567,7 @@ await assert.rejects(
           canary_assessment: "not_applicable",
           canary_reason: "the per-run OOB token IS the causality signal here",
         },
-      });
-      expect(confirm.isError).toBe(true);
+      }),
       ),
       (e: Error) => {
         assert.ok(e.message.includes("OOB fresh replay unavailable"), `unexpected: ${e.message}`);
@@ -655,8 +654,7 @@ await assert.rejects(
           canary_assessment: "not_applicable",
           canary_reason: "the per-run OOB token IS the causality signal here",
         },
-      });
-      expect(confirm.isError).toBe(true);
+      }),
       expect(confirm.content[0].text).toContain("PI_POC_ALLOW_NETWORK=1");
       ),
       (e: Error) => {
@@ -854,8 +852,7 @@ await assert.rejects(
           canary_assessment: "not_applicable",
           canary_reason: "the per-run OOB token IS the causality signal here",
         },
-      });
-      expect(confirm.isError).toBe(true);
+      }),
       ),
       (e: Error) => {
         assert.ok(/control-token interaction|target_only/.test(e.message), `unexpected: ${e.message}`);
@@ -940,8 +937,7 @@ await assert.rejects(
           canary_assessment: "not_applicable",
           canary_reason: "the per-run OOB token IS the causality signal here",
         },
-      });
-      expect(confirm.isError).toBe(true);
+      }),
       ),
       (e: Error) => {
         assert.ok(e.message.includes("control script changed since phase 1"), `unexpected: ${e.message}`);
