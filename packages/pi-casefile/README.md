@@ -1,6 +1,6 @@
 # pi-casefile
 
-Local security case book for Pi Agent. Keeps your guesses → proven findings behind a PoC gate, saved in SQLite, run in a sandbox.
+Local security case book for Pi Agent. Guesses become findings only through a PoC gate. State lives in SQLite, PoCs run in a sandbox.
 
 ## Install
 
@@ -8,41 +8,36 @@ Local security case book for Pi Agent. Keeps your guesses → proven findings be
 pi install npm:@xaccefy/pi-casefile
 ```
 
-Or via the XPI umbrella package: `pi install npm:@xaccefy/pi-xpi`
+Or via the umbrella package: `pi install npm:@xaccefy/pi-xpi`
 
 ## XP mode (default OFF)
 
-The attack-mode text stays **quiet by default** so your normal coding isn't buried in security talk.
+The attack-mode text stays quiet by default so normal coding isn't buried in security talk.
 
 | Control | Effect |
 |---------|--------|
 | `/xp` | Toggle SWARM/OFF |
 | `/xp on` | Default enabled mode: SWARM |
 | `/xp swarm` | Bounded multi-agent workflow: auditor/tracer/skeptic/chain only |
-| `/xp lite` | Focused workflow: single-agent, no subagent dispatch |
-| `/xp off` | Quiet mode explicitly |
-| `PI_XP_MODE=on` | Force SWARM for this process (same as `swarm`) |
-| `PI_XP_MODE=swarm` | Force SWARM for this process (overrides file) |
-| `PI_XP_MODE=lite` | Force LITE (single-agent, no subagent dispatch) |
-| `PI_XP_MODE=off` | Force OFF |
+| `/xp lite` | Single-agent, no subagent dispatch |
+| `/xp off` | Quiet mode |
+| `PI_XP_MODE=on` / `swarm` / `lite` / `off` | Force a mode for this process |
 
-When **LITE**, every prompt gets the attacker-minded workflow plus any open cases, done by the main agent alone — no `subagent` dispatch (CTF / single-shot engagements). When **SWARM**, the bounded pipeline is injected and only auditor/tracer/skeptic/chain are delegated; validation, patching, reporting, and ConfirmFinding stay with the main agent. When **OFF**, nothing is added; tools still work.
-
-State is persisted next to the ledger as `xp-mode` (e.g. `.pi/xp-mode`).
+LITE runs everything in the main agent. SWARM delegates only auditor/tracer/skeptic/chain; validation, patching, reporting, and ConfirmFinding stay with the main agent. OFF adds nothing; tools still work. State persists as `xp-mode` next to the ledger.
 
 ## Environment
 
 | Variable | Purpose |
 |----------|---------|
 | `PI_CASEFILE_PATH` | Absolute path to the SQLite ledger file |
-| `CASEFILE_WORKSPACE_ROOT` / `PI_WORKSPACE_ROOT` | Override workspace root used to place `.pi/casefile.db` |
+| `CASEFILE_WORKSPACE_ROOT` / `PI_WORKSPACE_ROOT` | Workspace root used to place `.pi/casefile.db` |
 | `PI_POC_ALLOW_NETWORK=1` | Operator authorization for a networked PoC sandbox |
-| `PI_POC_ALLOW_PRIVATE_REPLAY=1` | Operator authorization for harness replay to private/internal targets |
-| `PI_POC_CONTROL_TARGETS` | Comma/newline-separated operator-approved control hosts/origins; agent-invented controls are rejected |
+| `PI_POC_ALLOW_PRIVATE_REPLAY=1` | Operator authorization for replay to private targets |
+| `PI_POC_CONTROL_TARGETS` | Operator-approved control hosts; agent-invented controls are rejected |
 
 Default DB path: `<workspace>/.pi/casefile.db`
 
-## State machine
+## Case lifecycle
 
 ```
 hypothesis → investigating → confirmed → reported
@@ -50,33 +45,26 @@ hypothesis → investigating → confirmed → reported
               blocked         killed (terminal)
 ```
 
-- **investigating** needs `evidence` + `confidence`
-- **confirmed** only through the two-phase gate — `PromoteFinding` runs the PoC 2× target + 1× control, requires complete zero-exit runs and nonce-bound discriminating response-body evidence, then the harness performs a DNS-pinned identical replay and requires two conclusive responses with `target_only`. Reflection-capable requests may add a post-PoC harness-generated canary that must appear only on target. Status-only/trivial matchers and incomplete response capture are rejected. Exit zero is necessary but never proof. The main agent performs semantic review and calls `ConfirmFinding`, which captures a second fresh harness replay and binds it to the verdict; worker processes are rejected. Blind/OOB claims fail closed without a source-separated oracle.
-- **Every promotion requires a distinct `control_target`** pre-approved by the operator in `PI_POC_CONTROL_TARGETS`; an agent cannot invent its own easy control. `control_path` defaults to `poc_path` and exists only as an override — if supplied, it must contain the same bytes as the PoC (sha256 enforced). The control run is stored as `controlVerified`. Crashes, transport-inconclusive controls, status-only evidence, and missing evidence all block promotion.
-- **New cases require `disproveIf`** — falsification conditions (what would disprove this hypothesis). A hypothesis that can't say what kills it isn't one yet.
-- **A kill must be justified**: either an EvidenceAdd `refutation` item, or a canonical kill-reason token (intended_behavior, duplicate, framework_protection, out_of_scope, insufficient_impact, no_attack_path, ...) in assumptions/nextStep. Bare `status: "killed"` is rejected.
-- **reported** needs `CaseContext` first (records the report path; the main agent produces the final file)
-- **killed** / **reported** are final (no more edits)
-
-## Evidence items
-
-`EvidenceAdd` records role-typed, artifact-backed evidence (observation / reproduction / impact / refutation / cleanup). Artifact reads are restricted to regular, non-symlink files inside the workspace. Bytes are copied durably and stored as basename + SHA-256; the full source path is never persisted. The PoC gate auto-records the `reproduction` item at promotion.
+- New cases need `disproveIf`: what evidence would kill the hypothesis. A hypothesis that can't say what kills it isn't one yet.
+- `PromoteFinding` (phase 1, main agent only) runs the PoC twice on the target and once on an operator-approved control, requires zero-exit runs with nonce-bound response-body evidence, then replays the same request through the harness with DNS pinning and demands a `target_only` result. Access-control bugs use a same-host baseline instead of a control host. Status-only matchers and incomplete captures are rejected.
+- `ConfirmFinding` (phase 2, main agent only) captures one more fresh replay and binds it to the semantic verdict. Worker processes are rejected on both phases.
+- Kills need a refutation evidence item or a canonical kill reason. Bare `status: "killed"` is rejected.
+- `reported` requires `CaseContext` first.
 
 ## Tools
 
 | Tool | Use |
 |------|-----|
-| `CaseAdd` | Open a case (`title` + `disproveIf` required; start as `hypothesis` or `investigating`) |
-| `CaseUpdate` | Evidence, impact, severity, status (not direct confirm) |
-| `EvidenceAdd` | Role-typed, hashed evidence item on a case (refutation justifies kills; cleanup tracks cleanup) |
-| `PromoteFinding` | Phase 1: main-agent-only PoC 2× target + 1× operator-approved control, then DNS-pinned harness-owned replay requiring conclusive `target_only`; optional reflection canary upgrades the recorded proof strength when observed only on target. `local:true` and private replay are operator-gated; blind/OOB proof fails closed without source separation |
-| `ConfirmFinding` | Phase 2: main-agent-only semantic decision plus a fresh harness-owned target/control replay (CONFIRMED promotes; NOT_CONFIRMED keeps investigating; worker/subagent gate calls are rejected) |
+| `CaseAdd` | Open a case (`title` + `disproveIf` required) |
+| `CaseUpdate` | Evidence, impact, severity, status (no direct confirm) |
+| `EvidenceAdd` | Role-typed, hashed evidence; refutation justifies kills |
+| `PromoteFinding` | Phase 1 of the gate (see above) |
+| `ConfirmFinding` | Phase 2 of the gate |
 | `CaseGet` / `CaseList` / `CaseSearch` | Read / filter / search |
 | `CaseLink` / `CaseUnlink` | Bidirectional exploit chains |
-| `ChainSuggest` | Scan cases for exploitable chain combinations (credential+endpoint→ATO, redirect+OAuth→token theft, XSS+state-change→CSRF, IDOR+user-data, SSTI→RCE, race+payment, info-disclosure+SSRF), ranked by confidence |
-| `CoverageAdd` | Record a tested (asset × attack-class) cell — `scope: wide` (deployment-wide verdict, applies to every later asset) or `local`; both found and clean results count. Optionally link the cell to an artifact-backed evidence item (`evidence_item_id`); unbacked cells render as ⚠ unbacked in the report |
-| `CoverageReport` | Render the machine-checkable coverage matrix (which classes are tested where; plateau claims must match it) |
-| `CaseContext` | Context bundle for a confirmed/reported case (full record, logs, links, artifacts) + report path |
+| `ChainSuggest` | Rank exploitable case combinations |
+| `CoverageAdd` / `CoverageReport` | Record and render tested (asset × attack-class) cells |
+| `CaseContext` | Full case bundle for the report |
 
 Commands: `/casefile` (dashboard), `/xp` (XP mode).
 
