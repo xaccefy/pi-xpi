@@ -1,3 +1,4 @@
+import assert from "node:assert";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -553,7 +554,8 @@ describe("casefile extension", () => {
       expect(phase1.isError).toBeUndefined();
       expect(provisioned.length).toBe(2);
 
-      const confirm = await executeTool(pi, "ConfirmFinding", {
+await assert.rejects(
+      executeTool(pi, "ConfirmFinding", {
         id: added.details.record.id,
         verdict: {
           verdict: "CONFIRMED",
@@ -567,7 +569,12 @@ describe("casefile extension", () => {
         },
       });
       expect(confirm.isError).toBe(true);
-      expect(confirm.content[0].text).toContain("OOB fresh replay unavailable");
+      ),
+      (e: Error) => {
+        assert.ok(e.message.includes("OOB fresh replay unavailable"), `unexpected: ${e.message}`);
+        return true;
+      },
+    );
       // No stale re-poll: the phase-1 tokens were never re-queried.
       expect(provisioned.length).toBe(2);
     } finally {
@@ -635,7 +642,8 @@ describe("casefile extension", () => {
 
       // Operator revokes networked PoC execution between the phases.
       delete process.env.PI_POC_ALLOW_NETWORK;
-      const confirm = await executeTool(pi, "ConfirmFinding", {
+await assert.rejects(
+      executeTool(pi, "ConfirmFinding", {
         id: added.details.record.id,
         verdict: {
           verdict: "CONFIRMED",
@@ -650,7 +658,12 @@ describe("casefile extension", () => {
       });
       expect(confirm.isError).toBe(true);
       expect(confirm.content[0].text).toContain("PI_POC_ALLOW_NETWORK=1");
-      expect(confirm.content[0].text).toContain("does not survive revocation");
+      ),
+      (e: Error) => {
+        assert.ok(e.message.includes("PI_POC_ALLOW_NETWORK=1"), `unexpected: ${e.message}`);
+        return true;
+      },
+    );
       // No fresh replay happened: only the phase-1 pair was ever provisioned.
       expect(provisioned.length).toBe(2);
     } finally {
@@ -828,7 +841,8 @@ describe("casefile extension", () => {
       });
       expect(phase1.isError).toBeUndefined();
 
-      const confirm = await executeTool(pi, "ConfirmFinding", {
+await assert.rejects(
+      executeTool(pi, "ConfirmFinding", {
         id: added.details.record.id,
         verdict: {
           verdict: "CONFIRMED",
@@ -842,7 +856,12 @@ describe("casefile extension", () => {
         },
       });
       expect(confirm.isError).toBe(true);
-      expect(confirm.content[0].text).toMatch(/control-token interaction|target_only/);
+      ),
+      (e: Error) => {
+        assert.ok(/control-token interaction|target_only/.test(e.message), `unexpected: ${e.message}`);
+        return true;
+      },
+    );
     } finally {
       for (const k of [
         "PI_OOB_ORACLE_URL",
@@ -908,7 +927,8 @@ describe("casefile extension", () => {
       expect(phase1.isError).toBeUndefined();
 
       writeFileSync(separateControl, `${readFileSync(separateControl, "utf8")}# tampered\n`, "utf8");
-      const confirm = await executeTool(pi, "ConfirmFinding", {
+await assert.rejects(
+      executeTool(pi, "ConfirmFinding", {
         id: added.details.record.id,
         verdict: {
           verdict: "CONFIRMED",
@@ -922,7 +942,12 @@ describe("casefile extension", () => {
         },
       });
       expect(confirm.isError).toBe(true);
-      expect(confirm.content[0].text).toContain("control script changed since phase 1");
+      ),
+      (e: Error) => {
+        assert.ok(e.message.includes("control script changed since phase 1"), `unexpected: ${e.message}`);
+        return true;
+      },
+    );
       // Failed before provisioning: still only the phase-1 pair exists.
       expect(provisioned.length).toBe(2);
     } finally {
