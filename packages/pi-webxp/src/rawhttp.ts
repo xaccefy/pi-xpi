@@ -32,12 +32,12 @@ import { type TLSSocket, connect as tlsConnect } from "node:tls";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { isPublicIpAddress } from "@xaccefy/pi-shared";
-import { assertPrivateHostsAllowed } from "./network-safety.ts";
 import { Type } from "typebox";
 import {
   DEFAULT_MAX_BODY as DEFAULT_MAX_RESPONSE_BYTES,
   MAX_BODY_HARD as MAX_RESPONSE_BYTES_HARD,
 } from "./httprequest.ts";
+import { assertPrivateHostsAllowed } from "./network-safety.ts";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_RESPONSE_WAIT_MS = 5_000;
@@ -139,7 +139,10 @@ function dialSocket(
       return;
     }
     signal?.addEventListener("abort", onAbort, { once: true });
-    const timer = setTimeout(() => fail(new Error(`connect timed out after ${timeoutMs}ms`)), timeoutMs);
+    const timer = setTimeout(
+      () => fail(new Error(`connect timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
     const onEstablished = (established: Socket) => {
       if (settled) {
         // A connection completing after timeout/abort: nobody owns it.
@@ -536,9 +539,7 @@ export async function raceSendRequests(
       ...summarizeCapture(cap, releaseAt),
     }));
 
-    const arrived = results
-      .map((r) => r.firstResponseMs)
-      .filter((v): v is number => v !== null);
+    const arrived = results.map((r) => r.firstResponseMs).filter((v): v is number => v !== null);
     const responseSpreadMs =
       arrived.length >= 2 ? Math.max(...arrived) - Math.min(...arrived) : null;
 
@@ -758,7 +759,11 @@ export default function rawHttpExtension(pi: ExtensionAPI) {
     renderResult(result, _opts, theme, context) {
       if (context.isError) return new Text(theme.fg("error", "✗ race failed"), 0, 0);
       const d = result.details as
-        | { results?: { firstResponseMs?: number | null }[]; responseSpreadMs?: number | null; statuses?: Record<string, number> }
+        | {
+            results?: { firstResponseMs?: number | null }[];
+            responseSpreadMs?: number | null;
+            statuses?: Record<string, number>;
+          }
         | undefined;
       const spread = d?.responseSpreadMs ?? "n/a";
       return new Text(

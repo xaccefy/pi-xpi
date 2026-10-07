@@ -136,7 +136,6 @@ function origin(url: URL): string {
   return `${url.protocol}//${url.host}`;
 }
 
-
 const DEFAULT_SESSION = "default";
 const MAX_SESSION_NAME_CHARS = 64;
 const MAX_SESSIONS = 32;

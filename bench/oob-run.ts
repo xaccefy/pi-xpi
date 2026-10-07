@@ -57,7 +57,7 @@ function makeOracle() {
 
 const BASE_ENV = {
   // In-memory oracle: fetch is intercepted before any connection, but the
-// URL must still satisfy the transport rule (https, or loopback http).
+  // URL must still satisfy the transport rule (https, or loopback http).
   PI_OOB_ORACLE_URL: "http://localhost",
   PI_OOB_SOURCE_SEPARATED: "1",
 };

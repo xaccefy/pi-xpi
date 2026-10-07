@@ -1,8 +1,8 @@
 import assert from "node:assert";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -28,7 +28,9 @@ function registeredToolNames(): Set<string> {
   ];
   for (const rel of direct) {
     const src = readFileSync(join(root, rel), "utf8");
-    for (const m of src.matchAll(/(?:pi\.registerTool|registerCaseTool)\(\{[\s\S]*?name:\s*"([^"]+)"/g)) {
+    for (const m of src.matchAll(
+      /(?:pi\.registerTool|registerCaseTool)\(\{[\s\S]*?name:\s*"([^"]+)"/g,
+    )) {
       names.add(m[1]);
     }
   }

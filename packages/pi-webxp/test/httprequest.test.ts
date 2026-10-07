@@ -176,14 +176,12 @@ describe("pi-webxp: http_request", () => {
     delete process.env.PI_WEBXP_ALLOW_PRIVATE_HOSTS;
   });
 
-
   it("registers the http_request tool", () => {
     const tool = api.tools.find((t) => t.name === "http_request");
     assert.ok(tool, "http_request tool is registered");
     assert.equal(tool.label, "HTTP Request");
     assert.ok(tool.description.includes("cookie jar"));
   });
-
 
   it("returns status and body for a GET request", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
@@ -200,7 +198,6 @@ describe("pi-webxp: http_request", () => {
     assert.equal(details.body, "OK");
     assert.ok(result.content[0].text.includes("HTTP/1.1 200 OK"));
   });
-
 
   it("persists cookies from Set-Cookie across calls", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
@@ -388,7 +385,6 @@ describe("pi-webxp: http_request", () => {
     );
   });
 
-
   it("replaces (not duplicates) cookies when Set-Cookie rotates a value", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
 
@@ -423,7 +419,6 @@ describe("pi-webxp: http_request", () => {
     assert.equal(sessionCount, 1, `Exactly one session cookie: ${cookiesOnHost}`);
   });
 
-
   it("injects cookies from the jar into request headers", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
 
@@ -448,7 +443,6 @@ describe("pi-webxp: http_request", () => {
     assert.ok(text.includes("> Cookie:"), "Cookie header injected into request transcript");
   });
 
-
   it("returns 302 as-is with redirect=manual (default)", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
     const result = await tool.execute(
@@ -462,7 +456,6 @@ describe("pi-webxp: http_request", () => {
     assert.equal(details.status, 302);
     assert.equal(details.redirected, false, "No redirect followed in manual mode");
   });
-
 
   it("blocks private/internal redirect hops by default", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
@@ -534,7 +527,6 @@ describe("pi-webxp: http_request", () => {
     );
   });
 
-
   it("blocks private/internal hosts by default", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
     await assert.rejects(
@@ -573,7 +565,6 @@ describe("pi-webxp: http_request", () => {
     );
   });
 
-
   it("rejects non-http(s) URLs", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
     await assert.rejects(
@@ -581,7 +572,6 @@ describe("pi-webxp: http_request", () => {
       /not allowed/,
     );
   });
-
 
   it("truncates large response bodies", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
@@ -596,7 +586,6 @@ describe("pi-webxp: http_request", () => {
     assert.ok(details.bodyTruncated, "Body was truncated");
     assert.ok(details.bodySize <= 50, `Body size ${details.bodySize} is within cap`);
   });
-
 
   it("sends custom headers", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
@@ -614,7 +603,6 @@ describe("pi-webxp: http_request", () => {
     assert.ok(text.includes("X-Custom-Header: test-value"), "Custom header in transcript");
   });
 
-
   it("applies AbortSignal.timeout", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
     const result = await tool.execute(
@@ -628,7 +616,6 @@ describe("pi-webxp: http_request", () => {
     // that timeoutMs is passed through to the fetch signal
     assert.ok(!(result as any).content[0].text.includes("HTTP request failed"));
   });
-
 
   it("stringifies json body and sets content-type", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
@@ -647,7 +634,6 @@ describe("pi-webxp: http_request", () => {
     assert.ok(text.includes("application/json"), "Content-Type set to application/json");
     assert.ok(text.includes('"key":"value"'), "JSON body stringified");
   });
-
 
   it("treats a caller's capitalized Cookie header as authoritative", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;
@@ -721,7 +707,6 @@ describe("pi-webxp: http_request", () => {
     );
     assert.strictEqual(sentHeaders[ctKeys[0]], "application/vnd.api+json", "caller's value wins");
   });
-
 
   it("verifyTls=false wires the TLS bypass on the real request path", async () => {
     const tool = api.tools.find((t) => t.name === "http_request")!;

@@ -1972,7 +1972,9 @@ export default function casefileExtension(pi: ExtensionAPI) {
             // approval of the control target does not survive revocation of
             // PI_POC_CONTROL_TARGETS.
             if (bundle.controlTarget) {
-              const revokedControlAuthorization = controlTargetAuthorizationError(bundle.controlTarget);
+              const revokedControlAuthorization = controlTargetAuthorizationError(
+                bundle.controlTarget,
+              );
               if (revokedControlAuthorization) {
                 throw new Error(
                   `CONTROL AUTHORIZATION FAILED: ${revokedControlAuthorization}. ` +
@@ -2015,7 +2017,11 @@ export default function casefileExtension(pi: ExtensionAPI) {
               provisionCallback(freshOracle.config),
               provisionCallback(freshOracle.config),
             ]);
-            const rerunOptions = (pocMode: string, target: string, domain: string): PocRunOptions => ({
+            const rerunOptions = (
+              pocMode: string,
+              target: string,
+              domain: string,
+            ): PocRunOptions => ({
               network: bundle.oobRunOptions!.network,
               local: bundle.oobRunOptions!.local,
               env: {
@@ -2053,7 +2059,10 @@ export default function casefileExtension(pi: ExtensionAPI) {
               // the canary that must stay silent — zero interactions with it
               // is the differential, and any hit falsifies target-dependence.
               requireComplete(
-                runPoc(bundle.pocPath, rerunOptions("poc", caseTargetForReplay, freshTarget.domain)),
+                runPoc(
+                  bundle.pocPath,
+                  rerunOptions("poc", caseTargetForReplay, freshTarget.domain),
+                ),
                 "target",
               );
             }

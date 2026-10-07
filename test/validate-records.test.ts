@@ -2,8 +2,8 @@ import assert from "node:assert";
 import { spawnSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const validator = join(root, "scripts", "validate-records.js");
@@ -24,8 +24,14 @@ describe("record validator fixtures", () => {
 
   it("fixture directory is populated with both valid and invalid records", () => {
     assert.ok(fixtures.length >= 8, "expected the full fixture set");
-    assert.ok(fixtures.some((f) => f.startsWith("invalid-")), "expected invalid-* fixtures");
-    assert.ok(fixtures.filter((f) => !f.startsWith("invalid-")).length >= 5, "expected valid fixtures");
+    assert.ok(
+      fixtures.some((f) => f.startsWith("invalid-")),
+      "expected invalid-* fixtures",
+    );
+    assert.ok(
+      fixtures.filter((f) => !f.startsWith("invalid-")).length >= 5,
+      "expected valid fixtures",
+    );
   });
 
   for (const fixture of fixtures) {
@@ -33,7 +39,11 @@ describe("record validator fixtures", () => {
     it(`${shouldFail ? "rejects" : "accepts"} ${fixture}`, () => {
       const result = runValidator([join(fixturesDir, fixture)]);
       if (shouldFail) {
-        assert.notStrictEqual(result.status, 0, `validator accepted an invalid record:\n${result.stdout}`);
+        assert.notStrictEqual(
+          result.status,
+          0,
+          `validator accepted an invalid record:\n${result.stdout}`,
+        );
         assert.ok(result.stderr.trim().length > 0, "invalid records must print diagnostics");
       } else {
         assert.strictEqual(
@@ -53,11 +63,7 @@ describe("record validator fixtures", () => {
   });
 
   it("--type rejects a record of the wrong type", () => {
-    const result = runValidator([
-      join(fixturesDir, "finding-rejected.json"),
-      "--type",
-      "manifest",
-    ]);
+    const result = runValidator([join(fixturesDir, "finding-rejected.json"), "--type", "manifest"]);
     assert.notStrictEqual(result.status, 0);
     assert.match(result.stderr, /expected xpi\/audit-run@1/);
   });
@@ -126,7 +132,11 @@ describe("record validator fixtures", () => {
   it("--type on a JSON null document reports an invalid record, not a crash", () => {
     // The --type fast path used to read doc.schema before the null guard.
     for (const type of ["manifest", "ledger", "finding"]) {
-      const result = runValidator([join(fixturesDir, "invalid-null-document.json"), "--type", type]);
+      const result = runValidator([
+        join(fixturesDir, "invalid-null-document.json"),
+        "--type",
+        type,
+      ]);
       assert.strictEqual(result.status, 1, `--type ${type} must exit 1`);
       assert.match(result.stderr, /document must be a JSON object/);
     }

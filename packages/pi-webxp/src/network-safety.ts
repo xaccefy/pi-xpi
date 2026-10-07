@@ -102,7 +102,10 @@ export async function assertPublicDns(hostname: string, allowPrivateHosts = fals
  * the operator env the call fails closed — internal-lab use stays possible,
  * but the lab operator opts in, not the agent mid-session.
  */
-export function assertPrivateHostsAllowed(requested: boolean, env: NodeJS.ProcessEnv = process.env): void {
+export function assertPrivateHostsAllowed(
+  requested: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): void {
   if (!requested) return;
   if (env.PI_WEBXP_ALLOW_PRIVATE_HOSTS !== "1") {
     throw new Error(

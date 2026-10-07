@@ -153,11 +153,7 @@ async function oracleFetch(
     });
   } catch (e) {
     const raw = (e as Error).message ?? String(e);
-    const safe = raw
-      .split(requestUrl)
-      .join("[redacted-url]")
-      .split(path)
-      .join("[redacted-path]");
+    const safe = raw.split(requestUrl).join("[redacted-url]").split(path).join("[redacted-path]");
     throw new Error(`OOB oracle unreachable (${origin}): ${safe}`);
   }
 }
