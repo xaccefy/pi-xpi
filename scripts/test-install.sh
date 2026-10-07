@@ -14,12 +14,9 @@ chmod +x "$TEST_DIR/bin/omp"
 PI_LOG="$TEST_DIR/pi.log"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "${PI_LOG:?}"\nexit 0\n' > "$TEST_DIR/bin/pi"
 chmod +x "$TEST_DIR/bin/pi"
-# Seed retired agent files directly: their content is irrelevant, only their
-# existence (and the installer's retirement/survival rules) is under test.
-# Historical-blob extraction would need deep git history, which CI lacks.
-printf 'retired\n' > "$TEST_DIR/agents/confirmer.md"
-printf 'retired\n' > "$TEST_DIR/agents/exploit.md"
-printf 'retired\n' > "$TEST_DIR/agents/reporter.md"
+git -C "$ROOT_DIR" show c1c88d9c94560f4e69a198146bc7b23d91ea0ffa:agents/confirmer.md > "$TEST_DIR/agents/confirmer.md"
+git -C "$ROOT_DIR" show c1c88d9c94560f4e69a198146bc7b23d91ea0ffa:agents/exploit.md > "$TEST_DIR/agents/exploit.md"
+git -C "$ROOT_DIR" show 12daa82521d2047d6b6489853c6de8b650438745:agents/reporter.md > "$TEST_DIR/agents/reporter.md"
 
 run_installer() {
   PATH="$TEST_DIR/bin:$PATH" \
