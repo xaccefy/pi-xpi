@@ -75,12 +75,12 @@ const scenarios: Array<{ id: string; threat: string; run: () => Promise<string> 
       const oracle = makeOracle();
       setOobOracleFetchForTest(oracle.fetch);
       const t = await provisionCallback({
-        baseUrl: "http://oracle.test",
+        baseUrl: "http://localhost",
         sourceSeparated: true,
         selfIps: [SELF_IP],
       });
       const c = await provisionCallback({
-        baseUrl: "http://oracle.test",
+        baseUrl: "http://localhost",
         sourceSeparated: true,
         selfIps: [SELF_IP],
       });
@@ -109,12 +109,12 @@ const scenarios: Array<{ id: string; threat: string; run: () => Promise<string> 
       const oracle = makeOracle();
       setOobOracleFetchForTest(oracle.fetch);
       const t = await provisionCallback({
-        baseUrl: "http://oracle.test",
+        baseUrl: "http://localhost",
         sourceSeparated: true,
         selfIps: [],
       });
       const c = await provisionCallback({
-        baseUrl: "http://oracle.test",
+        baseUrl: "http://localhost",
         sourceSeparated: true,
         selfIps: [],
       });
@@ -209,7 +209,7 @@ const scenarios: Array<{ id: string; threat: string; run: () => Promise<string> 
       let threw = "";
       try {
         await provisionCallback({
-          baseUrl: "http://oracle.test",
+          baseUrl: "http://localhost",
           sourceSeparated: true,
           selfIps: [],
         });
