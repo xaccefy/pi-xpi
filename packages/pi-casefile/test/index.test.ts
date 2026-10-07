@@ -569,7 +569,7 @@ await assert.rejects(
         },
       }),
       (e: Error) => {
-        assert.ok(e.message.includes("OOB fresh replay unavailable"), `unexpected: ${e.message}`);
+        assert.ok(/OOB oracle \/provision failed: HTTP 500/.test(e.message), `unexpected: ${e.message}`);
         return true;
       },
     );
@@ -741,10 +741,12 @@ await assert.rejects(
         control_path: hybridControl,
         control_target: "https://control.example",
         oob: true,
+        local: true,
       });
       expect(phase1.isError).toBeUndefined();
       const bundle = phase1.details.record.pendingConfirmation;
       expect(bundle.controlTarget).toBe("https://control.example");
+      expect(bundle.oobRunOptions).toEqual({ network: "host", local: true });
       expect(bundle.oobTokens).toBeDefined();
 
       const confirm = await executeTool(pi, "ConfirmFinding", {
@@ -851,7 +853,7 @@ await assert.rejects(
         },
       }),
       (e: Error) => {
-        assert.ok(/control-token interaction|target_only/.test(e.message), `unexpected: ${e.message}`);
+        assert.ok(/MAIN-AGENT REPLAY FAILED/.test(e.message) && /control-token 1/.test(e.message), `unexpected: ${e.message}`);
         return true;
       },
     );
