@@ -462,8 +462,13 @@ function buildDockerArgs(
     "ALL",
     "--security-opt",
     "no-new-privileges",
+    // Run as the PARENT's uid/gid: the bind-mounted workspace is owned by
+    // whoever runs the tests. A hardcoded uid cannot write into it on hosts
+    // whose user is not 1000 (GitHub runner VMs use uid 1001), which made
+    // the PoC exit 0 while its evidence write silently failed. Falling back
+    // to 1000:1000 where the platform does not expose the ids.
     "--user",
-    "1000:1000",
+    `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`,
     "--memory",
     "256m",
     "--pids-limit",
