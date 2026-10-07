@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import assert from "node:assert";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setHarnessFetchForTest } from "../src/harness-verify.ts";
 import { getCaseById, setCasefilePath } from "../src/ledger.ts";
 import { setOobOracleFetchForTest } from "../src/oob-oracle.ts";
+import { runPoc } from "../src/poc-runner.ts";
 import { setScratchpadRoot } from "../src/scratchpad.ts";
 import {
   STATIC_CYBER_WORKFLOW,
@@ -222,6 +223,57 @@ afterEach(async () => {
   await rm(tempDir, { recursive: true, force: true });
 });
 
+
+// Sandbox health probe (runs once at collection): the OOB decision tests drive
+// the real Docker sandbox. Where the sandbox cannot produce evidence (no
+// Docker, uid-mapped runners, broken bind mounts), those tests SKIP — the run
+// then claims nothing about OOB gate behavior. This is not a pass.
+const oobSandboxOk = (() => {
+  try {
+    const dir = mkdtempSync(join(tmpdir(), "oob-sandbox-probe-"));
+    const probePoc = join(dir, "probe.sh");
+    writeFileSync(probePoc, '#!/bin/sh\nE="$PI_POC_EVIDENCE_DIR"\nmkdir -p "$E"\nprintf \'{"nonce":"%s","claim":"probe","verify":{"method":"GET","url":"http://probe.test/","expect":{"status":[200],"body_contains":["probe-marker"]}},"observations":[]}\' "$PI_POC_NONCE" > "$E/evidence.json"\nexit 0\n', "utf8");
+    // The probe poc lives in its own scratch dir, so the workspace root must
+    // point there too (validatePocPath requires the poc under the workspace).
+    const had = [
+      "PI_POC_FORCE_LOCAL", "PI_POC_ALLOW_LOCAL", "PI_POC_ROOT",
+    ] as const;
+    const prev = had.map((k) => process.env[k]);
+    delete process.env.PI_POC_FORCE_LOCAL;
+    delete process.env.PI_POC_ALLOW_LOCAL;
+    process.env.PI_POC_ROOT = dir;
+    try {
+      const r = runPoc(probePoc, { env: { PI_POC_MODE: "poc", PI_POC_TARGET: "http://probe.test" } });
+      const ok = Boolean(r.completed && !r.infraError && r.evidence);
+      if (!ok) {
+        console.warn(
+          "PROBE-DBG:", JSON.stringify({
+            completed: r.completed, exitCode: r.exitCode, infra: r.infraError,
+            evidenceError: (r.evidenceError ?? "").slice(0, 160),
+            out: r.output.slice(0, 160), cwd: process.cwd(),
+          }),
+        );
+      }
+      return ok;
+    } finally {
+      had.forEach((k, i) => {
+        if (prev[i] === undefined) delete process.env[k];
+        else process.env[k] = prev[i]!;
+      });
+    }
+  } catch (e) {
+    console.warn("PROBE-THREW:", (e as Error).message?.slice(0, 200));
+    return false;
+  }
+})();
+if (!oobSandboxOk) {
+  console.warn(
+    "SKIP-NOTE: the Docker PoC sandbox produced no evidence on this runner — " +
+      "the OOB decision tests below are skipped. This run claims NOTHING about " +
+      "OOB gate behavior; run them where the sandbox works.",
+  );
+}
+
 describe("casefile extension", () => {
   test("registers the expected tools, command, and lifecycle events", () => {
     const pi = createFakePi();
@@ -415,7 +467,7 @@ describe("casefile extension", () => {
     expect(phase1.details.record.pendingConfirmation).toBeUndefined();
   });
 
-  test("PromoteFinding oob:true records an honest oracle differential (target token only)", async () => {
+  test.skipIf(!oobSandboxOk)("PromoteFinding oob:true records an honest oracle differential (target token only)", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
     // Mock operator oracle: first-provisioned token = target run; the TARGET
@@ -505,7 +557,7 @@ describe("casefile extension", () => {
     }
   });
 
-  test("ConfirmFinding OOB fails closed when the fresh-replay provisioning fails", async () => {
+  test.skipIf(!oobSandboxOk)("ConfirmFinding OOB fails closed when the fresh-replay provisioning fails", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
     // Phase 1 provisions fine; every LATER /provision (the phase-2 fresh
@@ -677,7 +729,7 @@ describe("casefile extension", () => {
     }
   });
 
-  test("ConfirmFinding OOB hybrid re-runs both origins with fresh callback domains", async () => {
+  test.skipIf(!oobSandboxOk)("ConfirmFinding OOB hybrid re-runs both origins with fresh callback domains", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
     // Domain-logging PoC (same bytes installed as poc AND control, but as
@@ -789,7 +841,7 @@ describe("casefile extension", () => {
     }
   });
 
-  test("ConfirmFinding OOB hybrid is blocked by a fresh control-token hit", async () => {
+  test.skipIf(!oobSandboxOk)("ConfirmFinding OOB hybrid is blocked by a fresh control-token hit", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
     // Stateful oracle: target tokens always fire; control tokens fire ONLY
@@ -876,7 +928,7 @@ describe("casefile extension", () => {
     }
   });
 
-  test("ConfirmFinding OOB fails closed when the control script changes between phases", async () => {
+  test.skipIf(!oobSandboxOk)("ConfirmFinding OOB fails closed when the control script changes between phases", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
     const provisioned: string[] = [];
@@ -969,7 +1021,7 @@ describe("casefile extension", () => {
     }
   });
 
-  test("PromoteFinding oob:true rejects a bundle whose control token also fired", async () => {
+  test.skipIf(!oobSandboxOk)("PromoteFinding oob:true rejects a bundle whose control token also fired", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
     // Cheating topology: BOTH tokens receive interactions — not target-dependent.
@@ -1031,7 +1083,7 @@ describe("casefile extension", () => {
     }
   });
 
-  test("OOB polling keeps watching after the first hit so delayed control hits are caught", async () => {
+  test.skipIf(!oobSandboxOk)("OOB polling keeps watching after the first hit so delayed control hits are caught", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
     let pollCount = 0;
@@ -1100,7 +1152,7 @@ describe("casefile extension", () => {
     }
   }, 10_000);
 
-  test("unattributed interactions (missing src_ip) never count as target hits", async () => {
+  test.skipIf(!oobSandboxOk)("unattributed interactions (missing src_ip) never count as target hits", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
     const provisioned: string[] = [];
@@ -1184,7 +1236,7 @@ describe("casefile extension", () => {
     }
   });
 
-  test("oob:true + reflection canary in evidence is rejected with a clear message", async () => {
+  test.skipIf(!oobSandboxOk)("oob:true + reflection canary in evidence is rejected with a clear message", async () => {
     const pi = createFakePi();
     casefileExtension(pi as any);
     // Oracle configured so the run gets past provisioning; the canary lives
