@@ -1,0 +1,30 @@
+{
+  "schema": "xpi/audit-run@1",
+  "runId": "e1-gate-revalidation-20261008t061449z",
+  "created": "2026-10-08T06:14:49Z",
+  "mode": "source_audit",
+  "profile": "deep",
+  "harness": "pi",
+  "target": {
+    "kind": "repository",
+    "reference": "xaccefy/pi-xpi (self-benchmark, offline gate suites)",
+    "revision": "v0.10.0-rc1@a752d71490fd08987f76a339d80c3aa46d4713fc",
+    "dirty": true
+  },
+  "scope": {
+    "include": [
+      "bench/run.ts",
+      "bench/adversarial.ts",
+      "bench/chain-run.ts",
+      "bench/oob-run.ts",
+      "bench/transport-run.ts"
+    ]
+  },
+  "executionPolicy": {
+    "network": "none",
+    "sandbox": "none",
+    "sandboxFailClosed": true,
+    "notes": "Deterministic mock-fetch suites; no live targets, no model in the loop."
+  },
+  "status": "completed"
+}

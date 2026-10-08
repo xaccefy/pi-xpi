@@ -1,0 +1,91 @@
+revision: v0.10.0-rc1 @ a752d71490fd08987f76a339d80c3aa46d4713fc (dirty=4)
+bun: 1.3.14
+=== differential ===
+XPI machine-confirmation soundness suite — judge correctness by vuln class
+========================================================================
+[PASS] reflected-xss            canary        
+[PASS] path-traversal           inter_host    
+[PASS] sqli-union-exfil         inter_host    
+[PASS] info-disclosure-debug    inter_host    
+[PASS] xxe-file-read            inter_host    
+[PASS] ssti-secret-leak         inter_host    
+[PASS] idor-bola                intra_target  
+[PASS] broken-auth-bypass       intra_target  
+[PASS] mass-assignment-privesc  intra_target  
+[PASS] jwt-alg-none             intra_target  
+[PASS] price-tampering-logic    intra_target  
+[PASS] path-authz-bypass        intra_target  
+------------------------------------------------------------------------
+SCORE 12/12 = 100.0%
+
+wrote /home/xaccefy/workspace/projects/xpi/bench/results/latest.json
+=== adversarial ===
+XPI adversarial soundness suite — cheats and noise the gate must reject
+========================================================================
+[PASS] adv-canary-control-echo      rejected
+[PASS] adv-decoy-secret-control     rejected
+[PASS] adv-generic-status-predicate rejected
+[PASS] adv-always-match-regex       rejected
+[PASS] adv-flaky-target             rejected
+[PASS] adv-intra-missing-baseline   rejected
+[PASS] adv-intra-identical-baseline rejected
+[PASS] adv-binding-host-mismatch    rejected
+[PASS] adv-control-same-identity    rejected
+[PASS] adv-redirect-off-host        rejected
+------------------------------------------------------------------------
+SCORE 10/10 rejected = 100.0%
+=== chain ===
+XPI chain-suggestion benchmark — XBOW 104 style (cGain = recall on chaining pairs)
+================================================================================
+[PASS] cred-endpoint          credential_endpoint        exp=true  got=true  — suggested
+[PASS] idor-leak              idor_data_leak             exp=true  got=true  — suggested
+[PASS] xss-csrf               xss_csrf                   exp=true  got=true  — suggested
+[PASS] ssti-rce               ssti_rce                   exp=true  got=true  — suggested
+[PASS] lfi-upload-rce         lfi_rce_chain              exp=true  got=true  — suggested
+[PASS] ssrf-internal          ssrf_internal_pivot        exp=true  got=true  — suggested
+[PASS] jwt-privesc            jwt_privilege_escalation   exp=true  got=true  — suggested
+[PASS] graphql-sqli           graphql_chain              exp=true  got=true  — suggested
+[PASS] graphql-idor           graphql_chain              exp=true  got=true  — suggested
+[PASS] deser-rce              deserialization_rce        exp=true  got=true  — suggested
+[PASS] xxe-leak               xxe_file_read              exp=true  got=true  — suggested
+[PASS] sqli-cred-dump         sqli_credential_dump       exp=true  got=true  — suggested
+[PASS] sqli-upload            sqli_credential_dump       exp=true  got=true  — suggested
+[PASS] bizlogic-priv          business_logic_privilege   exp=true  got=true  — suggested
+[PASS] upload-rce             upload_rce                 exp=true  got=true  — suggested
+[PASS] crypto-bypass          crypto_auth_bypass         exp=true  got=true  — suggested
+[PASS] neg-cross-asset        credential_endpoint        exp=false got=false — correctly rejected
+[PASS] neg-negated            xss_csrf                   exp=false got=false — correctly rejected
+[PASS] nm-cred-cred           credential_endpoint        exp=false got=false — correctly rejected
+[PASS] nm-idor-idor           idor_data_leak             exp=false got=false — correctly rejected
+[PASS] nm-xss-read-only       xss_csrf                   exp=false got=false — correctly rejected
+[PASS] nm-lfi-lfi             lfi_rce_chain              exp=false got=false — correctly rejected
+[PASS] nm-upload-upload       upload_rce                 exp=false got=false — correctly rejected
+[PASS] nm-jwt-jwt             jwt_privilege_escalation   exp=false got=false — correctly rejected
+[PASS] nm-ssrf-ssrf           ssrf_internal_pivot        exp=false got=false — correctly rejected
+[PASS] nm-crypto-crypto       crypto_auth_bypass         exp=false got=false — correctly rejected
+[PASS] nm-bizlogic-nonauth    business_logic_privilege   exp=false got=false — correctly rejected
+[PASS] nm-gql-gql             graphql_chain              exp=false got=false — correctly rejected
+[PASS] nm-redirect-redirect   redirect_oauth             exp=false got=false — correctly rejected
+[PASS] nm-oauth-oauth         redirect_oauth             exp=false got=false — correctly rejected
+[PASS] nm-race-race           race_condition_business    exp=false got=false — correctly rejected
+[PASS] nm-subdomain-trap      credential_endpoint        exp=false got=false — correctly rejected
+[PASS] nm-negated-sqli        sqli_credential_dump       exp=false got=false — correctly rejected
+--------------------------------------------------------------------------------
+SCORE 33/33 = 100.0%  |  cGain (chain recall) 16/16 = 100.0%  |  correctly rejected 17/17
+Baseline (pre-expansion 8 patterns) would score ~ 44.4% cGain (8/18 pairs) → current 100.0% (+55.6pp)
+
+HOLDOUT (paraphrase probe, non-gating): 4/6 recalled (67%) — misses: h-xxe-paraphrase[paraphrase], h-deser-paraphrase[paraphrase]
+
+wrote /home/xaccefy/workspace/projects/xpi/bench/results/chain-latest.json
+=== oob ===
+[PASS] oob-target-only-separated    target=1 control=0
+[PASS] oob-delayed-control-hit      settle window caught trailing control hit
+[PASS] oob-self-ip-only             self interactions rejected
+[PASS] oob-unattributed-source      unattributed interaction rejected
+[PASS] oob-no-oracle-fail-closed    fails closed with explanatory error
+[PASS] oob-refuse-invented-domain   oracle-invented secret refused
+SCORE 6/6 = 100.0%
+=== transport ===
+[PASS] raw-verbatim-bytes       148 bytes round-tripped exactly
+[PASS] race-burst-delivery      8/8 delivered, distinct sequence 1..8, observed response spread 0ms
+SCORE 2/2 = 100.0%

@@ -1,0 +1,22 @@
+{
+  "differential": {
+    "passMarkers": 14,
+    "failMarkers": 0
+  },
+  "adversarial": {
+    "passMarkers": 10,
+    "failMarkers": 0
+  },
+  "chain": {
+    "passMarkers": 36,
+    "failMarkers": 0
+  },
+  "oob": {
+    "passMarkers": 6,
+    "failMarkers": 2
+  },
+  "transport": {
+    "passMarkers": 2,
+    "failMarkers": 0
+  }
+}
