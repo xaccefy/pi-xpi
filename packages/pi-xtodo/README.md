@@ -17,7 +17,7 @@ pi install npm:@xaccefy/pi-xtodo
 | `list` | Filter by `status`; `includeDeleted` for tombstones |
 | `get` | Full detail including blockedBy / blocks |
 | `delete` | Soft-delete (kept as a tombstone) |
-| `clear` | Clear all tasks |
+| `clear` | Clear all tasks, or only those with `status` (e.g. `completed`) — ids are not reused |
 
 ### Status lifecycle
 

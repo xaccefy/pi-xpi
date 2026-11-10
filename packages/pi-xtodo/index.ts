@@ -73,7 +73,7 @@ export const TodoParamsSchema = Type.Object(
     status: Type.Optional(
       Type.String({
         enum: ["pending", "in_progress", "completed", "deleted"],
-        description: "Target status (update) or list filter (list)",
+        description: "Target status (update), list filter (list), or only status to remove (clear)",
       }),
     ),
     blockedBy: Type.Optional(
@@ -446,8 +446,17 @@ function applyMutation(
       return { state: { tasks, nextId }, text: `Deleted #${id}: ${tasks[idx].subject}` };
     }
 
-    case "clear":
-      return { state: freshState(), text: `Cleared ${tasks.length} tasks` };
+    case "clear": {
+      if (!params.status) return { state: freshState(), text: `Cleared ${tasks.length} tasks` };
+      // Status-scoped clear: drop only matching tasks, keep nextId so ids are never reused.
+      const kept = tasks.filter((t) => t.status !== params.status);
+      for (const t of tasks) if (t.status === params.status) scrubBlockedBy(kept, t.id);
+      const n = tasks.length - kept.length;
+      return {
+        state: { tasks: kept, nextId },
+        text: `Cleared ${n} ${params.status} task${n === 1 ? "" : "s"}`,
+      };
+    }
   }
 }
 

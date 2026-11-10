@@ -474,6 +474,25 @@ describe("pi-xtodo", () => {
     assert.strictEqual(list.content[0].text, "No tasks");
   });
 
+  it("clear with status removes only that status and keeps ids monotonic", async () => {
+    const t = pi.tools[0];
+    await exec(t, "1", { action: "create", subject: "A" });
+    await exec(t, "2", { action: "create", subject: "B" });
+    await exec(t, "3", { action: "create", subject: "C", blockedBy: [1] });
+    await exec(t, "4", { action: "update", id: 1, status: "completed" });
+    await exec(t, "5", { action: "delete", id: 2 });
+    const r = await exec(t, "6", { action: "clear", status: "completed" });
+    ok(r, "clear completed");
+    assert.strictEqual(r.content[0].text, "Cleared 1 completed task");
+    const list = await exec(t, "7", { action: "list", includeDeleted: true });
+    assert.strictEqual(list.content[0].text, "[deleted] #2 B\n[pending] #3 C");
+    await exec(t, "8", { action: "clear", status: "deleted" });
+    const c = await exec(t, "9", { action: "create", subject: "D" });
+    assert.ok(c.content[0].text.startsWith("Created #4"), "no id reuse after partial clear");
+    const list2 = await exec(t, "10", { action: "list", includeDeleted: true });
+    assert.strictEqual(list2.content[0].text, "[pending] #3 C\n[pending] #4 D");
+  });
+
   it("get returns error for missing or missing-id", async () => {
     const t = pi.tools[0];
     const r1 = await exec(t, "1", { action: "get", id: 999 });
